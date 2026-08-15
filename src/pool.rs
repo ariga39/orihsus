@@ -605,6 +605,22 @@ fn backoff_at(policy: &PoolPolicy, step: u32) -> Duration {
 }
 
 impl RequestAttempts {
+    /// Select another distinct key only if one is available now. Once the
+    /// gateway has a committed upstream response, an unrelated key cooldown
+    /// must not delay or replace that response.
+    pub(crate) fn next_immediate(&mut self) -> AttemptResult {
+        if self.used.len() >= self.max {
+            return AttemptResult::Exhausted;
+        }
+        match self.try_select_unused() {
+            Some(sel) => {
+                self.used.push(sel.fingerprint.clone());
+                AttemptResult::Selected(sel)
+            }
+            None => AttemptResult::Exhausted,
+        }
+    }
+
     /// Select the next distinct key for this request, or report that none is
     /// currently available (`Unavailable`) or that the attempt budget for
     /// this request is used up (`Exhausted`).

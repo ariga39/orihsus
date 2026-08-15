@@ -4073,6 +4073,73 @@ async fn final_server_error_is_sanitized_when_both_keys_fail() {
     assert_eq!(value["error"]["type"], "upstream_error");
 }
 
+#[tokio::test]
+async fn server_error_is_returned_when_the_only_other_key_is_already_cooling() {
+    let control = Arc::new(MockControl::default());
+    let addr = start_mock(control.clone()).await;
+    let p = pool_with_timeout(&["key-1", "key-2"], Duration::from_millis(20));
+    let mut cooling = p.request();
+    let key1 = match cooling.next().await {
+        orihsus::pool::AttemptResult::Selected(selection) => selection,
+        other => panic!("expected key1 selection, got {other:?}"),
+    };
+    p.report_failure(
+        &key1,
+        orihsus::pool::Failure::UsageLimit {
+            dimension: orihsus::pool::UsageDimension::Weekly,
+            cooldown: Duration::from_secs(60),
+        },
+    );
+
+    let sink = TestSink::default();
+    let app = build_router(state_with(
+        &p,
+        &queue(2, 2, Duration::from_secs(30)),
+        &format!("http://{addr}"),
+        sink.clone(),
+    ));
+    control
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(MockResponse::json(
+            503,
+            br#"{"error":{"message":"Endpoint unavailable"}}"#,
+        ));
+
+    let resp = send(&app, chat_req()).await;
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a committed upstream 503 must win over an unrelated key cooldown"
+    );
+    let body = body_string(resp).await;
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["error"]["type"], "upstream_error");
+    assert!(!body.contains("Endpoint unavailable"));
+    {
+        let requests = control.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].headers.get("authorization").unwrap(),
+            "Bearer key-2"
+        );
+    }
+    {
+        let records = sink.0.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, 503);
+    }
+
+    let mut probe = p.request();
+    let selected = match probe.next().await {
+        orihsus::pool::AttemptResult::Selected(selection) => selection,
+        other => panic!("503 must leave key2 selectable, got {other:?}"),
+    };
+    assert_eq!(selected.fingerprint(), fingerprint("key-2"));
+}
+
 #[tokio::test(start_paused = true)]
 async fn non_streaming_success_resets_pool_backoff() {
     let control = Arc::new(MockControl::default());

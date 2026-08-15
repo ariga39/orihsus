@@ -16,6 +16,7 @@ This document records the decisions that define the gateway contract.
 - Attempt at most two distinct keys per request.
 - Treat exact OpenCode `GoUsageLimitError` payloads as quota cooldowns. Recognized dimensions are `weekly`, `monthly`, and `5h`; parsed reset durations override dimension defaults.
 - Treat ordinary 429 responses with `Retry-After` when valid, otherwise exponential backoff. Handle 401/403 as key failures and retry eligible 5xx/network failures without exposing credentials.
+- Once an upstream error response has been committed, retry only another key that is available immediately. A different key's existing cooldown must never delay or replace a saved 5xx response with the gateway-level all-keys-cooling 429.
 - When every key is cooling down, wait within a fixed pool budget, then return 429 with a conservative `Retry-After` derived from the earliest recovery. Reserve 503 for gateway capacity, timeout, shutdown, or upstream-transport failures.
 - Poll the OpenCode usage API proactively. A key at or above the configured utilization threshold is cooled until the reported reset time; polling failures do not remove otherwise healthy keys.
 

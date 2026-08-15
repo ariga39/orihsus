@@ -919,7 +919,16 @@ async fn chat_completions(State(state): State<Arc<GatewayState>>, req: Request<B
 
     let mut last_response: Option<(ConsumedResponse, String)> = None;
     let final_outcome = loop {
-        let sel = match attempts.next().await {
+        // Before any upstream response exists, waiting for a cooling candidate
+        // can still produce service. After a committed error exists, retry only
+        // a key available now: a different key's cooldown must not delay or
+        // replace the response already received.
+        let next_attempt = if last_response.is_some() {
+            attempts.next_immediate()
+        } else {
+            attempts.next().await
+        };
+        let sel = match next_attempt {
             AttemptResult::Selected(s) => s,
             AttemptResult::Unavailable { retry_after } => {
                 break FinalOutcome::Unavailable(retry_after)
