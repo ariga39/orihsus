@@ -8,6 +8,7 @@ use axum::Router;
 use crate::audit::AuditWriter;
 use crate::config::Config;
 use crate::gateway::{build_router, BodyBudget, GatewayState, RuntimeState, RuntimeStore};
+use crate::models::ModelMonitor;
 use crate::pool::{KeyPool, PoolPolicy};
 use crate::queue::AdmissionQueue;
 use crate::usage::UsageMonitor;
@@ -40,6 +41,7 @@ pub struct AppRuntime {
     pub audit: Arc<AuditWriter>,
     pub body_budget: BodyBudget,
     pub usage_monitor: Option<UsageMonitor>,
+    pub model_monitor: Option<ModelMonitor>,
 }
 
 /// Assemble everything the gateway needs from a validated config. Any failure
@@ -97,6 +99,8 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
     let router = build_router(state);
     let usage_monitor = UsageMonitor::start(cfg.usage.clone(), cfg.keys.clone(), pool.clone())
         .map_err(BootstrapError::Client)?;
+    let model_monitor = ModelMonitor::start(cfg.model_sync.clone(), runtime.clone())
+        .map_err(BootstrapError::Client)?;
     Ok((
         AppRuntime {
             pool,
@@ -105,6 +109,7 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
             audit,
             body_budget,
             usage_monitor: Some(usage_monitor),
+            model_monitor: Some(model_monitor),
         },
         router,
     ))

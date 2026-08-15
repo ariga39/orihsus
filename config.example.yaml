@@ -15,8 +15,7 @@ keys:
   - "CHANGE-ME-upstream-key-1"
   - "CHANGE-ME-upstream-key-2"
 
-# Optional, but normally a deployment decision: models advertised by
-# GET /v1/models. Remove this section to advertise only deepseek-chat.
-models:
-  - "deepseek-chat"
-  - "deepseek-reasoner"
+# Models are fetched from OpenCode Go immediately at startup and hourly.
+# To pin a manual allowlist instead, add `models: ["deepseek-chat"]`.
+model_sync:
+  interval_seconds: 3600

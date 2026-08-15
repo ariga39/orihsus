@@ -23,6 +23,7 @@ pub(crate) enum UpstreamApi {
     Messages,
     Responses,
     Usage,
+    Models,
 }
 
 pub(crate) fn upstream_api_url(base: &url::Url, api: UpstreamApi) -> url::Url {
@@ -31,6 +32,7 @@ pub(crate) fn upstream_api_url(base: &url::Url, api: UpstreamApi) -> url::Url {
         UpstreamApi::Messages => "v1/messages",
         UpstreamApi::Responses => "v1/responses",
         UpstreamApi::Usage => "v1/usage",
+        UpstreamApi::Models => "v1/models",
     };
     base.join(path).expect("fixed upstream API path is valid")
 }
@@ -50,6 +52,7 @@ const DEFAULT_MAX_INFLIGHT_BODY_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const DEFAULT_MODELS: [&str; 1] = ["deepseek-chat"];
+const DEFAULT_MODEL_SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_BREAKER_THRESHOLD: usize = 5;
 const DEFAULT_BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
 const DEFAULT_MAX_ATTEMPTS: usize = 2;
@@ -159,13 +162,21 @@ pub struct Config {
     pub listen: SocketAddr,
     pub gateway_token: Secret,
     pub keys: Vec<Secret>,
-    /// Static model list advertised by `GET /v1/models` and hot-reloadable.
+    /// Current startup/fallback model list, or an explicit manual override.
     pub models: Vec<String>,
+    pub model_sync: ModelSync,
     pub limits: Limits,
     pub key_failure_handling: KeyFailureHandling,
     pub usage: Usage,
     pub audit: Audit,
     pub server: Server,
+}
+
+/// Public OpenCode Go model-list synchronization policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSync {
+    pub enabled: bool,
+    pub interval: Duration,
 }
 
 /// Proactive OpenCode Go usage polling policy. Changes require a restart.
@@ -347,6 +358,7 @@ impl Config {
         }
         let keys = keys.into_iter().map(Secret::new).collect();
 
+        let has_manual_models = raw.models.is_some();
         let models = match raw.models {
             Some(models) => {
                 if models.is_empty() {
@@ -372,6 +384,18 @@ impl Config {
             }
             None => DEFAULT_MODELS.iter().map(|s| s.to_string()).collect(),
         };
+        let model_sync = raw.model_sync.unwrap_or_default();
+        let model_sync_enabled = !has_manual_models && model_sync.enabled.unwrap_or(true);
+        let model_sync_interval = Duration::from_secs(
+            model_sync
+                .interval_seconds
+                .unwrap_or(DEFAULT_MODEL_SYNC_INTERVAL.as_secs()),
+        );
+        if model_sync_interval < Duration::from_secs(30) {
+            return Err(validation(
+                "model_sync.interval_seconds must be at least 30".into(),
+            ));
+        }
 
         let limits = raw.limits.unwrap_or_default();
         let max_concurrency = limits.max_concurrency.unwrap_or(DEFAULT_MAX_CONCURRENCY);
@@ -609,6 +633,10 @@ impl Config {
             gateway_token,
             keys,
             models,
+            model_sync: ModelSync {
+                enabled: model_sync_enabled,
+                interval: model_sync_interval,
+            },
             limits: Limits {
                 max_concurrency,
                 max_queue,
@@ -652,11 +680,20 @@ struct RawConfig {
     listen: Option<RawListen>,
     keys: Option<Vec<String>>,
     models: Option<Vec<String>>,
+    model_sync: Option<RawModelSync>,
     limits: Option<RawLimits>,
     key_failure_handling: Option<RawKeyFailureHandling>,
     usage: Option<RawUsage>,
     audit: Option<RawAudit>,
     server: Option<RawServer>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+struct RawModelSync {
+    enabled: Option<bool>,
+    interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -76,7 +76,29 @@ async fn assemble_starts_and_retains_the_usage_monitor_guard() {
     let cfg = orihsus::config::load(&path).unwrap();
     let (mut runtime, router) = assemble(&cfg).unwrap();
     assert!(runtime.usage_monitor.is_some());
+    assert!(runtime.model_monitor.is_some());
     runtime.usage_monitor.take().unwrap().shutdown().await;
+    drop(router);
+    shutdown_audit(runtime);
+}
+
+#[tokio::test]
+async fn explicit_models_are_a_manual_override_with_a_dormant_sync_worker() {
+    let dir = TempDir::new().unwrap();
+    let audit_path = dir.path().join("audit.jsonl");
+    let cfg_text = MINIMAL
+        .replace(
+            "/tmp/orihsus-app-test-audit.jsonl",
+            audit_path.to_str().unwrap(),
+        )
+        .replace(
+            "keys:\n  - \"key-1\"",
+            "keys:\n  - \"key-1\"\nmodels:\n  - manual-model",
+        );
+    let cfg = orihsus::config::load(write_config(dir.path(), &cfg_text)).unwrap();
+    let (runtime, router) = assemble(&cfg).unwrap();
+    assert!(runtime.model_monitor.is_some());
+    assert_eq!(runtime.runtime.snapshot().models, vec!["manual-model"]);
     drop(router);
     shutdown_audit(runtime);
 }

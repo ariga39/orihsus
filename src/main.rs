@@ -225,13 +225,24 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
             .as_ref()
             .expect("assemble always starts usage monitor")
             .keys_handle();
+        let model_sync = runtime
+            .model_monitor
+            .as_ref()
+            .expect("assemble always starts model monitor")
+            .config_handle();
         // Only hot fields are applied atomically: keys + token/max_body/
         // models are swapped under one lock, so a failure never half-applies and
         // a request never observes mixed generations. Non-hot changes
         // (limits/key-failure handling/audit/server/listen) are refused by the reloader
         // before this callback ever runs.
         HotReloader::start(&config_path, RELOAD_DEBOUNCE, initial, move |snap| {
-            store
+            let previous_model_sync = model_sync.replace(snap.model_sync.clone());
+            let models = if snap.model_sync.enabled {
+                store.snapshot().models.clone()
+            } else {
+                snap.models.clone()
+            };
+            if store
                 .update_with_keys(
                     &pool,
                     snap.keys.clone(),
@@ -240,10 +251,14 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
                         base_url: url::Url::parse(orihsus::config::OPENCODE_GO_BASE_URL)
                             .expect("built-in OpenCode Go base URL is valid"),
                         max_body_bytes: snap.limits.max_body_bytes,
-                        models: snap.models.clone(),
+                        models,
                     },
                 )
-                .map_err(|_| ApplyError)?;
+                .is_err()
+            {
+                model_sync.replace(previous_model_sync);
+                return Err(ApplyError);
+            }
             usage_keys.replace_keys(snap.keys.clone());
             Ok(())
         })?
@@ -329,6 +344,9 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
     }
 
     if let Some(monitor) = runtime.usage_monitor.take() {
+        monitor.shutdown().await;
+    }
+    if let Some(monitor) = runtime.model_monitor.take() {
         monitor.shutdown().await;
     }
 

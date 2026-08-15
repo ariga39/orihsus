@@ -191,7 +191,7 @@ pub struct RuntimeState {
     pub gateway_token: Secret,
     pub base_url: Url,
     pub max_body_bytes: usize,
-    /// Static model list served by `GET /v1/models`, hot-reloadable.
+    /// Current model list served by `GET /v1/models`, hot-reloadable.
     pub models: Vec<String>,
 }
 
@@ -240,6 +240,18 @@ impl RuntimeStore {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(state);
+    }
+
+    /// Atomically replace only the model allowlist, preserving the latest
+    /// concurrently hot-reloaded token, URL and body limit.
+    pub fn update_models(&self, models: Vec<String>) {
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = (**guard).clone();
+        state.models = models;
+        *guard = Arc::new(state);
     }
 
     /// Atomically apply a hot reload across both the key pool and the runtime

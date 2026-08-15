@@ -46,6 +46,7 @@ pub struct RuntimeConfigSnapshot {
     pub gateway_token: Secret,
     pub keys: Vec<Secret>,
     pub models: Vec<String>,
+    pub model_sync: config::ModelSync,
     pub limits: config::Limits,
     pub key_failure_handling: config::KeyFailureHandling,
 }
@@ -56,6 +57,7 @@ impl RuntimeConfigSnapshot {
             gateway_token: cfg.gateway_token.clone(),
             keys: cfg.keys.clone(),
             models: cfg.models.clone(),
+            model_sync: cfg.model_sync.clone(),
             limits: cfg.limits.clone(),
             key_failure_handling: cfg.key_failure_handling.clone(),
         }

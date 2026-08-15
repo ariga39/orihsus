@@ -897,8 +897,13 @@ fn models_default_and_custom_values() {
     assert_eq!(
         cfg.models,
         vec!["deepseek-chat".to_string()],
-        "absent models must default to the backwards-compatible deepseek-chat list"
+        "the last-resort list remains available until the startup sync succeeds"
     );
+    assert!(
+        cfg.model_sync.enabled,
+        "absent models must enable upstream synchronization"
+    );
+    assert_eq!(cfg.model_sync.interval, Duration::from_secs(60 * 60));
 
     let custom = write_config(
         dir.path(),
@@ -916,6 +921,46 @@ models:
     assert_eq!(
         cfg.models,
         vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]
+    );
+    assert!(
+        !cfg.model_sync.enabled,
+        "an explicit list is a manual override"
+    );
+}
+
+#[test]
+fn model_sync_can_be_disabled_or_given_a_custom_interval() {
+    let dir = TempDir::new().unwrap();
+    let disabled = write_config(
+        dir.path(),
+        "disabled-model-sync.yaml",
+        "gateway_token: gway-secret\nkeys:\n  - key-1\nmodel_sync:\n  enabled: false\n",
+    );
+    let cfg = orihsus::config::load(&disabled).unwrap();
+    assert!(!cfg.model_sync.enabled);
+
+    let custom = write_config(
+        dir.path(),
+        "custom-model-sync.yaml",
+        "gateway_token: gway-secret\nkeys:\n  - key-1\nmodel_sync:\n  interval_seconds: 7200\n",
+    );
+    let cfg = orihsus::config::load(&custom).unwrap();
+    assert!(cfg.model_sync.enabled);
+    assert_eq!(cfg.model_sync.interval, Duration::from_secs(7200));
+}
+
+#[test]
+fn model_sync_interval_shorter_than_thirty_seconds_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(
+        dir.path(),
+        "short-model-sync.yaml",
+        "gateway_token: gway-secret\nkeys:\n  - key-1\nmodel_sync:\n  interval_seconds: 29\n",
+    );
+    let err = orihsus::config::load(&path).unwrap_err();
+    assert!(
+        format!("{err}").contains("model_sync.interval_seconds"),
+        "{err}"
     );
 }
 

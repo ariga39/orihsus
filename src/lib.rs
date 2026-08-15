@@ -6,6 +6,7 @@ pub mod audit;
 pub mod config;
 pub mod gateway;
 pub mod hot_reload;
+pub mod models;
 pub mod pool;
 pub mod queue;
 pub mod server;

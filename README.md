@@ -9,7 +9,7 @@ A lightweight OpenAI-compatible gateway for OpenCode Go that rotates multiple su
 - Tries at most two keys per request. Retryable upstream errors become sanitized OpenAI-compatible JSON; upstream bodies and metadata are never exposed.
 - Enforces gateway bearer authentication, header-read timeouts, and a maximum header size; nginx terminates public TLS and HTTP/2.
 - Writes JSONL audit records with token counts. Keys are represented only by the first 12 hexadecimal characters of a SHA-256 fingerprint.
-- Hot-reloads tokens, keys, and models. The OpenCode Go upstream and allowed API paths are built in to prevent SSRF and key disclosure.
+- Hot-reloads tokens, keys, and models. When no manual model list is configured, the allowlist is refreshed from OpenCode Go at startup and hourly thereafter.
 - Bounds concurrency, queued requests, request bodies, model names, SSE streams, error classification, and the audit queue.
 
 ## Quick start
@@ -37,7 +37,9 @@ Configuration values are scalar strings or numbers. Durations are integer second
 | `keys` | list of strings | yes | — | Non-empty, unique upstream key pool. Hot-reloadable. |
 | `listen.host` | string (IP) | no | `127.0.0.1` | Loopback IP address. Non-loopback addresses are rejected. |
 | `listen.port` | integer | no | `8080` | Local HTTP port, from 0 through 65535. |
-| `models` | list of strings | no | `["deepseek-chat"]` | Non-empty, unique allowlist; each UTF-8 value is at most 256 bytes. Requests outside it are rejected before upstream. Hot-reloadable. |
+| `models` | list of strings | no | synchronized | Manual non-empty, unique allowlist; each UTF-8 value is at most 256 bytes. When present it overrides and disables automatic synchronization. Hot-reloadable. |
+| `model_sync.enabled` | boolean | no | `true` | Synchronize the allowlist from the public OpenCode Go `/v1/models` endpoint when `models` is absent. A failed or invalid refresh keeps the last-known-good list. Hot-reloadable. |
+| `model_sync.interval_seconds` | integer | no | `3600` | Model refresh interval; at least `30`. The first refresh runs immediately at startup. Hot-reloadable. |
 | `limits.max_concurrency` | integer | no | `200` | Maximum requests actively handled. |
 | `limits.max_queue` | integer | no | `500` | Maximum requests waiting for admission; zero disables waiting. |
 | `limits.queue_wait_timeout_seconds` | integer | no | `30` | Maximum time an admitted-to-queue request may wait; must be positive. |
@@ -62,7 +64,7 @@ Configuration values are scalar strings or numbers. Durations are integer second
 
 `key_failure_handling` configures what happens when the currently selected upstream key fails. Ordinary failures use exponential backoff; repeated failures open that key's circuit breaker; `max_attempts` controls whether the same client request may fail over to one other key. It does not configure scheduled key replacement.
 
-Only `gateway_token` and `keys` are required. Omitted optional sections use the defaults above. Listener, limits, key-failure handling, usage, audit, and server changes require restart. The upstream is fixed at `https://opencode.ai/zen/go/`; any `upstream` or `base_url` configuration is rejected. Only the fixed `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and `/v1/usage` upstream paths can receive subscription keys; `/v1/models` is served locally. Request and successful response bodies are forwarded unchanged; clients must choose the protocol endpoint matching their model.
+Only `gateway_token` and `keys` are required. Omitted optional sections use the defaults above. Before the first successful automatic refresh, the service retains `deepseek-chat` as a fail-safe allowlist. Listener, limits, key-failure handling, usage, audit, and server changes require restart. The upstream is fixed at `https://opencode.ai/zen/go/`; any `upstream` or `base_url` configuration is rejected. Only the fixed `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and authenticated `/v1/usage` upstream paths can receive subscription keys; model synchronization uses unauthenticated `GET /v1/models`, while the gateway's own `/v1/models` remains local. Request and successful response bodies are forwarded unchanged; clients must choose the protocol endpoint matching their model.
 
 ## Testing
 
