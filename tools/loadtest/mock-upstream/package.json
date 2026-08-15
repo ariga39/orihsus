@@ -1,0 +1,14 @@
+{
+  "name": "orihsus-mock-upstream",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Programmable HTTPS HTTP/1.1 + HTTP/2 upstream for orihsus load tests",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

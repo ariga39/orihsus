@@ -1,0 +1,36 @@
+# Loopback-only 10MiB body-budget test configuration.
+listen: "127.0.0.1:18444"
+tls:
+  cert_path: "/tmp/orihsus-loadtest/certs/server-cert.pem"
+  key_path: "/tmp/orihsus-loadtest/certs/server-key.pem"
+gateway_token: "loadtest-gateway-token"
+upstream:
+  base_url: "https://127.0.0.1:18443"
+keys:
+  - "mock-key-1"
+  - "mock-key-2"
+models:
+  - "deepseek-chat"
+limits:
+  max_concurrency: 200
+  max_queue: 500
+  queue_wait_timeout: "30s"
+  max_body_bytes: "10MiB"
+  max_inflight_body_bytes: "256MiB"
+rotation:
+  backoff_initial: "1s"
+  backoff_max: "5s"
+  breaker_threshold: 5
+  breaker_cooldown: "5s"
+  max_attempts: 2
+audit:
+  path: "/tmp/orihsus-loadtest/payload-audit.jsonl"
+  queue_capacity: 4096
+server:
+  read_header_timeout: "5s"
+  max_header_bytes: "32KiB"
+  max_connections: 1024
+  body_read_timeout: "30s"
+  upstream_response_header_timeout: "60s"
+  upstream_error_body_timeout: "5s"
+  response_write_timeout: "30s"

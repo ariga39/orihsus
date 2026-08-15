@@ -1,0 +1,67 @@
+[package]
+name = "orihsus"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["tools/loadtest/loadgen"]
+
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[workspace.metadata.quality-gates]
+rustfmt = "cargo fmt --check"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Test-only escape hatch for the loopback HTTPS mock upstream. Production
+# builds must not enable this feature.
+loadtest-insecure-upstream = []
+
+[lib]
+name = "orihsus"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+humantime = "2"
+url = "2"
+sha2 = "0.10"
+chrono = "0.4"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros", "signal", "net", "io-util"] }
+axum = { version = "0.8", features = ["macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+http-body-util = "0.1"
+subtle = "2"
+notify = "8"
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+libc = "0.2"
+tower = { version = "0.5", features = ["util"] }
+async-trait = "0.1"
+tikv-jemallocator = "0.6"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
+rcgen = "0.13"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,44 @@
+# orihsus — OpenCode Go Key-Rotation Gateway
+
+## Objective
+
+Build a production-oriented Rust gateway that exposes an OpenAI-compatible endpoint, forwards requests to OpenCode Go, rotates subscription API keys safely, and remains bounded under slow or hostile clients.
+
+## Required behavior
+
+- Serve `POST /v1/chat/completions`, `GET /v1/models`, `/healthz`, and `/readyz` over TLS.
+- Authenticate gateway clients with a bearer token before admission or body allocation.
+- Select keys from a fill-first pool and fail over at most once per request.
+- Classify OpenCode usage-limit responses, ordinary rate limits, authentication failures, upstream failures, and network errors without leaking secrets.
+- Preserve SSE and non-SSE streaming and stop upstream work when the downstream disappears or exceeds its write deadline.
+- Hot-reload the safe runtime subset atomically.
+- Emit bounded JSONL audit records with token counts and key fingerprints.
+- Provide explicit bounds for connections, active work, queueing, body memory, timeouts, retries, and shutdown.
+- Include a hardened systemd deployment and documented operational procedure.
+
+## Technical constraints
+
+- Stable Rust; Tokio/Axum/Reqwest/Rustls.
+- One process and no persistent database.
+- HTTPS-only upstream and same-origin redirects only.
+- Secrets must be absent from logs, formatting, errors, and audit output.
+- Production behavior must remain testable through narrow public seams and deterministic state-machine tests.
+
+## Module map
+
+- `config`: parsing, validation, redaction, and reloadable runtime snapshots.
+- `pool`: key selection, cooldowns, circuit breaking, and request-level candidates.
+- `queue`: bounded admission and global request-body budget.
+- `gateway`: routing, authentication, retries, error classification, and streaming.
+- `audit`: bounded JSONL writer, rotation, counters, and shutdown.
+- `hot_reload`: filesystem watching and atomic runtime updates.
+- `server`: TLS, connection limits, protocol watchdogs, and graceful shutdown.
+- `usage`: proactive usage polling and key cooldown updates.
+- `main`: process validation, component assembly, signals, and lifecycle ordering.
+
+## Completion criteria
+
+- `cargo fmt --check`, Clippy with warnings denied, all tests, and release build pass.
+- Configuration and deployment examples match the implemented schema.
+- Capacity and timeout boundaries are exercised with real sockets and the load-test tools.
+- Documentation is in English and accurately describes restart versus hot-reload behavior.

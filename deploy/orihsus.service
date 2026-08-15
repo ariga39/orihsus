@@ -1,0 +1,48 @@
+# orihsus — OpenCode Go key rotation gateway
+# systemd unit. Install: sudo cp deploy/orihsus.service /etc/systemd/system/
+# then enable+start. See docs/DEPLOYMENT.md.
+
+[Unit]
+Description=orihsus — OpenCode Go key rotation gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orihsus
+Group=orihsus
+ExecStart=/usr/local/bin/orihsus --config /etc/orihsus/config.yaml
+Restart=on-failure
+RestartSec=3
+
+# --- sandbox (non-root user, no capabilities) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/etc/orihsus
+ReadWritePaths=/var/log/orihsus
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+LimitNOFILE=65536
+
+# Graceful shutdown is bounded in-process, but that budget is real: the server
+# drains in-flight connections for up to 30s (DRAIN_TIMEOUT) and then flushes
+# the audit writer with a 5s bound (AUDIT_SHUTDOWN_TIMEOUT). TimeoutStopSec
+# covers both plus margin (45s = 30s drain + 5s audit + margin), so systemd
+# never SIGKILLs a process that is legitimately draining or flushing. This is a
+# safety net only — the process exits by itself even if a writer is stuck.
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target
