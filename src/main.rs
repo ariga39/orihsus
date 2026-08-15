@@ -30,6 +30,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliError {
     Help,
+    Version,
     UnknownOption,
     MissingValue,
 }
@@ -38,6 +39,7 @@ impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CliError::Help => Ok(()),
+            CliError::Version => Ok(()),
             CliError::UnknownOption => write!(f, "unknown option (see --help)"),
             CliError::MissingValue => write!(f, "--config requires a path argument"),
         }
@@ -52,7 +54,8 @@ fn usage() -> &'static str {
      \n\
      OPTIONS:\n\
      \x20   --config <PATH>    path to the YAML config (default: /etc/orihsus/config.yaml)\n\
-     \x20   -h, --help         print this help"
+     \x20   -h, --help         print this help\n\
+     \x20   -V, --version      print version and build commit"
 }
 
 fn parse_args(args: &[String]) -> Result<PathBuf, CliError> {
@@ -61,6 +64,9 @@ fn parse_args(args: &[String]) -> Result<PathBuf, CliError> {
     while let Some(arg) = iter.next() {
         if arg == "-h" || arg == "--help" {
             return Err(CliError::Help);
+        }
+        if arg == "-V" || arg == "--version" {
+            return Err(CliError::Version);
         }
         if arg == "--config" {
             let value = iter.next().ok_or(CliError::MissingValue)?;
@@ -160,6 +166,14 @@ async fn main() -> ExitCode {
         Ok(p) => p,
         Err(CliError::Help) => {
             println!("{}", usage());
+            return ExitCode::SUCCESS;
+        }
+        Err(CliError::Version) => {
+            println!(
+                "orihsus {} commit {}",
+                env!("CARGO_PKG_VERSION"),
+                env!("ORIHSUS_COMMIT_HASH")
+            );
             return ExitCode::SUCCESS;
         }
         Err(e) => {
@@ -471,6 +485,18 @@ mod tests {
         assert!(matches!(
             parse_args(&["--help".to_string()]),
             Err(CliError::Help)
+        ));
+    }
+
+    #[test]
+    fn version_flags_request_version_output() {
+        assert!(matches!(
+            parse_args(&["-V".to_string()]),
+            Err(CliError::Version)
+        ));
+        assert!(matches!(
+            parse_args(&["--version".to_string()]),
+            Err(CliError::Version)
         ));
     }
 

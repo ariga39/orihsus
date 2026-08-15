@@ -21,6 +21,8 @@ sudo install -m 0600 config.example.yaml /etc/orihsus/config.yaml
 orihsus --config /etc/orihsus/config.yaml
 ```
 
+Print the package version and the seven-character commit captured at build time with `orihsus --version` (or `-V`). Builds without an available Git checkout report `commit unknown`.
+
 Production setup, including nginx TLS termination, the dedicated user, systemd sandbox, and audit permissions, is documented in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The unit file is [deploy/orihsus.service](deploy/orihsus.service).
 
 ## Configuration
