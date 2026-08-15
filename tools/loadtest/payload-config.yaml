@@ -1,10 +1,9 @@
-# Loopback-only 10MiB body-budget test configuration.
+# Loopback-only 10MiB body-budget configuration. Use only with a debug
+# `loadtest-insecure-upstream` build and the synthetic loopback mock.
 listen:
   host: "127.0.0.1"
   port: 18444
 gateway_token: "loadtest-gateway-token"
-upstream:
-  base_url: "https://127.0.0.1:18443"
 keys:
   - "mock-key-1"
   - "mock-key-2"

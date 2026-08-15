@@ -1,0 +1,14 @@
+/var/log/orihsus/audit.jsonl {
+    daily
+    maxsize 100M
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    su orihsus orihsus
+    create 0600 orihsus orihsus
+    postrotate
+        systemctl kill -s HUP orihsus.service >/dev/null 2>&1 || true
+    endscript
+}

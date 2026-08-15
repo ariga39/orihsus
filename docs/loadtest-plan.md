@@ -4,7 +4,7 @@
 
 Validate gateway capacity boundaries, key rotation, streaming backpressure, slow-client cleanup, slowloris protection, audit behavior, and memory recovery. A generic HTTP benchmark is insufficient because critical behavior depends on precisely scripted upstream timing and response types.
 
-Never run these tests with production keys, production upstreams, or a production audit directory.
+Never run these tests with production keys, production upstreams, or a production audit directory. The debug-only `loadtest-insecure-upstream` feature disables certificate authentication and pins the gateway to the loopback mock; release builds with that feature are rejected.
 
 ## Capacity model
 
@@ -15,6 +15,7 @@ With the example configuration:
 - the 701st simultaneous request is rejected immediately with `503` and `Retry-After: 1`;
 - queued requests time out after 30 seconds with the same response;
 - an execution permit remains held until the downstream body completes or is cancelled.
+- at most 50 SSE responses stream concurrently (one quarter of 200 execution permits); excess SSE responses receive `503` and `Retry-After: 1`.
 
 The body budget is separate. Each request reserves the full `max_body_bytes`, not its content length. With 256 MiB global capacity and a 10 MiB per-request maximum, only 25 requests can buffer bodies simultaneously.
 
@@ -67,7 +68,7 @@ Return approximately 1 KiB JSON immediately. Sweep concurrency through 1, 25, 50
 
 ### 1. Active limit
 
-Hold 200 upstream requests at a barrier. Send more requests and verify that exactly 200 reach the mock until permits are released. Confirm long SSE streams retain permits and that completion admits queued work in FIFO order.
+Hold 200 ordinary upstream requests at a barrier. Send more requests and verify that exactly 200 reach the mock until permits are released. Separately hold 50 SSE streams and verify the 51st receives 503 while ordinary capacity remains available. Confirm long streams retain both permits and that completion admits queued work in FIFO order.
 
 ### 2. Queue limit and deadline
 

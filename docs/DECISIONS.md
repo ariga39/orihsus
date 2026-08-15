@@ -7,7 +7,7 @@ This document records the decisions that define the gateway contract.
 - Implement the service in stable Rust with Tokio, Axum, Reqwest, Rustls, Serde, and Tracing.
 - Ship one native binary with no database, container requirement, administrative UI, or metrics endpoint.
 - Expose only `POST /v1/chat/completions`, `GET /v1/models`, `/healthz`, and `/readyz`. Return explicit 404 or 405 responses for everything else.
-- Preserve successful and error response semantics from the upstream whenever the gateway can safely do so. Stream both SSE and ordinary successful bodies instead of buffering them completely.
+- Stream SSE and ordinary successful bodies without buffering them completely. Sanitize final upstream 401/403/429/5xx bodies into bounded OpenAI-compatible errors; preserve only a validated `Retry-After` on 429.
 
 ## Key rotation
 
@@ -26,6 +26,7 @@ This document records the decisions that define the gateway contract.
 - Never log raw API keys, gateway tokens, authorization headers, or request/response bodies.
 - Allow audit records to be dropped when the bounded queue is full; expose a one-time sanitized warning and counters instead of blocking requests.
 - Reopen the audit file on demand for log rotation, with a bounded acknowledgement wait.
+- Do not enqueue health/readiness probes. Install the bounded daily logrotate policy in `deploy/orihsus.logrotate` (100 MiB maximum, 14 compressed generations, SIGHUP reopen).
 
 ## Security
 
@@ -33,16 +34,21 @@ This document records the decisions that define the gateway contract.
 - Serve plaintext HTTP only on loopback and place nginx at the public boundary for TLS, HTTP/2, rate limiting, access logging, and fail2ban.
 - Never follow upstream redirects. Return 3xx responses unchanged so a selected key cannot escape the fixed API-path allowlist, even within the trusted origin.
 - Require bearer authentication before admission control and body buffering.
-- Require configuration mode `0600`, reject duplicate or blank secrets, and redact secrets from formatting and errors.
+- Revalidate bearer authentication after admission so a queued request cannot survive token rotation.
+- Keep YAML as the operator format but parse it with maintained `yaml_serde`; do not depend on unmaintained `serde_yaml` or unsound `serde_yml`.
+- Reject release builds that enable `loadtest-insecure-upstream`; its debug-only client is pinned to the loopback mock and requires synthetic credentials.
+- On Unix, open configuration with `O_NOFOLLOW`, then verify the open descriptor is a regular file owned by the effective process user with mode `0600`, and read that same descriptor. Reject duplicate or blank secrets and redact secrets from formatting and errors.
+- Forward only `Content-Type`, `Accept`, and a sanitized gateway request ID alongside the selected upstream authorization. Drop all other client headers at the credential-bearing boundary.
 - Refuse to run as root and use a dedicated system account with a restrictive systemd sandbox.
 
 ## Capacity and lifecycle
 
-- Bound active requests, queued requests, total accepted connections, request-body memory, error-body classification, and audit buffering.
+- Bound active requests, queued requests, total accepted connections, request-body memory, model values (256 bytes and configured allowlist), error-body classification, audit buffering, and SSE streams.
 - Reject a full admission queue immediately with `503` and `Retry-After: 1`; apply a finite queue wait deadline.
 - Reserve body-budget permits before buffering a request body and hold them through upstream request construction.
 - Apply deadlines independently to HTTP header reads, request bodies, upstream response headers, upstream error-body reads, and downstream writes. nginx independently bounds public TLS and client behavior.
 - Hold an admission permit until a streamed response reaches EOF, fails, or is cancelled.
+- Give SSE responses a separate cap of one quarter of `max_concurrency` (at least one); reject excess streams with 503 and `Retry-After: 1`.
 - Reap completed connection tasks continuously and bound graceful shutdown even if an audit writer is blocked.
 
 ## Deployment and testing

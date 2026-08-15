@@ -10,7 +10,9 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use orihsus::audit::{fingerprint, AuditError, AuditOutcome, AuditRecord, AuditWriter, Outcome};
 use orihsus::config::Secret;
-use orihsus::gateway::{build_router, AuditSink, BodyBudget, GatewayState, IoTimeouts};
+use orihsus::gateway::{
+    build_router, AuditSink, BodyBudget, GatewayState, IoTimeouts, RuntimeState, RuntimeStore,
+};
 use orihsus::pool::{KeyPool, NoJitter, PoolPolicy};
 use orihsus::queue::AdmissionQueue;
 use tempfile::TempDir;
@@ -364,10 +366,29 @@ async fn healthz_is_always_ok() {
 }
 
 #[tokio::test]
+async fn health_checks_never_enter_the_audit_queue() {
+    let sink = TestSink::default();
+    let app = build_router(state(
+        "http://127.0.0.1:1",
+        &["a"],
+        queue(2, 2, Duration::from_secs(30)),
+        sink.clone(),
+    ));
+    for path in ["/healthz", "/readyz"] {
+        let resp = send(
+            &app,
+            Request::builder().uri(path).body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert!(sink.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn every_client_route_writes_exactly_one_redacted_audit_record() {
-    // The per-request audit contract covers every client-facing route, not just
-    // chat completions: /healthz, /readyz, /v1/models (authed + auth failure),
-    // wrong-method fallbacks and the unknown-path fallback must each write
+    // The per-request audit contract covers non-health client-facing routes:
+    // /v1/models (authed + auth failure), wrong-method fallbacks and unknown paths write
     // exactly one redacted record echoing the validated request id and the
     // final status, with model/key/usage null.
     let sink = TestSink::default();
@@ -385,8 +406,6 @@ async fn every_client_route_writes_exactly_one_redacted_audit_record() {
     }
 
     let cases: &[(&str, &str, &str, u16, bool)] = &[
-        ("GET", "/healthz", "rid-healthz", 200, false),
-        ("GET", "/readyz", "rid-readyz", 200, false),
         ("POST", "/healthz", "rid-healthz-405", 405, false),
         ("POST", "/readyz", "rid-readyz-405", 405, false),
         ("GET", "/v1/models", "rid-models-ok", 200, true),
@@ -432,31 +451,6 @@ async fn every_client_route_writes_exactly_one_redacted_audit_record() {
         assert_eq!(rec.input_tokens, None, "{rid}: usage must be null");
         assert_eq!(rec.output_tokens, None, "{rid}: usage must be null");
     }
-
-    // /readyz must also audit its 429 path (all keys cooling).
-    let mut attempts = p.request();
-    let sel = match attempts.next().await {
-        orihsus::pool::AttemptResult::Selected(s) => s,
-        other => panic!("{other:?}"),
-    };
-    p.report_failure(
-        &sel,
-        orihsus::pool::Failure::Unavailable { retry_after: None },
-    );
-
-    let resp = send(&app, req("GET", "/readyz", "rid-readyz-429")).await;
-    assert_eq!(resp.status().as_u16(), 429);
-    let records = sink.0.lock().unwrap();
-    assert_eq!(
-        records.len(),
-        cases.len() + 1,
-        "the 429 readyz must write exactly one record"
-    );
-    let rec = records.last().unwrap();
-    assert_eq!(rec.request_id, "rid-readyz-429");
-    assert_eq!(rec.status, 429);
-    assert_eq!(rec.model, None);
-    assert_eq!(rec.key_fingerprint, None);
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> axum::response::Response {
@@ -631,14 +625,48 @@ async fn routing_returns_404_and_405_with_openai_error() {
 }
 
 #[tokio::test]
+async fn chat_rejects_models_outside_the_configured_bounded_allowlist() {
+    let control = Arc::new(MockControl::default());
+    let addr = start_mock(control.clone()).await;
+    let app = build_router(state(
+        &format!("http://{addr}"),
+        &["key-1"],
+        queue(2, 2, Duration::from_secs(30)),
+        TestSink::default(),
+    ));
+
+    for model in ["not-configured".to_string(), "m".repeat(257)] {
+        let body = serde_json::json!({"model": model, "messages": []}).to_string();
+        let resp = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", "Bearer gway-token")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+    assert!(
+        control.requests.lock().unwrap().is_empty(),
+        "invalid models must never reach the upstream"
+    );
+}
+
+#[tokio::test]
 async fn readyz_reflects_pool_and_queue_readiness() {
     use orihsus::pool::Failure;
 
     let p = pool(&["a"]);
     let q = queue(2, 2, Duration::from_secs(30));
-    let sink = TestSink::default();
-    let sink_check = sink.clone();
-    let app = build_router(state_with(&p, &q, "http://127.0.0.1:1", sink));
+    let app = build_router(state_with(
+        &p,
+        &q,
+        "http://127.0.0.1:1",
+        TestSink::default(),
+    ));
 
     fn readyz_req(rid: &str) -> Request<Body> {
         Request::builder()
@@ -648,17 +676,16 @@ async fn readyz_reflects_pool_and_queue_readiness() {
             .unwrap()
     }
 
-    // healthy -> 200, one audit record
+    // healthy -> 200
     let resp = send(&app, readyz_req("rid-readyz-ok")).await;
     assert_eq!(
         resp.status(),
         StatusCode::OK,
         "healthy pool + open queue -> 200"
     );
-    assert_rejected_audit(&sink_check, 1, 200);
 
     // All keys cooling: return the client-visible rate-limit contract.
-    // error carrying Retry-After, and still audit exactly once.
+    // error carrying Retry-After.
     let mut req = p.request();
     let sel = match req.next().await {
         orihsus::pool::AttemptResult::Selected(s) => s,
@@ -697,9 +724,8 @@ async fn readyz_reflects_pool_and_queue_readiness() {
         }),
         "readiness failure uses the standard OpenAI error object"
     );
-    assert_rejected_audit(&sink_check, 2, 429);
 
-    // Closed queue: same OpenAI 503 contract, still exactly one audit record.
+    // Closed queue: same OpenAI 503 contract.
     q.close();
     let resp = send(&app, readyz_req("rid-readyz-503-closed")).await;
     assert_eq!(
@@ -733,7 +759,6 @@ async fn readyz_reflects_pool_and_queue_readiness() {
         }),
         "closed-queue readiness failure uses the standard OpenAI error object"
     );
-    assert_rejected_audit(&sink_check, 3, 503);
 }
 
 #[tokio::test]
@@ -766,8 +791,13 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
             .uri("/v1/chat/completions")
             .header("authorization", "Bearer gway-token")
             .header("content-type", "application/json")
+            .header("accept", "application/json")
             .header("x-request-id", "my-req-1")
-            .header("x-custom", "keep-me")
+            .header("cookie", "session=client-secret")
+            .header("x-api-key", "client-api-secret")
+            .header("x-forwarded-for", "203.0.113.9")
+            .header("traceparent", "00-secret-trace-01")
+            .header("x-custom", "drop-me")
             .header("connection", "x-dyn")
             .header("x-dyn", "strip-me")
             .header("keep-alive", "timeout=5")
@@ -800,6 +830,35 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
         v["usage"]["prompt_tokens"], 10,
         "body passed through unchanged"
     );
+
+    let requests = control.requests.lock().unwrap();
+    let upstream_headers = &requests[0].headers;
+    assert_eq!(
+        upstream_headers.get("content-type").unwrap(),
+        "application/json"
+    );
+    assert_eq!(upstream_headers.get("accept").unwrap(), "application/json");
+    assert_eq!(upstream_headers.get("x-request-id").unwrap(), "my-req-1");
+    assert_eq!(
+        upstream_headers.get("authorization").unwrap(),
+        "Bearer key-1"
+    );
+    for rejected in [
+        "cookie",
+        "x-api-key",
+        "x-forwarded-for",
+        "traceparent",
+        "x-custom",
+        "connection",
+        "x-dyn",
+        "keep-alive",
+    ] {
+        assert!(
+            !upstream_headers.contains_key(rejected),
+            "client header {rejected} reached the credential-bearing upstream"
+        );
+    }
+    drop(requests);
 
     let records = sink.0.lock().unwrap();
     assert_eq!(records.len(), 1, "one audit record per request");
@@ -839,11 +898,7 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
         &format!("{addr}"),
         "Host rebuilt from the upstream URL, never the client's"
     );
-    assert_eq!(
-        cr.headers.get("x-custom").unwrap(),
-        "keep-me",
-        "end-to-end header forwarded"
-    );
+    assert!(!cr.headers.contains_key("x-custom"));
     let fwd: serde_json::Value = serde_json::from_slice(&cr.body).unwrap();
     assert_eq!(
         fwd["unknown_field"], 123,
@@ -1519,12 +1574,12 @@ async fn body_budget_prevents_second_body_buffering_until_first_releases() {
     // holds the whole budget, B must not buffer a single byte.
     let bcount = Arc::new(AtomicUsize::new(0));
     let count = bcount.clone();
-    let stream_b = futures_util::stream::iter(
-        (0..16).map(|_| Ok::<Bytes, Infallible>(Bytes::from(vec![b'x'; 1024]))),
-    )
-    .inspect_ok(move |chunk| {
-        count.fetch_add(chunk.len(), Ordering::SeqCst);
-    });
+    let payload_b = Bytes::from_static(br#"{"model":"deepseek-chat","messages":[]}"#);
+    let expected_b = payload_b.len();
+    let stream_b =
+        futures_util::stream::iter([Ok::<Bytes, Infallible>(payload_b)]).inspect_ok(move |chunk| {
+            count.fetch_add(chunk.len(), Ordering::SeqCst);
+        });
     let req_b = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -1574,7 +1629,7 @@ async fn body_budget_prevents_second_body_buffering_until_first_releases() {
     );
     assert_eq!(
         bcount.load(Ordering::SeqCst),
-        16 * 1024,
+        expected_b,
         "B's body is fully buffered after the budget freed"
     );
 }
@@ -1638,12 +1693,12 @@ async fn body_budget_covers_the_upstream_wait_but_not_the_response_stream() {
     // waiting for upstream headers, B must not buffer a single byte.
     let bcount = Arc::new(AtomicUsize::new(0));
     let count = bcount.clone();
-    let stream_b = futures_util::stream::iter(
-        (0..16).map(|_| Ok::<Bytes, Infallible>(Bytes::from(vec![b'x'; 1024]))),
-    )
-    .inspect_ok(move |chunk| {
-        count.fetch_add(chunk.len(), Ordering::SeqCst);
-    });
+    let payload_b = Bytes::from_static(br#"{"model":"deepseek-chat","messages":[]}"#);
+    let expected_b = payload_b.len();
+    let stream_b =
+        futures_util::stream::iter([Ok::<Bytes, Infallible>(payload_b)]).inspect_ok(move |chunk| {
+            count.fetch_add(chunk.len(), Ordering::SeqCst);
+        });
     let req_b = Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
@@ -1680,7 +1735,7 @@ async fn body_budget_covers_the_upstream_wait_but_not_the_response_stream() {
     );
     assert_eq!(
         bcount.load(Ordering::SeqCst),
-        16 * 1024,
+        expected_b,
         "B's body is fully buffered while A's response stream is still open"
     );
 }
@@ -1840,6 +1895,48 @@ async fn queue_full_maps_to_503() {
     assert!(resp.headers().contains_key("retry-after"));
     let v: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
     assert_eq!(v["error"]["type"], "service_unavailable");
+}
+
+#[tokio::test]
+async fn queued_request_must_reauthenticate_after_token_rotation() {
+    let q = queue(1, 1, Duration::from_secs(30));
+    let hold = q.acquire().await.unwrap();
+    let p = pool(&["key-1"]);
+    let runtime = RuntimeStore::new(RuntimeState {
+        gateway_token: Secret::new("token-old"),
+        base_url: Url::parse("http://127.0.0.1:1").unwrap(),
+        max_body_bytes: 1 << 20,
+        models: vec!["deepseek-chat".to_string()],
+    });
+    let app = build_router(GatewayState::with_runtime(
+        upstream_client(),
+        runtime.clone(),
+        p,
+        q.clone(),
+        Arc::new(TestSink::default()),
+        budget_for(1 << 20),
+        IoTimeouts::default(),
+    ));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", "Bearer token-old")
+        .body(Body::from(r#"{"model":"deepseek-chat","messages":[]}"#))
+        .unwrap();
+    let handle = tokio::spawn(async move { send(&app, request).await });
+    while q.snapshot().queued != 1 {
+        tokio::task::yield_now().await;
+    }
+
+    runtime.update(RuntimeState {
+        gateway_token: Secret::new("token-new"),
+        base_url: Url::parse("http://127.0.0.1:1").unwrap(),
+        max_body_bytes: 1 << 20,
+        models: vec!["deepseek-chat".to_string()],
+    });
+    drop(hold);
+
+    assert_eq!(handle.await.unwrap().status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -3113,258 +3210,6 @@ async fn stalled_auth_error_body_is_unavailable_with_no_breaker() {
     }
 }
 
-#[tokio::test]
-async fn oversized_error_with_stalled_remainder_streams_prefix_and_drop_cancels() {
-    // The 64KiB classification cap is reached within the deadline, so
-    // classification degrades to generic and the key cools normally. The
-    // remainder past the cap never EOFs, but the final response must still
-    // forward the buffered prefix plus the live remainder stream byte-for-byte
-    // (never buffering the whole body), holding the permit until EOF or client
-    // drop — a stalled remainder is a stalled stream, not a network failure.
-    let mut partial =
-        br#"{"error":{"type":"GoUsageLimitError","message":"Weekly usage limit reached.","pad":""#
-            .to_vec();
-    partial.extend(std::iter::repeat_n(b'a', 66 * 1024));
-    partial.extend_from_slice(br#""}"#);
-    assert!(
-        partial.len() > 64 * 1024,
-        "body must exceed the classification cap"
-    );
-
-    for status in [429u16, 500] {
-        let (addr, control) =
-            start_partial_error_mock(status, partial.clone(), partial.len() + 512).await;
-        let p = pool(&["key-1", "key-2"]);
-        let q = queue(2, 2, Duration::from_secs(30));
-        let app = build_router(state_with(
-            &p,
-            &q,
-            &format!("http://{addr}"),
-            TestSink::default(),
-        ));
-
-        let resp = tokio::time::timeout(Duration::from_secs(2), send(&app, chat_req()))
-            .await
-            .expect("{status}: the error response must return promptly, not wait for EOF");
-        assert_eq!(
-            resp.status(),
-            StatusCode::from_u16(status).unwrap(),
-            "{status}: the oversized error is forwarded, not replaced by a self-made 503"
-        );
-        assert_eq!(
-            control.accepts.load(Ordering::SeqCst),
-            2,
-            "{status}: the oversized error still fails over to the second key"
-        );
-
-        let mut body = resp.into_body();
-        let first = tokio::time::timeout(Duration::from_secs(2), next_data_frame(&mut body))
-            .await
-            .expect("{status}: the buffered prefix must arrive while the upstream is still open")
-            .expect("a data frame");
-        assert_eq!(
-            first.as_ref(),
-            &partial[..64 * 1024],
-            "{status}: the buffered classification prefix passes through untouched"
-        );
-        assert_eq!(
-            q.snapshot().active,
-            1,
-            "{status}: permit held while the error stream is live, before EOF"
-        );
-
-        drop(body);
-        wait_until_closed(&control, 2).await;
-        tokio::task::yield_now().await;
-        assert_eq!(
-            q.snapshot().active,
-            0,
-            "{status}: client drop cancels the upstream and releases the permit"
-        );
-    }
-}
-
-#[tokio::test]
-async fn oversized_error_prefix_streams_before_upstream_ends_and_drop_releases_permit() {
-    // A 429 error body that overruns the 64KiB classification cap arrives fast,
-    // but the remainder (past the cap) never EOFs. The gateway must NOT buffer
-    // the whole body waiting for EOF: the buffered prefix plus the live
-    // remainder stream must be forwarded so the first bytes reach the client
-    // while the upstream is still open, the permit must be held until EOF/drop,
-    // and dropping the body must cancel the upstream and release the permit.
-    let mut partial =
-        br#"{"error":{"type":"GoUsageLimitError","message":"Weekly usage limit reached.","pad":""#
-            .to_vec();
-    partial.extend(std::iter::repeat_n(b'a', 66 * 1024));
-    partial.extend_from_slice(br#""}"#);
-    assert!(
-        partial.len() > 64 * 1024,
-        "body must exceed the classification cap"
-    );
-
-    let (addr, control) = start_partial_error_mock(429, partial.clone(), partial.len() + 512).await;
-    let q = queue(2, 2, Duration::from_secs(30));
-    let app = build_router(state_with(
-        &pool(&["a"]),
-        &q,
-        &format!("http://{addr}"),
-        TestSink::default(),
-    ));
-
-    let resp = tokio::time::timeout(Duration::from_secs(2), send(&app, chat_req()))
-        .await
-        .expect("the gateway must return the error response promptly, not wait for EOF");
-    assert_eq!(
-        resp.status(),
-        StatusCode::TOO_MANY_REQUESTS,
-        "the oversized 429 is forwarded, not replaced by a self-made 503"
-    );
-
-    let mut body = resp.into_body();
-    let first = tokio::time::timeout(Duration::from_secs(2), next_data_frame(&mut body))
-        .await
-        .expect("the buffered prefix must arrive while the upstream body is still open")
-        .expect("a data frame");
-    assert_eq!(
-        first.as_ref(),
-        &partial[..64 * 1024],
-        "the buffered classification prefix passes through untouched"
-    );
-    assert_eq!(
-        q.snapshot().active,
-        1,
-        "permit held while the error stream is live, before EOF"
-    );
-
-    drop(body);
-    wait_until_closed(&control, 1).await;
-    tokio::task::yield_now().await;
-    assert_eq!(
-        q.snapshot().active,
-        0,
-        "client drop cancels the upstream error stream and releases the permit"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn oversized_error_stalled_remainder_idle_times_out_and_ends_the_response() {
-    // The >64KiB classification prefix arrives fast, but the upstream then
-    // stalls forever — no more bytes and no EOF. The client keeps reading, so
-    // the pump is parked on an idle `upstream.next()`, not on backpressure:
-    // after `upstream_error_body` the idle read must time out, cancelling the
-    // upstream, ending the response body and releasing the permit — never a
-    // permanent hang.
-    let mut partial =
-        br#"{"error":{"type":"GoUsageLimitError","message":"Weekly usage limit reached.","pad":""#
-            .to_vec();
-    partial.extend(std::iter::repeat_n(b'a', 66 * 1024));
-    partial.extend_from_slice(br#""}"#);
-    assert!(
-        partial.len() > 64 * 1024,
-        "body must exceed the classification cap"
-    );
-
-    let (addr, control) = start_partial_error_mock(429, partial.clone(), partial.len() + 512).await;
-    let q = queue(2, 2, Duration::from_secs(30));
-    let timeouts = IoTimeouts {
-        upstream_error_body: Duration::from_secs(5),
-        ..IoTimeouts::default()
-    };
-    let app = build_router(state_with_timeouts(
-        &pool(&["a"]),
-        &q,
-        &format!("http://{addr}"),
-        TestSink::default(),
-        timeouts,
-    ));
-
-    // Drive the handler until the 429 response is returned: the mock's headers
-    // and >64KiB body must land over real IO before timers are advanced.
-    let app2 = app.clone();
-    let handle = tokio::spawn(async move { send(&app2, chat_req()).await });
-    let mut elapsed = Duration::ZERO;
-    let resp = loop {
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(100)).await;
-        elapsed += Duration::from_millis(100);
-        assert!(
-            elapsed < Duration::from_secs(30),
-            "the oversized 429 must be returned, not hang"
-        );
-        if handle.is_finished() {
-            break handle.await.unwrap();
-        }
-    };
-    assert_eq!(
-        resp.status(),
-        StatusCode::TOO_MANY_REQUESTS,
-        "the oversized 429 is forwarded, not replaced by a self-made 503"
-    );
-
-    let mut body = resp.into_body();
-    let first = next_data_frame(&mut body)
-        .await
-        .expect("the buffered classification prefix must arrive while the upstream is still open");
-    assert_eq!(
-        first.as_ref(),
-        &partial[..64 * 1024],
-        "the buffered classification prefix passes through untouched"
-    );
-    assert_eq!(
-        q.snapshot().active,
-        1,
-        "permit held while the error stream is live, before the idle timeout"
-    );
-
-    // Keep reading to completion: the stalled remainder must idle-time out
-    // (5s), end the body and release the permit — never hang forever.
-    let q2 = q.clone();
-    let drain = tokio::spawn(async move {
-        let mut total = first.len();
-        while let Some(f) = next_data_frame(&mut body).await {
-            total += f.len();
-        }
-        (total, q2.snapshot().active)
-    });
-    let mut elapsed = Duration::ZERO;
-    let (total, active) = loop {
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(100)).await;
-        elapsed += Duration::from_millis(100);
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "the stalled remainder must time out and end the body, not hang forever"
-        );
-        if drain.is_finished() {
-            break drain.await.unwrap();
-        }
-    };
-    assert_eq!(
-        total,
-        partial.len(),
-        "prefix + remainder bytes are all forwarded byte-for-byte before the idle timeout"
-    );
-    assert_eq!(
-        active, 0,
-        "permit released once the idle timeout ends the error stream"
-    );
-
-    // The idle timeout must also cancel the stalled upstream connection.
-    let mut elapsed = Duration::ZERO;
-    loop {
-        if control.closed.load(Ordering::SeqCst) >= 1 {
-            break;
-        }
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(100)).await;
-        elapsed += Duration::from_millis(100);
-        assert!(
-            elapsed < Duration::from_secs(10),
-            "the stalled upstream must be cancelled once the idle timeout fires"
-        );
-    }
-}
-
 #[tokio::test(start_paused = true)]
 async fn pool_unavailable_maps_to_429_with_retry_after() {
     use orihsus::pool::Failure;
@@ -3530,6 +3375,43 @@ data: [DONE]
     );
     assert_eq!(records[0].output_tokens, Some(7));
     assert_eq!(records[0].status, 200);
+}
+
+#[tokio::test]
+async fn sse_streams_have_a_separate_concurrency_limit() {
+    let (gate_tx, gate_rx) = tokio::sync::mpsc::channel(1);
+    let control = Arc::new(MockControl::default());
+    control.sse.lock().unwrap().replace(SseControl {
+        event1: b"data: first\n\n".to_vec(),
+        event2: b"data: [DONE]\n\n".to_vec(),
+        event2b: None,
+        gate2: gate_rx,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        cancel_notify: Arc::new(tokio::sync::Notify::new()),
+    });
+    control.responses.lock().unwrap().push_back(MockResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        body: b"data: second\n\n".to_vec(),
+        extra_headers: vec![],
+    });
+    let addr = start_mock(control).await;
+    // The streaming limit is one quarter of total admission, with a floor of 1.
+    let app = build_router(state(
+        &format!("http://{addr}"),
+        &["key-1"],
+        queue(4, 4, Duration::from_secs(30)),
+        TestSink::default(),
+    ));
+
+    let first = send(&app, chat_req()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = send(&app, chat_req()).await;
+    assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(second.headers().get("retry-after").unwrap(), "1");
+
+    drop(first);
+    let _ = gate_tx.send(()).await;
 }
 
 #[tokio::test]
@@ -4044,7 +3926,7 @@ async fn invalid_request_id_is_replaced_and_never_injected() {
             .uri("/v1/chat/completions")
             .header("authorization", "Bearer gway-token")
             .header("x-request-id", evil)
-            .body(Body::from(r#"{"model":"m","messages":[]}"#))
+            .body(Body::from(r#"{"model":"deepseek-chat","messages":[]}"#))
             .unwrap(),
     )
     .await;
@@ -4083,7 +3965,7 @@ async fn invalid_request_id_is_replaced_and_never_injected() {
 }
 
 #[tokio::test]
-async fn final_upstream_error_is_passed_through_not_replaced_by_503() {
+async fn final_upstream_error_is_sanitized_without_leaking_metadata() {
     let control = Arc::new(MockControl::default());
     let addr = start_mock(control.clone()).await;
     let sink = TestSink::default();
@@ -4103,7 +3985,8 @@ async fn final_upstream_error_is_passed_through_not_replaced_by_503() {
     control.responses.lock().unwrap().push_back(MockResponse {
         status: 429,
         content_type: "application/json",
-        body: br#"{"error":{"message":"second-429"}}"#.to_vec(),
+        body: br#"{"error":{"message":"second-429"},"metadata":{"workspace":"wrk_SECRET"}}"#
+            .to_vec(),
         extra_headers: vec![("x-second".to_string(), "2".to_string())],
     });
 
@@ -4111,22 +3994,19 @@ async fn final_upstream_error_is_passed_through_not_replaced_by_503() {
     assert_eq!(
         resp.status(),
         StatusCode::TOO_MANY_REQUESTS,
-        "final upstream 429 must be passed through, not replaced by a self-made 503"
-    );
-    assert_eq!(
-        resp.headers().get("x-second").unwrap(),
-        "2",
-        "second response header passed through"
+        "final upstream 429 keeps its rate-limit status"
     );
     assert!(
-        !resp.headers().contains_key("x-first"),
-        "first response must not leak"
+        !resp.headers().contains_key("x-first") && !resp.headers().contains_key("x-second"),
+        "untrusted upstream headers must not pass through"
     );
     let body = body_string(resp).await;
     assert!(
-        body.contains("second-429"),
-        "second response body passed through"
+        !body.contains("second-429") && !body.contains("wrk_SECRET"),
+        "upstream error body and workspace metadata must not leak"
     );
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["error"]["type"], "rate_limit_error");
 
     {
         let captured = control.requests.lock().unwrap();
@@ -4154,7 +4034,7 @@ async fn final_upstream_error_is_passed_through_not_replaced_by_503() {
 }
 
 #[tokio::test]
-async fn final_server_error_is_passed_through_when_both_keys_fail() {
+async fn final_server_error_is_sanitized_when_both_keys_fail() {
     let control = Arc::new(MockControl::default());
     let addr = start_mock(control.clone()).await;
     let app = build_router(state(
@@ -4185,10 +4065,12 @@ async fn final_server_error_is_passed_through_when_both_keys_fail() {
     assert_eq!(
         resp.status(),
         StatusCode::INTERNAL_SERVER_ERROR,
-        "final 500 passed through"
+        "final upstream status is preserved"
     );
     let body = body_string(resp).await;
-    assert!(body.contains("boom-2"));
+    assert!(!body.contains("boom-1") && !body.contains("boom-2"));
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["error"]["type"], "upstream_error");
 }
 
 #[tokio::test(start_paused = true)]
@@ -4490,92 +4372,6 @@ async fn unavailable_proactive_usage_check_leaves_passive_429_failover_intact() 
     assert_eq!(
         captured[1].headers.get("authorization").unwrap(),
         "Bearer key-2"
-    );
-}
-
-#[tokio::test]
-async fn final_429_error_body_is_passed_through_byte_for_byte() {
-    let control = Arc::new(MockControl::default());
-    let addr = start_mock(control.clone()).await;
-    let app = build_router(state(
-        &format!("http://{addr}"),
-        &["key-1", "key-2"],
-        queue(2, 2, Duration::from_secs(30)),
-        TestSink::default(),
-    ));
-
-    control
-        .responses
-        .lock()
-        .unwrap()
-        .push_back(MockResponse::json(429, USAGE_429_WEEKLY));
-    control
-        .responses
-        .lock()
-        .unwrap()
-        .push_back(MockResponse::json(429, b"second-429-exact-body"));
-
-    let resp = send(&app, chat_req()).await;
-    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-    let body = body_string(resp).await;
-    assert_eq!(
-        body.as_bytes(),
-        b"second-429-exact-body",
-        "the final upstream 429 body must pass through byte-for-byte"
-    );
-}
-
-#[tokio::test(start_paused = true)]
-async fn oversized_429_body_degrades_to_generic_and_passes_through_fully() {
-    let control = Arc::new(MockControl::default());
-    let addr = start_mock(control.clone()).await;
-    let p = pool_with_timeout(&["a"], Duration::from_secs(30));
-    let q = queue(2, 2, Duration::from_secs(30));
-    let app = build_router(state_with(
-        &p,
-        &q,
-        &format!("http://{addr}"),
-        TestSink::default(),
-    ));
-
-    let mut big = br#"{"error":{"type":"GoUsageLimitError","message":"Resets in 3 days."},"metadata":{"workspace":"wrk_x","limitName":"weekly"},"pad":""#
-        .to_vec();
-    big.extend(std::iter::repeat_n(b'a', 80 * 1024));
-    big.extend_from_slice(b"\"}");
-    assert!(big.len() > 64 * 1024);
-    control.responses.lock().unwrap().push_back(MockResponse {
-        status: 429,
-        content_type: "application/json",
-        body: big.clone(),
-        extra_headers: Vec::new(),
-    });
-
-    let resp = send_io(&app, chat_req()).await;
-    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
-    let body = body_string(resp).await;
-    assert_eq!(
-        body.as_bytes(),
-        big.as_slice(),
-        "an oversized 429 body must still pass through completely"
-    );
-
-    // Overflowed body must be classified as GENERIC: the key cools for the
-    // initial 5s backoff, not for the 7d weekly usage fallback.
-    let mut req = p.request();
-    let handle = tokio::spawn(async move { req.next().await });
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::from_secs(4)).await;
-    assert!(
-        !handle.is_finished(),
-        "oversized body must degrade to generic: cooling 5s, not 7d"
-    );
-    tokio::time::advance(Duration::from_secs(1)).await;
-    assert!(
-        matches!(
-            handle.await.unwrap(),
-            orihsus::pool::AttemptResult::Selected(_)
-        ),
-        "generic backoff recovers after 5s"
     );
 }
 
@@ -5543,88 +5339,6 @@ async fn stalled_non_streaming_success_idle_times_out_ends_response_and_releases
             "the stalled upstream must be cancelled once the idle bound fires"
         );
     }
-}
-
-#[tokio::test(start_paused = true)]
-async fn oversized_error_to_a_slow_client_ends_after_response_write() {
-    // The oversized-error pump gets the same per-chunk write budget: after the
-    // >64KiB classification prefix is buffered, the live remainder streams to a
-    // client that then stops reading. The 16-slot channel fills, the pump parks
-    // on tx.send, and once response_write elapses the error stream must end,
-    // the upstream be cancelled and the permit released — the same bounded
-    // contract as the success pump.
-    let mut partial =
-        br#"{"error":{"type":"GoUsageLimitError","message":"Weekly usage limit reached.","pad":""#
-            .to_vec();
-    partial.extend(std::iter::repeat_n(b'a', 192 * 1024));
-    partial.extend_from_slice(br#""}"#);
-    assert!(
-        partial.len() > 64 * 1024,
-        "body must exceed the classification cap"
-    );
-
-    let (addr, control) = start_partial_error_mock(429, partial.clone(), partial.len() + 512).await;
-    let q = queue(2, 2, Duration::from_secs(30));
-    let timeouts = IoTimeouts {
-        upstream_error_body: Duration::from_secs(5),
-        response_write: Duration::from_secs(30),
-        ..IoTimeouts::default()
-    };
-    let app = build_router(state_with_timeouts(
-        &pool(&["a"]),
-        &q,
-        &format!("http://{addr}"),
-        TestSink::default(),
-        timeouts,
-    ));
-
-    let app2 = app.clone();
-    let handle = tokio::spawn(async move { send(&app2, chat_req()).await });
-    let resp = loop {
-        tokio::task::yield_now().await;
-        if handle.is_finished() {
-            break handle.await.unwrap();
-        }
-    };
-    assert_eq!(
-        resp.status(),
-        StatusCode::TOO_MANY_REQUESTS,
-        "the oversized 429 is forwarded, not replaced"
-    );
-    let mut body = resp.into_body();
-    let first = next_data_frame(&mut body)
-        .await
-        .expect("the buffered classification prefix streams");
-    assert_eq!(
-        first.as_ref(),
-        &partial[..64 * 1024],
-        "the buffered classification prefix passes through untouched"
-    );
-    assert_eq!(q.snapshot().active, 1);
-
-    // The client stops reading; the remainder fills the channel and the pump
-    // parks on tx.send. Cross the write budget: the error stream must end.
-    let mut elapsed = Duration::ZERO;
-    loop {
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(100)).await;
-        elapsed += Duration::from_millis(100);
-        assert!(
-            elapsed < Duration::from_secs(40),
-            "the error stream must be abandoned after the write budget, not hang"
-        );
-        if control.closed.load(Ordering::SeqCst) >= 1 {
-            break;
-        }
-    }
-    assert_eq!(
-        q.snapshot().active,
-        0,
-        "permit released once the write budget fires"
-    );
-    // Remainder bytes already handed off before the budget fired are still
-    // buffered in the response channel; the error body must drain them and end.
-    while next_data_frame(&mut body).await.is_some() {}
 }
 
 #[tokio::test]

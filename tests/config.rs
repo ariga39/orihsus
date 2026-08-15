@@ -959,6 +959,19 @@ models:
 }
 
 #[test]
+fn configured_model_names_are_bounded_to_256_bytes() {
+    let dir = TempDir::new().unwrap();
+    let oversized = "m".repeat(257);
+    let path = write_config(
+        dir.path(),
+        "oversized-model.yaml",
+        &format!("gateway_token: gway-secret\nkeys:\n  - key-1\nmodels:\n  - {oversized}\n"),
+    );
+    let err = orihsus::config::load(&path).unwrap_err();
+    assert!(format!("{err}").contains("256 bytes"), "got: {err}");
+}
+
+#[test]
 fn config_file_must_have_0600_permissions() {
     let dir = TempDir::new().unwrap();
     let path = write_config(
@@ -977,6 +990,23 @@ keys:
 
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(orihsus::config::load(&path).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn config_loader_rejects_symlinks_even_when_target_is_mode_0600() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let target = write_config(dir.path(), "real.yaml", MINIMAL);
+    let link = dir.path().join("config.yaml");
+    symlink(&target, &link).unwrap();
+
+    let err = orihsus::config::load(&link).unwrap_err();
+    assert!(
+        format!("{err}").contains("cannot read config"),
+        "symlink must be rejected at open: {err}"
+    );
 }
 
 #[test]

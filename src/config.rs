@@ -1,4 +1,8 @@
 use std::fmt;
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -6,7 +10,11 @@ use std::time::Duration;
 use crate::pool::MAX_COOLDOWN;
 use serde::Deserialize;
 
+#[cfg(not(feature = "loadtest-insecure-upstream"))]
 pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/";
+#[cfg(feature = "loadtest-insecure-upstream")]
+pub const OPENCODE_GO_BASE_URL: &str = "https://127.0.0.1:18443/";
+pub const MAX_MODEL_BYTES: usize = 256;
 
 /// Closed set of upstream APIs that may receive an OpenCode Go key.
 #[derive(Debug, Clone, Copy)]
@@ -64,14 +72,16 @@ const DEFAULT_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Load and validate the full runtime configuration from a YAML file.
 pub fn load(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
     let path = path.as_ref();
-    check_permissions(path)?;
-    let contents = std::fs::read_to_string(path).map_err(|e| ConfigError {
-        kind: ErrorKind::Io {
-            path: path.to_owned(),
-            source: e,
-        },
-    })?;
-    let raw: RawConfig = serde_yaml::from_str(&contents).map_err(|e| {
+    let mut file = open_config(path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|e| ConfigError {
+            kind: ErrorKind::Io {
+                path: path.to_owned(),
+                source: e,
+            },
+        })?;
+    let raw: RawConfig = yaml_serde::from_str(&contents).map_err(|e| {
         let (line, column) = match e.location() {
             Some(loc) => (loc.line(), loc.column()),
             None => (0, 0),
@@ -88,25 +98,55 @@ pub fn load(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
 }
 
 #[cfg(unix)]
-fn check_permissions(path: &Path) -> Result<(), ConfigError> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path).map_err(|e| ConfigError {
+fn open_config(path: &Path) -> Result<File, ConfigError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| ConfigError {
+            kind: ErrorKind::Io {
+                path: path.to_owned(),
+                source: e,
+            },
+        })?;
+    let meta = file.metadata().map_err(|e| ConfigError {
         kind: ErrorKind::Io {
             path: path.to_owned(),
             source: e,
         },
     })?;
-    if meta.permissions().mode() & 0o777 != 0o600 {
+    // Validate and read the same open file description. This closes both
+    // symlink traversal and path-replacement TOCTOU windows.
+    // SAFETY: geteuid takes no arguments, has no preconditions, and cannot fail.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !secure_config_metadata(
+        meta.is_file(),
+        meta.permissions().mode() & 0o777,
+        meta.uid(),
+        effective_uid,
+    ) {
         return Err(ConfigError {
             kind: ErrorKind::Permission(path.to_owned()),
         });
     }
-    Ok(())
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn secure_config_metadata(is_file: bool, mode: u32, owner: u32, effective_uid: u32) -> bool {
+    is_file && mode == 0o600 && owner == effective_uid
 }
 
 #[cfg(not(unix))]
-fn check_permissions(_path: &Path) -> Result<(), ConfigError> {
-    Ok(())
+fn open_config(path: &Path) -> Result<File, ConfigError> {
+    File::open(path).map_err(|e| ConfigError {
+        kind: ErrorKind::Io {
+            path: path.to_owned(),
+            source: e,
+        },
+    })
 }
 
 /// Fully validated runtime configuration.
@@ -250,7 +290,7 @@ impl fmt::Display for ConfigError {
             ErrorKind::Permission(path) => {
                 write!(
                     f,
-                    "config file {} must have Unix permissions 0600",
+                    "config file {} must be a regular file owned by the process user with Unix permissions 0600",
                     path.display()
                 )
             }
@@ -313,6 +353,11 @@ impl Config {
                     if m.trim().is_empty() {
                         return Err(validation(
                             "models must contain only non-blank model names".into(),
+                        ));
+                    }
+                    if m.len() > MAX_MODEL_BYTES {
+                        return Err(validation(
+                            "models must not exceed 256 bytes per value".into(),
                         ));
                     }
                     if !seen.insert(m) {
@@ -641,7 +686,7 @@ struct RawLimits {
 #[serde(rename_all = "snake_case")]
 struct RawKeyFailureHandling {
     /// Retained only to provide a redacted migration error for an old field.
-    soft_threshold: Option<serde_yaml::Value>,
+    soft_threshold: Option<yaml_serde::Value>,
     backoff_initial_seconds: Option<u64>,
     backoff_max_seconds: Option<u64>,
     breaker_threshold: Option<usize>,
@@ -678,8 +723,14 @@ mod upstream_allowlist_tests {
     fn built_in_upstream_has_one_https_origin_without_query_or_fragment() {
         let base = url::Url::parse(OPENCODE_GO_BASE_URL).unwrap();
         assert_eq!(base.scheme(), "https");
+        #[cfg(not(feature = "loadtest-insecure-upstream"))]
         assert_eq!(base.host_str(), Some("opencode.ai"));
+        #[cfg(not(feature = "loadtest-insecure-upstream"))]
         assert_eq!(base.path(), "/zen/go/");
+        #[cfg(feature = "loadtest-insecure-upstream")]
+        assert_eq!(base.host_str(), Some("127.0.0.1"));
+        #[cfg(feature = "loadtest-insecure-upstream")]
+        assert_eq!(base.path(), "/");
         assert!(base.query().is_none());
         assert!(base.fragment().is_none());
     }
@@ -687,13 +738,27 @@ mod upstream_allowlist_tests {
     #[test]
     fn upstream_api_allowlist_builds_only_fixed_paths() {
         let base = url::Url::parse(OPENCODE_GO_BASE_URL).unwrap();
+        #[cfg(not(feature = "loadtest-insecure-upstream"))]
+        let expected_prefix = "/zen/go";
+        #[cfg(feature = "loadtest-insecure-upstream")]
+        let expected_prefix = "";
         assert_eq!(
-            upstream_api_url(&base, UpstreamApi::ChatCompletions).as_str(),
-            "https://opencode.ai/zen/go/v1/chat/completions"
+            upstream_api_url(&base, UpstreamApi::ChatCompletions).path(),
+            format!("{expected_prefix}/v1/chat/completions")
         );
         assert_eq!(
-            upstream_api_url(&base, UpstreamApi::Usage).as_str(),
-            "https://opencode.ai/zen/go/v1/usage"
+            upstream_api_url(&base, UpstreamApi::Usage).path(),
+            format!("{expected_prefix}/v1/usage")
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod config_file_security_tests {
+    use super::secure_config_metadata;
+
+    #[test]
+    fn owner_mismatch_is_rejected_even_for_a_regular_mode_0600_file() {
+        assert!(!secure_config_metadata(true, 0o600, 1001, 1000));
     }
 }

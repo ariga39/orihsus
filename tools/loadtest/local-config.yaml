@@ -1,11 +1,10 @@
-# Loopback-only load-test configuration. The upstream certificate is accepted
-# only by an orihsus binary built with `loadtest-insecure-upstream`.
+# Loopback-only load-test configuration. A debug orihsus binary built with
+# `loadtest-insecure-upstream` pins upstream to https://127.0.0.1:18443/ and
+# accepts its synthetic certificate. Release builds reject that feature.
 listen:
   host: "127.0.0.1"
   port: 18444
 gateway_token: "loadtest-gateway-token"
-upstream:
-  base_url: "https://127.0.0.1:18443"
 keys:
   - "mock-key-1"
   - "mock-key-2"

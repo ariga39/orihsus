@@ -11,7 +11,7 @@ OpenCode Go subscription keys have independent usage limits and recovery times. 
 
 - Never leak an upstream key to clients, redirects, diagnostics, or audit logs.
 - Continue serving when one key reaches a quota or fails.
-- Preserve streaming latency and upstream error semantics.
+- Preserve streaming latency without exposing upstream error bodies or metadata.
 - Bound memory, connections, concurrency, queueing, retries, and shutdown.
 - Keep deployment and state management simple.
 
@@ -33,7 +33,7 @@ When every candidate is unavailable, wait only within the configured pool deadli
 
 ### Capacity control
 
-Use semaphores for active requests, queued waiters, accepted connections, and total buffered request-body bytes. Reject overflow immediately and place deadlines around every externally controlled wait. Use bounded channels for response pumping and audit work.
+Use semaphores for active requests, queued waiters, accepted connections, total buffered request-body bytes, and SSE streams. Cap SSE at one quarter of active-request capacity (at least one). Reject overflow immediately and place deadlines around every externally controlled wait. Use bounded channels for response pumping and audit work.
 
 ### Streaming boundary
 
@@ -41,15 +41,15 @@ Forward SSE and ordinary successful bodies incrementally. Retries are allowed on
 
 ### Configuration
 
-Parse and validate a mode-`0600` YAML file. Require a loopback listen address. Publish one immutable runtime snapshot containing the hot-reloadable token, keys, and model list. Changes to listener, capacity, audit, or polling schedules require restart. The upstream URL is not configurable.
+Parse and validate a mode-`0600` YAML file with maintained `yaml_serde`. Require a loopback listen address. Publish one immutable runtime snapshot containing the hot-reloadable token, keys, and model allowlist; each model is limited to 256 UTF-8 bytes. Changes to listener, capacity, audit, or polling schedules require restart. The upstream URL is not configurable.
 
 ### Network and security
 
-Fix the upstream service root to `https://opencode.ai/zen/go/` and allow credential-bearing requests only to the built-in chat-completions and usage paths. Reject all upstream URL configuration, preventing SSRF and key disclosure through private, loopback, metadata, query, fragment, or custom-path targets. Never follow redirects, including same-origin redirects, because they could escape the path allowlist. Reject root execution, bind loopback HTTP only, limit header size/read time, and authenticate before admission or body allocation. nginx owns public TLS, HTTP/2, connection policy, rate limiting, and fail2ban-visible access logs.
+Fix the upstream service root to `https://opencode.ai/zen/go/` and allow credential-bearing requests only to the built-in chat-completions and usage paths. Reject all upstream URL configuration, preventing SSRF and key disclosure through private, loopback, metadata, query, fragment, or custom-path targets. Never follow redirects, including same-origin redirects, because they could escape the path allowlist. Forward only content negotiation/type and a sanitized request ID from the client boundary; drop cookies, alternate API keys, forwarding identity, tracing baggage, and extension headers. Reject root execution, bind loopback HTTP only, limit header size/read time, authenticate before admission/body allocation, and authenticate again after a queued request is admitted. On Unix, open config with no-follow and validate owner/type/mode on the same descriptor that is read. A debug-only load-test feature pins its mock to loopback; enabling its TLS bypass in a release build is a compile error. nginx owns public TLS, HTTP/2, connection policy, rate limiting, and fail2ban-visible access logs.
 
 ### Audit
 
-Send sanitized records to a bounded non-blocking queue consumed by a writer thread. Record fingerprints and outcomes, not bodies or secrets. Support bounded reopen and shutdown operations; prefer a dropped audit record plus warning over blocking request traffic.
+Send sanitized, size-bounded records to a bounded non-blocking queue consumed by a writer thread. Record fingerprints and outcomes, not bodies or secrets, and omit health/readiness probes. Support bounded reopen and shutdown operations; ship logrotate policy and prefer a dropped audit record plus warning over blocking request traffic.
 
 ### Deployment
 

@@ -272,9 +272,15 @@ async fn http_adapter_uses_fixed_get_endpoint_and_bearer_header() {
             .parse()
             .unwrap(),
     );
+    #[cfg(not(feature = "loadtest-insecure-upstream"))]
     assert_eq!(
         orihsus::usage::HttpUsageFetcher::endpoint().as_str(),
         "https://opencode.ai/zen/go/v1/usage"
+    );
+    #[cfg(feature = "loadtest-insecure-upstream")]
+    assert_eq!(
+        orihsus::usage::HttpUsageFetcher::endpoint().as_str(),
+        "https://127.0.0.1:18443/v1/usage"
     );
     assert_eq!(
         fetcher.fetch(&Secret::new("adapter-secret")).await.unwrap(),

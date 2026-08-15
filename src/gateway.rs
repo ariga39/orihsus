@@ -15,13 +15,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use chrono::{DateTime, Utc};
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use subtle::ConstantTimeEq;
 use tokio_stream::wrappers::ReceiverStream;
 use url::Url;
 
 use crate::audit::{AuditError, AuditOutcome, AuditRecord, Outcome};
-use crate::config::{upstream_api_url, Secret, UpstreamApi};
+use crate::config::{upstream_api_url, Secret, UpstreamApi, MAX_MODEL_BYTES};
 use crate::pool::{AttemptResult, Failure, KeyPool, UsageDimension};
 use crate::queue::{AdmissionError, AdmissionQueue, Permit};
 
@@ -362,6 +362,7 @@ pub struct GatewayState {
     pub(crate) audit: Arc<dyn AuditSink>,
     pub(crate) runtime: RuntimeStore,
     pub(crate) body_budget: BodyBudget,
+    pub(crate) stream_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) timeouts: IoTimeouts,
 }
 
@@ -407,6 +408,7 @@ impl GatewayState {
         body_budget: BodyBudget,
         timeouts: IoTimeouts,
     ) -> GatewayState {
+        let max_streams = (queue.snapshot().max_concurrency / 4).max(1);
         GatewayState {
             http,
             pool,
@@ -414,6 +416,7 @@ impl GatewayState {
             audit,
             runtime,
             body_budget,
+            stream_slots: Arc::new(tokio::sync::Semaphore::new(max_streams)),
             timeouts,
         }
     }
@@ -433,28 +436,18 @@ pub fn build_router(state: GatewayState) -> Router {
         .with_state(Arc::new(state))
 }
 
-async fn healthz(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> StatusCode {
-    let start = tokio::time::Instant::now();
-    let request_id = request_id_for(req.headers());
-    record_audit_rejected(&state, &request_id, StatusCode::OK.as_u16(), start);
+async fn healthz() -> StatusCode {
     StatusCode::OK
 }
 
-async fn readyz(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
-    let start = tokio::time::Instant::now();
-    let request_id = request_id_for(req.headers());
-    let (status, resp) = if state.queue.is_closed() {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            service_unavailable(Some(1)),
-        )
+async fn readyz(State(state): State<Arc<GatewayState>>) -> Response {
+    if state.queue.is_closed() {
+        service_unavailable(Some(1))
     } else if !state.pool.has_available_key() {
-        (StatusCode::TOO_MANY_REQUESTS, rate_limited(1))
+        rate_limited(1)
     } else {
-        (StatusCode::OK, StatusCode::OK.into_response())
-    };
-    record_audit_rejected(&state, &request_id, status.as_u16(), start);
-    resp
+        StatusCode::OK.into_response()
+    }
 }
 
 fn openai_error(
@@ -676,24 +669,21 @@ async fn forward_request(
     headers: &HeaderMap,
     body: &Bytes,
     base_url: &Url,
+    request_id: &str,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let url = upstream_api_url(base_url, UpstreamApi::ChatCompletions);
-    let connection_headers = connection_named_headers(headers);
     let mut rb = state.http.post(url).body(body.clone());
-    for (name, value) in headers {
-        let lname = name.as_str().to_ascii_lowercase();
-        if is_hop_by_hop(&lname) || connection_headers.contains(&lname) {
-            continue;
+    // Credential-bearing traffic receives only the OpenAI protocol headers.
+    // Ambient cookies, proxy identity, API keys, and tracing baggage are never
+    // relayed to the upstream.
+    for allowed in [CONTENT_TYPE, axum::http::header::ACCEPT] {
+        for value in headers.get_all(&allowed) {
+            rb = rb.header(allowed.clone(), value.clone());
         }
-        if matches!(
-            lname.as_str(),
-            "authorization" | "host" | "content-length" | "transfer-encoding"
-        ) {
-            continue;
-        }
-        rb = rb.header(name.clone(), value.clone());
     }
-    rb = rb.header(AUTHORIZATION, format!("Bearer {}", sel.key().as_str()));
+    rb = rb
+        .header("x-request-id", request_id)
+        .header(AUTHORIZATION, format!("Bearer {}", sel.key().as_str()));
     rb.send().await
 }
 
@@ -840,6 +830,18 @@ async fn chat_completions(State(state): State<Arc<GatewayState>>, req: Request<B
             return queue_error_response(e);
         }
     };
+    // A queued request may have passed the first check before a hot token
+    // rotation. Revalidate after admission, immediately before taking the
+    // runtime/key snapshot and reading the body.
+    if let Err(resp) = check_auth(&state, req.headers()) {
+        record_audit_rejected(
+            &state,
+            &request_id,
+            StatusCode::UNAUTHORIZED.as_u16(),
+            start,
+        );
+        return resp;
+    }
     // One consistent (snapshot, key-pool) pair for this whole request, grabbed
     // atomically; in-flight SSE streams keep the pair they started with.
     let (rt, mut attempts) = state.runtime.snapshot_and_request(&state.pool);
@@ -896,7 +898,24 @@ async fn chat_completions(State(state): State<Arc<GatewayState>>, req: Request<B
             return service_unavailable(Some(1));
         }
     };
-    let model = extract_model(&body_bytes).unwrap_or_default();
+    let Some(model) = extract_model(&body_bytes) else {
+        record_audit_rejected(&state, &request_id, StatusCode::BAD_REQUEST.as_u16(), start);
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "Model must be one of the configured models",
+            "invalid_request_error",
+            Some("invalid_model"),
+        );
+    };
+    if model.len() > MAX_MODEL_BYTES || !rt.models.iter().any(|allowed| allowed == &model) {
+        record_audit_rejected(&state, &request_id, StatusCode::BAD_REQUEST.as_u16(), start);
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "Model must be one of the configured models",
+            "invalid_request_error",
+            Some("invalid_model"),
+        );
+    }
 
     let mut last_response: Option<(ConsumedResponse, String)> = None;
     let final_outcome = loop {
@@ -913,7 +932,14 @@ async fn chat_completions(State(state): State<Arc<GatewayState>>, req: Request<B
         // never bounded here, so a long stream is not affected.
         let resp = match tokio::time::timeout(
             state.timeouts.upstream_header,
-            forward_request(&state, &sel, &parts.headers, &body_bytes, &rt.base_url),
+            forward_request(
+                &state,
+                &sel,
+                &parts.headers,
+                &body_bytes,
+                &rt.base_url,
+                &request_id,
+            ),
         )
         .await
         {
@@ -1113,38 +1139,25 @@ struct ConsumedResponse {
     body: ErrorBody,
 }
 
-/// Unread remainder of an oversized upstream error body: the bytes past the
-/// classification cap plus the still-open upstream stream. Kept alive so the
-/// final response can forward it byte-for-byte; dropping it cancels the
-/// upstream connection.
-#[allow(clippy::type_complexity)]
-type ErrorBodyRemainder =
-    std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
-
 /// Result of a bounded classification read of an upstream error body.
 enum ErrorBody {
     /// EOF reached at or before the classification cap: the complete body is
     /// buffered and can be passed through byte-for-byte.
     Buffered(Bytes),
-    /// More than the cap was pending without EOF: classification degrades to a
-    /// generic rate-limit; the final response forwards the buffered `prefix`
-    /// followed by `rest` (the still-unread upstream stream) byte-for-byte,
-    /// never buffering the whole body.
-    Oversized {
-        prefix: Bytes,
-        rest: ErrorBodyRemainder,
-    },
+    /// More than the cap was pending without EOF. The body is discarded after
+    /// classification and never exposed to the client.
+    Oversized,
 }
 
 /// Bounded classification read of an upstream error response's body. Reads at
 /// most [`ERROR_CLASSIFY_CAP`] bytes of prefix: a body whose EOF lands within
 /// the cap is buffered whole; a body that overruns the cap keeps the unread
-/// remainder as a stream. `Err(())` means a mid-body connection failure; the
-/// partial bytes are discarded, nothing leaks to the client.
+/// remainder is discarded. `Err(())` means a mid-body connection failure; the
+/// partial bytes are also discarded.
 async fn consume_error_response(resp: reqwest::Response) -> Result<ConsumedResponse, ()> {
     let status = resp.status();
     let headers = filter_response_headers(resp.headers());
-    let mut stream: ErrorBodyRemainder = Box::pin(resp.bytes_stream());
+    let mut stream = resp.bytes_stream();
     let mut prefix: Vec<u8> = Vec::with_capacity(ERROR_CLASSIFY_CAP.min(4096));
     loop {
         let chunk = match stream.next().await {
@@ -1163,16 +1176,10 @@ async fn consume_error_response(resp: reqwest::Response) -> Result<ConsumedRespo
             prefix.extend_from_slice(&chunk);
         } else {
             prefix.extend_from_slice(&chunk[..remaining]);
-            let tail = chunk.slice(remaining..);
-            let rest: ErrorBodyRemainder =
-                Box::pin(futures_util::stream::iter([Ok(tail)]).chain(stream));
             return Ok(ConsumedResponse {
                 status,
                 headers,
-                body: ErrorBody::Oversized {
-                    prefix: Bytes::from(prefix),
-                    rest,
-                },
+                body: ErrorBody::Oversized,
             });
         }
     }
@@ -1184,7 +1191,7 @@ async fn consume_error_response(resp: reqwest::Response) -> Result<ConsumedRespo
 fn classify_error_body(body: &ErrorBody) -> RateLimitKind {
     match body {
         ErrorBody::Buffered(bytes) => classify_429(bytes, false),
-        ErrorBody::Oversized { .. } => RateLimitKind::Generic,
+        ErrorBody::Oversized => RateLimitKind::Generic,
     }
 }
 
@@ -1220,180 +1227,45 @@ async fn finalize_consumed_error(
     fingerprint: String,
     start: tokio::time::Instant,
 ) -> Response {
-    match consumed.body {
-        ErrorBody::Buffered(body) => {
-            let status = consumed.status;
-            record_audit(
-                state,
-                &request_id,
-                &model,
-                &fingerprint,
-                None,
-                None,
-                status.as_u16(),
-                start,
-                None,
-            );
-            drop(permit);
-            build_buffered_response(status, consumed.headers, body, &request_id)
-        }
-        ErrorBody::Oversized { prefix, rest } => {
-            stream_error_response(
-                state.clone(),
-                consumed.status,
-                consumed.headers,
-                prefix,
-                rest,
-                permit,
-                request_id,
-                model,
-                fingerprint,
-                start,
-            )
-            .await
-        }
-    }
-}
-
-/// Build a response from a fully buffered upstream error body.
-fn build_buffered_response(
-    status: StatusCode,
-    headers: HeaderMap,
-    body: Bytes,
-    request_id: &str,
-) -> Response {
-    let body = Body::from(body);
-    let mut rb = Response::builder().status(status);
-    let mut last_name: Option<HeaderName> = None;
-    for (name, value) in headers {
-        let name = match name {
-            Some(n) => {
-                last_name = Some(n.clone());
-                n
-            }
-            None => last_name
-                .clone()
-                .expect("only the first header entry may lack a name"),
-        };
-        rb = rb.header(name, value);
-    }
-    rb = rb.header("x-request-id", request_id);
-    rb.body(body).unwrap()
-}
-
-/// Outcome of draining the oversized error remainder to the client. Reserved
-/// for the (future) audit extension that distinguishes a completed stream from
-/// one cancelled by the upstream idle timeout; this slice returns it but does
-/// not extend the audit schema.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ErrorPumpOutcome {
-    /// The remainder reached EOF, the upstream errored, or the client
-    /// disconnected before any idle deadline elapsed.
-    Completed,
-    /// The upstream sent no data within the idle bound; the remainder was
-    /// cancelled and the client stream ended.
-    TimedOut,
-}
-
-/// Stream an oversized upstream error to the client: the buffered classification
-/// prefix followed by the still-unread upstream body, byte-for-byte. The body
-/// guard holds the admission permit until the stream reaches EOF, the upstream
-/// goes idle past [`IoTimeouts::upstream_error_body`], or the client drops the
-/// response body; on drop the upstream stream is cancelled.
-#[allow(clippy::too_many_arguments)]
-async fn stream_error_response(
-    state: Arc<GatewayState>,
-    status: StatusCode,
-    headers: HeaderMap,
-    prefix: Bytes,
-    rest: ErrorBodyRemainder,
-    permit: Permit,
-    request_id: String,
-    model: String,
-    fingerprint: String,
-    start: tokio::time::Instant,
-) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    let client_gone = Arc::new(tokio::sync::Notify::new());
-    let task_gone = Arc::clone(&client_gone);
-    let task_request_id = request_id.clone();
-    let status_u16 = status.as_u16();
-
-    tokio::spawn(async move {
-        let mut upstream =
-            futures_util::stream::iter([Ok::<Bytes, reqwest::Error>(prefix)]).chain(rest);
-        let outcome = tokio::select! {
-            _ = task_gone.notified() => ErrorPumpOutcome::Completed,
-            outcome = pump_error_upstream(
-                state.timeouts.upstream_error_body,
-                state.timeouts.response_write,
-                &mut upstream,
-                &tx,
-            ) => outcome,
-        };
-        // The pump outcome (Completed vs TimedOut) is reserved for the audit
-        // schema extension; this slice does not extend the audit record yet.
-        let _ = outcome;
-        record_audit(
-            &state,
-            &task_request_id,
-            &model,
-            &fingerprint,
-            None,
-            None,
-            status_u16,
-            start,
-            None,
-        );
-        drop(permit);
-        drop(upstream);
-    });
-
-    let stream = ReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>);
-    let body = Body::from_stream(DropNotifyStream::new(stream, client_gone));
-    let mut rb = Response::builder().status(status);
-    let mut last_name: Option<HeaderName> = None;
-    for (name, value) in headers {
-        let name = match name {
-            Some(n) => {
-                last_name = Some(n.clone());
-                n
-            }
-            None => last_name
-                .clone()
-                .expect("only the first header entry may lack a name"),
-        };
-        rb = rb.header(name, value);
-    }
-    rb = rb.header("x-request-id", &request_id);
-    rb.body(body).unwrap()
-}
-
-/// Pump the oversized error remainder to the client, bounding each upstream
-/// read with `idle` so a stalled upstream is cancelled instead of holding the
-/// response and its admission permit open forever. The timeout wraps only
-/// `upstream.next()`; each `tx.send` is independently bounded by
-/// [`IoTimeouts::response_write`] so a client that stops reading also releases
-/// the stream and its permit within a bounded window.
-async fn pump_error_upstream(
-    idle: Duration,
-    write_budget: Duration,
-    upstream: &mut (impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin),
-    tx: &tokio::sync::mpsc::Sender<Bytes>,
-) -> ErrorPumpOutcome {
-    loop {
-        match tokio::time::timeout(idle, upstream.next()).await {
-            Err(_) => return ErrorPumpOutcome::TimedOut,
-            Ok(None) | Ok(Some(Err(_))) => return ErrorPumpOutcome::Completed,
-            Ok(Some(Ok(bytes))) => {
-                if !send_with_timeout(tx, bytes, write_budget).await {
-                    // The client dropped the body or stopped consuming it: end
-                    // the error stream and release the permit.
-                    return ErrorPumpOutcome::Completed;
-                }
-            }
+    let status = consumed.status;
+    record_audit(
+        state,
+        &request_id,
+        &model,
+        &fingerprint,
+        None,
+        None,
+        status.as_u16(),
+        start,
+        None,
+    );
+    drop(permit);
+    let (message, error_type, code) = if status == StatusCode::TOO_MANY_REQUESTS {
+        (
+            "Upstream rate limit exceeded",
+            "rate_limit_error",
+            "rate_limit",
+        )
+    } else if is_auth_unavailable(status) {
+        (
+            "Upstream authentication failed",
+            "authentication_error",
+            "upstream_authentication",
+        )
+    } else {
+        ("Upstream service error", "upstream_error", "upstream_error")
+    };
+    let mut response = openai_error(status, message, error_type, Some(code));
+    response.headers_mut().insert(
+        "x-request-id",
+        HeaderValue::from_str(&request_id).expect("validated request ID"),
+    );
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        if let Some(value) = consumed.headers.get(RETRY_AFTER) {
+            response.headers_mut().insert(RETRY_AFTER, value.clone());
         }
     }
+    response
 }
 
 /// Forward a final upstream response by streaming its body to the client. Both
@@ -1416,7 +1288,30 @@ async fn finalize_response(
     fingerprint: String,
     start: tokio::time::Instant,
 ) -> Response {
-    let parser = if is_streaming(&resp) {
+    let streaming = is_streaming(&resp);
+    let stream_permit = if streaming {
+        match state.stream_slots.clone().try_acquire_owned() {
+            Ok(slot) => Some(slot),
+            Err(_) => {
+                record_audit(
+                    state,
+                    &request_id,
+                    &model,
+                    &fingerprint,
+                    None,
+                    None,
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    start,
+                    None,
+                );
+                drop(permit);
+                return service_unavailable(Some(1));
+            }
+        }
+    } else {
+        None
+    };
+    let parser = if streaming {
         StreamUsageParser::Sse(SseUsageParser::new(SSE_EVENT_CAP))
     } else {
         StreamUsageParser::Json(JsonUsageParser::new(JSON_USAGE_CAP))
@@ -1431,6 +1326,7 @@ async fn finalize_response(
         fingerprint,
         start,
         parser,
+        stream_permit,
     )
     .await
 }
@@ -1460,6 +1356,7 @@ async fn stream_response(
     fingerprint: String,
     start: tokio::time::Instant,
     mut parser: StreamUsageParser,
+    stream_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Response {
     let status = resp.status();
     let filtered = filter_response_headers(resp.headers());
@@ -1524,6 +1421,7 @@ async fn stream_response(
             start,
             audit_outcome,
         );
+        drop(stream_permit);
         drop(permit);
         drop(upstream);
     });

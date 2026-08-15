@@ -7,11 +7,28 @@ fn deployment_assets_exist() {
     for path in [
         "src/main.rs",
         "deploy/orihsus.service",
+        "deploy/orihsus.logrotate",
         "config.example.yaml",
         "docs/DEPLOYMENT.md",
         "README.md",
     ] {
         assert!(Path::new(path).exists(), "deployment asset missing: {path}");
+    }
+}
+
+#[test]
+fn audit_logrotate_is_bounded_and_signals_reopen() {
+    let text = fs::read_to_string("deploy/orihsus.logrotate").unwrap();
+    for required in [
+        "/var/log/orihsus/audit.jsonl",
+        "daily",
+        "rotate 14",
+        "maxsize 100M",
+        "compress",
+        "su orihsus orihsus",
+        "systemctl kill -s HUP orihsus.service",
+    ] {
+        assert!(text.contains(required), "logrotate missing: {required}");
     }
 }
 

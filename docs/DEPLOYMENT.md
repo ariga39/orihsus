@@ -17,11 +17,12 @@ sudo install -d -o orihsus -g orihsus -m 0750 /var/lib/orihsus
 cargo build --release
 sudo install -o root -g root -m 0755 target/release/orihsus /usr/local/bin/orihsus
 sudo install -o orihsus -g orihsus -m 0600 config.example.yaml /etc/orihsus/config.yaml
+sudo install -o root -g root -m 0644 deploy/orihsus.logrotate /etc/logrotate.d/orihsus
 sudo chown orihsus:orihsus /etc/orihsus/config.yaml
 sudo chmod 600 /etc/orihsus/config.yaml
 ```
 
-Replace every placeholder secret. The listener defaults to loopback port 8080. To change it, use separate scalar values such as `listen: { host: "127.0.0.1", port: 8081 }`; validation rejects non-loopback hosts. Do not configure an upstream URL: orihsus fixes it to `https://opencode.ai/zen/go/` and rejects `upstream`/`base_url` fields.
+Replace every placeholder secret. The config must remain a regular, non-symlink file owned by `orihsus` with mode `0600`; the service validates owner/type/mode on the same open descriptor it reads. The listener defaults to loopback port 8080. To change it, use separate scalar values such as `listen: { host: "127.0.0.1", port: 8081 }`; validation rejects non-loopback hosts. Do not configure an upstream URL: orihsus fixes it to `https://opencode.ai/zen/go/` and rejects `upstream`/`base_url` fields.
 
 ## 3. Install the systemd service
 
@@ -145,7 +146,7 @@ Point OpenAI-compatible clients at `https://api.example.com/v1` and send `Author
 
 Use `journalctl -u orihsus -f` for process diagnostics and nginx logs for public connection/authentication policy. orihsus audit records are JSONL at the configured path and contain metadata and key fingerprints, never raw credentials or bodies.
 
-After rotating the audit file, signal orihsus so its writer reopens the path:
+The installed `deploy/orihsus.logrotate` policy rotates daily or at 100 MiB, retains 14 compressed generations, creates mode-`0600` files, and signals orihsus to reopen the path. Health and readiness probes are intentionally excluded from audit records. For a manual rotation, signal orihsus after moving the file:
 
 ```bash
 sudo systemctl kill -s HUP orihsus
@@ -159,7 +160,7 @@ The gateway token, key set, and model list are hot-reloadable. Listener/server s
 
 - Ensure `LimitNOFILE` exceeds the orihsus connection cap plus upstream/audit descriptors.
 - Monitor both nginx public connection/rate-limit metrics and orihsus admission, latency, RSS, descriptors, audit warnings, and restart counts.
-- Long SSE responses retain orihsus admission permits until completion or cancellation.
+- Long SSE responses retain admission permits until completion or cancellation and are additionally capped at one quarter of `limits.max_concurrency` (at least one).
 - Size the global body budget deliberately: each request currently reserves the full per-request body maximum.
 
 ## 9. Upgrade and rollback

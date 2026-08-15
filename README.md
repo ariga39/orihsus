@@ -6,11 +6,11 @@ A lightweight OpenAI-compatible gateway for OpenCode Go that rotates multiple su
 
 - Supports `POST /v1/chat/completions` with transparent SSE streaming and `GET /v1/models`; other routes return 404 or 405.
 - Uses a fill-first key pool. `GoUsageLimitError` cools a key by quota dimension, while ordinary 429 responses use `Retry-After` or exponential backoff.
-- Tries at most two keys per request: the initially selected key and one failover key. The final upstream error is forwarded unchanged.
+- Tries at most two keys per request. Retryable upstream errors become sanitized OpenAI-compatible JSON; upstream bodies and metadata are never exposed.
 - Enforces gateway bearer authentication, header-read timeouts, and a maximum header size; nginx terminates public TLS and HTTP/2.
 - Writes JSONL audit records with token counts. Keys are represented only by the first 12 hexadecimal characters of a SHA-256 fingerprint.
 - Hot-reloads tokens, keys, and models. The OpenCode Go upstream and allowed API paths are built in to prevent SSRF and key disclosure.
-- Bounds concurrency, queued requests, request bodies, error bodies, and the audit queue.
+- Bounds concurrency, queued requests, request bodies, model names, SSE streams, error classification, and the audit queue.
 
 ## Quick start
 
@@ -35,7 +35,7 @@ Configuration values are scalar strings or numbers. Durations are integer second
 | `keys` | list of strings | yes | — | Non-empty, unique upstream key pool. Hot-reloadable. |
 | `listen.host` | string (IP) | no | `127.0.0.1` | Loopback IP address. Non-loopback addresses are rejected. |
 | `listen.port` | integer | no | `8080` | Local HTTP port, from 0 through 65535. |
-| `models` | list of strings | no | `["deepseek-chat"]` | Non-empty, unique values returned by `GET /v1/models`. Hot-reloadable. |
+| `models` | list of strings | no | `["deepseek-chat"]` | Non-empty, unique allowlist; each UTF-8 value is at most 256 bytes. Requests outside it are rejected before upstream. Hot-reloadable. |
 | `limits.max_concurrency` | integer | no | `200` | Maximum requests actively handled. |
 | `limits.max_queue` | integer | no | `500` | Maximum requests waiting for admission; zero disables waiting. |
 | `limits.queue_wait_timeout_seconds` | integer | no | `30` | Maximum time an admitted-to-queue request may wait; must be positive. |
@@ -85,7 +85,9 @@ The hooks run `cargo fmt --check` and Clippy with warnings denied. Rust filename
 ## Security
 
 - The process refuses to run as root. Production uses a dedicated account and a systemd sandbox with `NoNewPrivileges`, `ProtectSystem=strict`, and no capabilities.
-- Configuration must be mode `0600`; keys and tokens are never emitted through `Debug`, `Display`, or logs.
+- On Unix, configuration must be a non-symlink regular file owned by the process user with mode `0600`; validation and reading use the same open descriptor. Keys and tokens are never emitted through `Debug`, `Display`, or logs.
 - nginx is the only public listener and owns TLS, HTTP/2, edge rate limiting, and fail2ban-compatible access logs. orihsus rejects non-loopback listen addresses.
-- The OpenCode upstream must use HTTPS. Redirects are followed only when scheme, host, and effective port are unchanged, so the selected `Authorization` header cannot reach another origin.
+- The OpenCode upstream is a built-in HTTPS origin and redirects are never followed, so the selected `Authorization` header cannot escape the API-path allowlist.
+- Credential-bearing upstream requests receive only `Content-Type`, `Accept`, the sanitized gateway request ID, and the selected upstream authorization; client cookies, API-key headers, forwarding identity, tracing baggage, and arbitrary extension headers are dropped.
 - Only the documented routes are exposed; the service cannot act as an arbitrary proxy.
+- Production builds cannot enable the certificate-verification bypass used by the isolated loopback load-test harness.

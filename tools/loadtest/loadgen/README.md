@@ -4,6 +4,8 @@
 
 It supports HTTP and HTTPS over HTTP/1.1 and HTTP/2, a test CA or an explicit insecure mode, JSON validation, incremental SSE framing, paced reads, completely stopped reads, per-request JSONL, aggregate JSON, and raw TCP/TLS slowloris stages. Use HTTP against the private orihsus listener and HTTPS/TLS stages against the nginx public edge.
 
+`--insecure` disables TLS peer authentication. Use it only on an isolated test network with synthetic credentials; never point it at production or use production keys.
+
 `--write-bytes-per-sec N` streams the configured request body in 64KiB chunks against a monotonic-clock deadline. This is intended for body-budget and slow-upload tests; it does not pre-generate future chunks while the HTTP stack is backpressured.
 
 ## Build and examples
