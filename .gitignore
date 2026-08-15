@@ -1,1 +1,13 @@
 /target/
+# Credentials and local secrets
+config.yaml
+*.pem
+*.key
+*.p12
+.env
+.env.*
+!.env.example
+# Local state
+*.log
+*.jsonl
+
