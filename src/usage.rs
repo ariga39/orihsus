@@ -37,8 +37,6 @@ pub trait UsageFetcher: Send + Sync {
     async fn fetch(&self, key: &Secret) -> Result<Vec<u8>, UsageFetchError>;
 }
 
-const USAGE_ENDPOINT: &str = "https://opencode.ai/zen/go/v1/usage";
-
 pub struct HttpUsageFetcher {
     client: reqwest::Client,
     endpoint: url::Url,
@@ -62,7 +60,9 @@ impl HttpUsageFetcher {
     }
 
     pub fn endpoint() -> url::Url {
-        url::Url::parse(USAGE_ENDPOINT).expect("static usage endpoint is valid")
+        let base = url::Url::parse(crate::config::OPENCODE_GO_BASE_URL)
+            .expect("built-in OpenCode Go base URL is valid");
+        crate::config::upstream_api_url(&base, crate::config::UpstreamApi::Usage)
     }
 
     #[doc(hidden)]

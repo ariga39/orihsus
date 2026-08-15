@@ -433,7 +433,7 @@ async fn every_client_route_writes_exactly_one_redacted_audit_record() {
         assert_eq!(rec.output_tokens, None, "{rid}: usage must be null");
     }
 
-    // /readyz must also audit its 503 path (all keys cooling).
+    // /readyz must also audit its 429 path (all keys cooling).
     let mut attempts = p.request();
     let sel = match attempts.next().await {
         orihsus::pool::AttemptResult::Selected(s) => s,
@@ -444,17 +444,17 @@ async fn every_client_route_writes_exactly_one_redacted_audit_record() {
         orihsus::pool::Failure::Unavailable { retry_after: None },
     );
 
-    let resp = send(&app, req("GET", "/readyz", "rid-readyz-503")).await;
-    assert_eq!(resp.status().as_u16(), 503);
+    let resp = send(&app, req("GET", "/readyz", "rid-readyz-429")).await;
+    assert_eq!(resp.status().as_u16(), 429);
     let records = sink.0.lock().unwrap();
     assert_eq!(
         records.len(),
         cases.len() + 1,
-        "the 503 readyz must write exactly one record"
+        "the 429 readyz must write exactly one record"
     );
     let rec = records.last().unwrap();
-    assert_eq!(rec.request_id, "rid-readyz-503");
-    assert_eq!(rec.status, 503);
+    assert_eq!(rec.request_id, "rid-readyz-429");
+    assert_eq!(rec.status, 429);
     assert_eq!(rec.model, None);
     assert_eq!(rec.key_fingerprint, None);
 }
@@ -657,7 +657,7 @@ async fn readyz_reflects_pool_and_queue_readiness() {
     );
     assert_rejected_audit(&sink_check, 1, 200);
 
-    // All keys cooling: a gateway-produced 503 must be an OpenAI-formatted
+    // All keys cooling: return the client-visible rate-limit contract.
     // error carrying Retry-After, and still audit exactly once.
     let mut req = p.request();
     let sel = match req.next().await {
@@ -665,11 +665,11 @@ async fn readyz_reflects_pool_and_queue_readiness() {
         other => panic!("{other:?}"),
     };
     p.report_failure(&sel, Failure::Unavailable { retry_after: None });
-    let resp = send(&app, readyz_req("rid-readyz-503-cooling")).await;
+    let resp = send(&app, readyz_req("rid-readyz-429-cooling")).await;
     assert_eq!(
         resp.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "all keys cooling -> 503"
+        StatusCode::TOO_MANY_REQUESTS,
+        "all keys cooling -> 429"
     );
     assert_eq!(
         resp.headers()
@@ -689,15 +689,15 @@ async fn readyz_reflects_pool_and_queue_readiness() {
         v,
         serde_json::json!({
             "error": {
-                "message": "Service Unavailable",
-                "type": "service_unavailable",
+                "message": "All upstream keys are temporarily rate limited",
+                "type": "rate_limit_error",
                 "param": null,
-                "code": null
+                "code": "upstream_keys_unavailable"
             }
         }),
         "readiness failure uses the standard OpenAI error object"
     );
-    assert_rejected_audit(&sink_check, 2, 503);
+    assert_rejected_audit(&sink_check, 2, 429);
 
     // Closed queue: same OpenAI 503 contract, still exactly one audit record.
     q.close();
@@ -1429,8 +1429,8 @@ async fn huge_usage_limit_resets_message_returns_bounded_retry_after_without_pan
         .expect("the huge usage-limit cooldown must be clamped, never panic");
     assert_eq!(
         resp.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "all keys cooling for the clamped ceiling -> self-produced 503"
+        StatusCode::TOO_MANY_REQUESTS,
+        "all keys cooling for the clamped ceiling -> self-produced 429"
     );
     let ra = resp
         .headers()
@@ -3366,7 +3366,7 @@ async fn oversized_error_stalled_remainder_idle_times_out_and_ends_the_response(
 }
 
 #[tokio::test(start_paused = true)]
-async fn pool_unavailable_maps_to_503_with_retry_after() {
+async fn pool_unavailable_maps_to_429_with_retry_after() {
     use orihsus::pool::Failure;
 
     let p = pool_with_timeout(&["a"], Duration::from_secs(2));
@@ -3398,8 +3398,8 @@ async fn pool_unavailable_maps_to_503_with_retry_after() {
     let resp = handle.await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "pool Unavailable -> 503"
+        StatusCode::TOO_MANY_REQUESTS,
+        "pool Unavailable -> 429"
     );
     assert_eq!(
         resp.headers().get("retry-after").unwrap(),
@@ -3409,7 +3409,7 @@ async fn pool_unavailable_maps_to_503_with_retry_after() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn pool_unavailable_is_audited_exactly_once_with_status_503() {
+async fn pool_unavailable_is_audited_exactly_once_with_status_429() {
     use orihsus::pool::Failure;
 
     let p = pool_with_timeout(&["a"], Duration::from_secs(2));
@@ -3435,14 +3435,14 @@ async fn pool_unavailable_is_audited_exactly_once_with_status_503() {
     tokio::time::advance(Duration::from_secs(2)).await;
     tokio::task::yield_now().await;
     let resp = handle.await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
         resp.headers().get("retry-after").unwrap(),
         "43",
         "Retry-After = 45s cooldown minus the 2s already waited, ceil"
     );
 
-    assert_rejected_audit(&sink, 1, 503);
+    assert_rejected_audit(&sink, 1, 429);
     assert_eq!(
         q.snapshot().active,
         0,

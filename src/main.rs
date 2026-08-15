@@ -211,7 +211,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
             .as_ref()
             .expect("assemble always starts usage monitor")
             .keys_handle();
-        // Only hot fields are applied, atomically: keys + token/base_url/max_body/
+        // Only hot fields are applied atomically: keys + token/max_body/
         // models are swapped under one lock, so a failure never half-applies and
         // a request never observes mixed generations. Non-hot changes
         // (limits/key-failure handling/audit/server/listen) are refused by the reloader
@@ -223,7 +223,8 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
                     snap.keys.clone(),
                     RuntimeState {
                         gateway_token: snap.gateway_token.clone(),
-                        base_url: snap.upstream.base_url.clone(),
+                        base_url: url::Url::parse(orihsus::config::OPENCODE_GO_BASE_URL)
+                            .expect("built-in OpenCode Go base URL is valid"),
                         max_body_bytes: snap.limits.max_body_bytes,
                         models: snap.models.clone(),
                     },
@@ -688,7 +689,6 @@ mod tests {
         let audit_path = dir.path().join("audit.jsonl");
         let config = format!(
             "gateway_token: \"gway-secret\"\n\
-             upstream:\n  base_url: \"https://api.opencode.go\"\n\
              keys:\n  - \"key-1\"\n\
              audit:\n  path: \"{}\"\n",
             audit_path.display()
@@ -872,7 +872,6 @@ mod tests {
         let cfg_path = dir.path().join("config.yaml");
         let config = format!(
             "gateway_token: \"gway-secret\"\n\
-             upstream:\n  base_url: \"https://api.opencode.go\"\n\
              keys:\n  - \"key-1\"\n\
              audit:\n  path: \"{}\"\n",
             audit_path.display()

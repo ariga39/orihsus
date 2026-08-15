@@ -167,8 +167,6 @@ fn docs_keep_credentials_private_and_put_tls_at_nginx() {
 
 const MINIMAL_NO_LISTEN: &str = r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 "#;

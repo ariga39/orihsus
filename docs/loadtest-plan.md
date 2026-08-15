@@ -81,7 +81,7 @@ Test normal paced SSE, permanently silent SSE, slow readers, and readers that st
 
 - Return an exact usage-limit response for K1 and success for K2; require one final success and two correlated attempts.
 - Exercise malformed JSON, unknown limit dimensions, invalid reset text, ordinary 429 with both `Retry-After` forms, 401/403, 5xx, and network failure.
-- Cool every key, verify the bounded pool wait, then require 503 with an earliest-recovery `Retry-After`.
+- Cool every key, verify the bounded pool wait, then require 429 with an earliest-recovery `Retry-After`.
 - Run concurrent failures to confirm stale results cannot erase newer cooldown or breaker state.
 
 ### 5. Audit behavior

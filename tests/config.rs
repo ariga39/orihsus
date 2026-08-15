@@ -15,8 +15,6 @@ fn write_config(dir: &Path, name: &str, contents: &str) -> PathBuf {
 
 const MINIMAL: &str = r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 "#;
@@ -32,8 +30,6 @@ fn minimal_valid_config_yields_defaults() {
     assert_eq!(cfg.keys, vec![Secret::new("key-1")]);
     assert_eq!(cfg.listen.ip().to_string(), "127.0.0.1");
     assert_eq!(cfg.listen.port(), 8080);
-    assert_eq!(cfg.upstream.base_url.as_str(), "https://api.opencode.go/");
-
     assert_eq!(cfg.limits.max_concurrency, 200);
     assert_eq!(cfg.limits.max_queue, 500);
     assert_eq!(cfg.limits.queue_wait_timeout, Duration::from_secs(30));
@@ -185,8 +181,6 @@ fn custom_audit_and_server_values_are_parsed() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 audit:
@@ -228,8 +222,6 @@ fn invalid_audit_and_server_values_are_rejected() {
         format!(
             r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 {extra}
@@ -332,8 +324,6 @@ fn missing_gateway_token_is_rejected() {
         dir.path(),
         "config.yaml",
         r#"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 "#,
@@ -345,99 +335,34 @@ keys:
 }
 
 #[test]
-fn non_https_upstream_is_rejected() {
+fn configurable_upstream_url_is_rejected() {
     let dir = TempDir::new().unwrap();
-    let path = write_config(
-        dir.path(),
-        "config.yaml",
-        r#"
-gateway_token: "gway-secret"
-upstream:
-  base_url: "http://api.opencode.go"
-keys:
-  - "key-1"
-"#,
-    );
-
-    let err = orihsus::config::load(&path).unwrap_err();
-
-    assert!(format!("{err}").contains("https"), "got: {err}");
-}
-
-#[test]
-fn base_url_path_prefix_normalizes_to_a_trailing_slash() {
-    // /openai and /openai/ must resolve identically: the path prefix is
-    // normalized to a trailing slash so forward_request's join keeps it (a bare
-    // /openai would let Url::join drop the last path segment).
-    for (input, expected) in [
-        (
-            "https://api.opencode.go/openai",
-            "https://api.opencode.go/openai/",
-        ),
-        (
-            "https://api.opencode.go/openai/",
-            "https://api.opencode.go/openai/",
-        ),
-        (
-            "https://api.opencode.go/a/b",
-            "https://api.opencode.go/a/b/",
-        ),
-        ("https://api.opencode.go", "https://api.opencode.go/"),
+    for (name, candidate) in [
+        ("metadata", "http://169.254.169.254/latest/meta-data"),
+        ("foreign-host", "https://evil.example/zen/go"),
+        ("query", "https://opencode.ai/zen/go?target=evil"),
+        ("fragment", "https://opencode.ai/zen/go#override"),
+        ("custom-path", "https://opencode.ai/not/allowed"),
+        ("official", "https://opencode.ai/zen/go"),
     ] {
-        let dir = TempDir::new().unwrap();
         let path = write_config(
             dir.path(),
-            "config.yaml",
+            &format!("{name}.yaml"),
             &format!(
                 r#"
 gateway_token: "gway-secret"
 upstream:
-  base_url: "{input}"
-keys:
-  - "key-1"
-"#
-            ),
-        );
-        let cfg = orihsus::config::load(&path).unwrap();
-        assert_eq!(cfg.upstream.base_url.as_str(), expected, "input {input}");
-        assert_eq!(
-            cfg.upstream
-                .base_url
-                .join("v1/chat/completions")
-                .unwrap()
-                .as_str(),
-            format!("{expected}v1/chat/completions"),
-            "input {input}: the forwarded join must keep the path prefix"
-        );
-    }
-}
-
-#[test]
-fn base_url_with_query_or_fragment_is_rejected() {
-    let dir = TempDir::new().unwrap();
-    for (name, bad) in [
-        (
-            "query.yaml",
-            "https://api.opencode.go?api-version=2026-01-01",
-        ),
-        ("fragment.yaml", "https://api.opencode.go/openai#frag"),
-        ("query-and-path.yaml", "https://api.opencode.go/openai?x=1"),
-    ] {
-        let path = write_config(
-            dir.path(),
-            name,
-            &format!(
-                r#"
-gateway_token: "gway-secret"
-upstream:
-  base_url: "{bad}"
+  base_url: "{candidate}"
 keys:
   - "key-1"
 "#
             ),
         );
         let err = orihsus::config::load(&path).unwrap_err();
-        assert!(format!("{err}").contains("base_url"), "{name}: got: {err}");
+        assert!(
+            format!("{err}").contains("invalid YAML"),
+            "{name}: got {err}"
+        );
     }
 }
 
@@ -448,8 +373,6 @@ fn empty_or_duplicate_keys_are_rejected() {
         format!(
             r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
 {keys}
 "#
@@ -495,8 +418,6 @@ fn deprecated_soft_threshold_is_rejected_with_a_static_message() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 key_failure_handling:
@@ -531,8 +452,6 @@ fn deprecated_soft_threshold_error_never_leaks_value_or_secrets() {
         &format!(
             r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 key_failure_handling:
@@ -562,8 +481,6 @@ fn zero_or_out_of_range_limit_values_are_rejected() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 limits:
@@ -605,8 +522,6 @@ fn max_queue_zero_is_allowed() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 limits:
@@ -631,8 +546,6 @@ fn max_concurrency_and_max_queue_above_semaphore_max_permits_are_rejected() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 limits:
@@ -673,8 +586,6 @@ fn breaker_threshold_above_u32_max_is_rejected() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 key_failure_handling:
@@ -694,8 +605,6 @@ fn max_header_bytes_above_u32_max_is_rejected() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 server:
@@ -715,8 +624,6 @@ fn custom_max_inflight_body_bytes_is_parsed() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 limits:
@@ -740,8 +647,6 @@ fn invalid_max_inflight_body_bytes_is_rejected() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 limits:
@@ -790,8 +695,6 @@ fn key_failure_handling_bounds_are_enforced() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 key_failure_handling:
@@ -850,8 +753,6 @@ fn backoff_max_is_capped_at_the_ops_cooldown_ceiling() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 key_failure_handling:
@@ -896,8 +797,6 @@ fn max_attempts_must_be_within_one_and_two() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 key_failure_handling:
@@ -925,8 +824,6 @@ fn unknown_top_level_fields_are_rejected() {
         "unknown-top.yaml",
         r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 max_concurrency: 8
@@ -950,8 +847,6 @@ fn unknown_nested_fields_are_rejected() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 {extra}
@@ -1010,8 +905,6 @@ fn models_default_and_custom_values() {
         "custom.yaml",
         r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 models:
@@ -1036,8 +929,6 @@ fn empty_blank_or_duplicate_models_are_rejected() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 models:
@@ -1075,8 +966,6 @@ fn config_file_must_have_0600_permissions() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 "#,
@@ -1102,8 +991,6 @@ fn errors_and_debug_never_leak_secrets() {
         &format!(
             r#"
 gateway_token: "{secret_token}"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "{secret_key}"
   - "{secret_key}"
@@ -1158,8 +1045,6 @@ keys:
         &format!(
             r#"
 gateway_token: "{secret_token}"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "{secret_key}"
 "#

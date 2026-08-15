@@ -48,7 +48,6 @@ pub struct RuntimeConfigSnapshot {
     pub models: Vec<String>,
     pub limits: config::Limits,
     pub key_failure_handling: config::KeyFailureHandling,
-    pub upstream: config::Upstream,
 }
 
 impl RuntimeConfigSnapshot {
@@ -59,7 +58,6 @@ impl RuntimeConfigSnapshot {
             models: cfg.models.clone(),
             limits: cfg.limits.clone(),
             key_failure_handling: cfg.key_failure_handling.clone(),
-            upstream: cfg.upstream.clone(),
         }
     }
 }

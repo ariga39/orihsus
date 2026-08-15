@@ -29,7 +29,7 @@ Use separate modules for configuration/runtime snapshots, key-pool state, admiss
 
 Use fill-first selection. A request receives a snapshot of distinct candidates and can try at most two. Exact usage-limit payloads cool the selected key until the parsed or default reset; ordinary 429, 401/403, 5xx, and network failures follow their own bounded transitions. Concurrent results are ordered so stale completions cannot erase newer failure state.
 
-When every candidate is unavailable, wait only within the configured pool deadline. On exhaustion, return 503 with a conservative `Retry-After`. Proactive usage polling may cool keys but cannot expose credentials or invalidate a newer key generation.
+When every candidate is unavailable, wait only within the configured pool deadline. On exhaustion, return 429 with a conservative `Retry-After`; reserve 503 for service and transport failures. Proactive usage polling may cool keys but cannot expose credentials or invalidate a newer key generation.
 
 ### Capacity control
 
@@ -41,11 +41,11 @@ Forward SSE and ordinary successful bodies incrementally. Retries are allowed on
 
 ### Configuration
 
-Parse and validate a mode-`0600` YAML file. Require a loopback listen address. Publish one immutable runtime snapshot containing the hot-reloadable token, upstream URL, keys, and model list. Changes to listener, capacity, audit, or polling schedules require restart.
+Parse and validate a mode-`0600` YAML file. Require a loopback listen address. Publish one immutable runtime snapshot containing the hot-reloadable token, keys, and model list. Changes to listener, capacity, audit, or polling schedules require restart. The upstream URL is not configurable.
 
 ### Network and security
 
-Require upstream HTTPS and follow redirects only within the same origin. Reject root execution, bind loopback HTTP only, limit header size/read time, and authenticate before admission or body allocation. nginx owns public TLS, HTTP/2, connection policy, rate limiting, and fail2ban-visible access logs.
+Fix the upstream service root to `https://opencode.ai/zen/go/` and allow credential-bearing requests only to the built-in chat-completions and usage paths. Reject all upstream URL configuration, preventing SSRF and key disclosure through private, loopback, metadata, query, fragment, or custom-path targets. Never follow redirects, including same-origin redirects, because they could escape the path allowlist. Reject root execution, bind loopback HTTP only, limit header size/read time, and authenticate before admission or body allocation. nginx owns public TLS, HTTP/2, connection policy, rate limiting, and fail2ban-visible access logs.
 
 ### Audit
 

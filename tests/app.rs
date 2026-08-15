@@ -20,8 +20,6 @@ fn write_config(dir: &Path, contents: &str) -> std::path::PathBuf {
 
 const MINIMAL: &str = r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 audit:
@@ -30,8 +28,6 @@ audit:
 
 const FIVE_MIN_QUEUE_WAIT: &str = r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 limits:
@@ -222,7 +218,7 @@ async fn upstream_client_does_not_follow_cross_origin_redirects() {
 }
 
 #[tokio::test]
-async fn upstream_client_follows_same_origin_redirects_and_keeps_authorization() {
+async fn upstream_client_never_follows_same_origin_redirects() {
     use axum::routing::get;
     use tokio::net::TcpListener;
 
@@ -267,8 +263,8 @@ async fn upstream_client_follows_same_origin_redirects_and_keeps_authorization()
         axum::serve(listener, app).await.unwrap();
     });
 
-    // A relative and an absolute Location on the same origin must both be
-    // followed, and the selected Authorization must be forwarded on the follow.
+    // Relative and absolute same-origin redirects must both stop before the
+    // credential-bearing request can escape the path allowlist.
     let client = build_upstream_client().unwrap();
     for path in ["/rel", "/abs"] {
         let resp = client
@@ -277,12 +273,7 @@ async fn upstream_client_follows_same_origin_redirects_and_keeps_authorization()
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "{path}: same-origin follow");
-        let body = resp.text().await.unwrap();
-        assert_eq!(
-            body, "Bearer selected-key",
-            "{path}: the selected Authorization must be forwarded on a same-origin redirect"
-        );
+        assert_eq!(resp.status(), StatusCode::FOUND, "{path}: redirect stopped");
     }
 }
 
@@ -350,8 +341,7 @@ async fn upstream_client_caps_a_same_origin_redirect_loop() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
-    // A misbehaving upstream that always redirects to itself must not hang the
-    // request: the custom policy caps the same-origin chain and returns the 3xx.
+    // A redirect is never followed, so a loop gets exactly one request.
     let hits = Arc::new(AtomicUsize::new(0));
     let hits2 = hits.clone();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -384,11 +374,7 @@ async fn upstream_client_caps_a_same_origin_redirect_loop() {
         StatusCode::FOUND,
         "the loop must be stopped with the 3xx response"
     );
-    assert!(
-        hits.load(Ordering::SeqCst) <= 11,
-        "the redirect chain must be capped (got {} hits)",
-        hits.load(Ordering::SeqCst)
-    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

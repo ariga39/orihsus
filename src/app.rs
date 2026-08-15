@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use url::Url;
 
 use crate::audit::AuditWriter;
 use crate::config::Config;
@@ -66,7 +65,8 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
     ));
     let runtime = RuntimeStore::new(RuntimeState {
         gateway_token: cfg.gateway_token.clone(),
-        base_url: cfg.upstream.base_url.clone(),
+        base_url: url::Url::parse(crate::config::OPENCODE_GO_BASE_URL)
+            .expect("built-in OpenCode Go base URL is valid"),
         max_body_bytes: cfg.limits.max_body_bytes,
         models: cfg.models.clone(),
     });
@@ -110,87 +110,16 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
     ))
 }
 
-/// How many redirect hops a single upstream request may follow before the
-/// gateway stops (mirrors reqwest's default). The custom policy must bound the
-/// chain itself: an unbounded same-origin redirect loop would hang the request
-/// until the upstream header timeout.
-const MAX_REDIRECT_HOPS: usize = 10;
-
-/// Upstream client: rustls-verified HTTPS (base_url is https by config), a
+/// Upstream client: rustls-verified HTTPS to the built-in upstream, a
 /// connect timeout only — no overall request timeout so SSE streams can run for
-/// as long as the upstream keeps them open. Redirects are followed only when
-/// scheme, host and effective port are unchanged; a cross-origin/scheme/port
-/// redirect is returned to the gateway, so the selected key's Authorization is
-/// never forwarded to the redirect target.
+/// as long as the upstream keeps them open. Redirects are never followed: even
+/// a same-origin redirect could escape the credential-bearing path allowlist.
 pub fn build_upstream_client() -> Result<reqwest::Client, reqwest::Error> {
     let builder = reqwest::Client::builder()
-        .redirect(same_origin_redirect_policy())
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(Duration::from_secs(90));
     #[cfg(feature = "loadtest-insecure-upstream")]
     let builder = builder.danger_accept_invalid_certs(true);
     builder.build()
-}
-
-/// Same-origin redirect policy: follow only redirects whose scheme, host and
-/// effective port are unchanged from the original request (`previous[0]`), so a
-/// relative or absolute same-origin `Location` is followed but a cross-origin,
-/// scheme-changing or port-changing target is stopped before any request is
-/// sent to it.
-fn same_origin_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        let origin = attempt.previous().first().unwrap_or(attempt.url());
-        if attempt.previous().len() > MAX_REDIRECT_HOPS {
-            attempt.stop()
-        } else if same_origin(origin, attempt.url()) {
-            attempt.follow()
-        } else {
-            attempt.stop()
-        }
-    })
-}
-
-fn same_origin(a: &Url, b: &Url) -> bool {
-    a.scheme() == b.scheme()
-        && a.host_str() == b.host_str()
-        && effective_port(a) == effective_port(b)
-}
-
-/// The port a URL actually connects on, using the scheme default when none is
-/// explicit, so `https://host` and `https://host:443` are the same origin.
-fn effective_port(url: &Url) -> u16 {
-    url.port().unwrap_or_else(|| match url.scheme() {
-        "http" => 80,
-        "https" => 443,
-        _ => 0,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn same(a: &str, b: &str) -> bool {
-        same_origin(&Url::parse(a).unwrap(), &Url::parse(b).unwrap())
-    }
-
-    #[test]
-    fn origin_matches_on_scheme_host_and_effective_port() {
-        assert!(same("https://api.opencode.go", "https://api.opencode.go/"));
-        assert!(same(
-            "https://api.opencode.go",
-            "https://api.opencode.go:443"
-        ));
-        assert!(same("http://api.opencode.go", "http://api.opencode.go:80"));
-        assert!(same(
-            "https://api.opencode.go:8443",
-            "https://api.opencode.go:8443"
-        ));
-        assert!(!same(
-            "https://api.opencode.go",
-            "https://api.opencode.go:8443"
-        ));
-        assert!(!same("https://api.opencode.go", "http://api.opencode.go"));
-        assert!(!same("https://api.opencode.go", "https://other.example"));
-    }
 }

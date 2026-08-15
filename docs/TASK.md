@@ -20,7 +20,7 @@ Build a production-oriented Rust gateway that exposes an OpenAI-compatible endpo
 
 - Stable Rust; Tokio/Axum/Reqwest/Rustls.
 - One process and no persistent database.
-- HTTPS-only upstream and same-origin redirects only.
+- Fixed HTTPS OpenCode Go upstream and no redirect following.
 - Secrets must be absent from logs, formatting, errors, and audit output.
 - Production behavior must remain testable through narrow public seams and deterministic state-machine tests.
 

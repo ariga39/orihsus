@@ -16,7 +16,7 @@ This document records the decisions that define the gateway contract.
 - Attempt at most two distinct keys per request.
 - Treat exact OpenCode `GoUsageLimitError` payloads as quota cooldowns. Recognized dimensions are `weekly`, `monthly`, and `5h`; parsed reset durations override dimension defaults.
 - Treat ordinary 429 responses with `Retry-After` when valid, otherwise exponential backoff. Handle 401/403 as key failures and retry eligible 5xx/network failures without exposing credentials.
-- When every key is cooling down, wait within a fixed pool budget, then return 503 with a conservative `Retry-After` derived from the earliest recovery.
+- When every key is cooling down, wait within a fixed pool budget, then return 429 with a conservative `Retry-After` derived from the earliest recovery. Reserve 503 for gateway capacity, timeout, shutdown, or upstream-transport failures.
 - Poll the OpenCode usage API proactively. A key at or above the configured utilization threshold is cooled until the reported reset time; polling failures do not remove otherwise healthy keys.
 
 ## Logging and accounting
@@ -29,8 +29,9 @@ This document records the decisions that define the gateway contract.
 
 ## Security
 
-- Require HTTPS upstream URLs. Serve plaintext HTTP only on loopback and place nginx at the public boundary for TLS, HTTP/2, rate limiting, access logging, and fail2ban.
-- Follow redirects only within the same origin. Never forward the selected authorization header across an origin, port, or scheme boundary.
+- Fix the upstream service root to `https://opencode.ai/zen/go/`; reject every configurable `upstream` or `base_url` field. Construct credential-bearing requests only for the built-in `/v1/chat/completions` and `/v1/usage` paths; serve `/v1/models` locally. This removes the configuration SSRF and key-exfiltration surface, including private, loopback, metadata, query, fragment, and custom-path targets.
+- Serve plaintext HTTP only on loopback and place nginx at the public boundary for TLS, HTTP/2, rate limiting, access logging, and fail2ban.
+- Never follow upstream redirects. Return 3xx responses unchanged so a selected key cannot escape the fixed API-path allowlist, even within the trusted origin.
 - Require bearer authentication before admission control and body buffering.
 - Require configuration mode `0600`, reject duplicate or blank secrets, and redact secrets from formatting and errors.
 - Refuse to run as root and use a dedicated system account with a restrictive systemd sandbox.
@@ -47,7 +48,7 @@ This document records the decisions that define the gateway contract.
 ## Deployment and testing
 
 - Deploy orihsus with systemd as a dedicated account and nginx as the only public listener. Keep certificate lifecycle and public edge policy outside the application.
-- Hot-reload only the gateway token, upstream base URL, keys, and model list. Listener, capacity, server, audit, and proactive-usage scheduling changes require restart.
+- Hot-reload only the gateway token, keys, and model list. Listener, capacity, server, audit, and proactive-usage scheduling changes require restart; the upstream origin and path allowlist are compiled in.
 - Test state machines deterministically and use real sockets/files for lifecycle, timeout, reload, and streaming boundaries.
 - Treat formatter, Clippy with warnings denied, unit/integration tests, release build, and load-test tooling checks as release gates.
 

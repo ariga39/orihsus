@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::header::{
-    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_TYPE,
+    HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_TYPE, RETRY_AFTER,
 };
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -21,7 +21,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use url::Url;
 
 use crate::audit::{AuditError, AuditOutcome, AuditRecord, Outcome};
-use crate::config::Secret;
+use crate::config::{upstream_api_url, Secret, UpstreamApi};
 use crate::pool::{AttemptResult, Failure, KeyPool, UsageDimension};
 use crate::queue::{AdmissionError, AdmissionQueue, Permit};
 
@@ -443,16 +443,15 @@ async fn healthz(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> 
 async fn readyz(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
     let start = tokio::time::Instant::now();
     let request_id = request_id_for(req.headers());
-    let (status, resp) = if state.pool.has_available_key() && !state.queue.is_closed() {
-        (StatusCode::OK, StatusCode::OK.into_response())
-    } else {
-        // A gateway-produced readiness failure is an OpenAI-formatted 503 with
-        // Retry-After, matching every other self-produced 503. Exactly one
-        // audit record is written below regardless of branch.
+    let (status, resp) = if state.queue.is_closed() {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             service_unavailable(Some(1)),
         )
+    } else if !state.pool.has_available_key() {
+        (StatusCode::TOO_MANY_REQUESTS, rate_limited(1))
+    } else {
+        (StatusCode::OK, StatusCode::OK.into_response())
     };
     record_audit_rejected(&state, &request_id, status.as_u16(), start);
     resp
@@ -492,6 +491,20 @@ fn service_unavailable(retry_after_secs: Option<u64>) -> Response {
             HeaderValue::from_str(&secs.to_string()).unwrap(),
         );
     }
+    resp
+}
+
+fn rate_limited(retry_after_secs: u64) -> Response {
+    let mut resp = openai_error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "All upstream keys are temporarily rate limited",
+        "rate_limit_error",
+        Some("upstream_keys_unavailable"),
+    );
+    resp.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from_str(&retry_after_secs.to_string()).unwrap(),
+    );
     resp
 }
 
@@ -664,9 +677,7 @@ async fn forward_request(
     body: &Bytes,
     base_url: &Url,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let url = base_url
-        .join("v1/chat/completions")
-        .expect("valid upstream url");
+    let url = upstream_api_url(base_url, UpstreamApi::ChatCompletions);
     let connection_headers = connection_named_headers(headers);
     let mut rb = state.http.post(url).body(body.clone());
     for (name, value) in headers {
@@ -1028,10 +1039,10 @@ async fn chat_completions(State(state): State<Arc<GatewayState>>, req: Request<B
             record_audit_rejected(
                 &state,
                 &request_id,
-                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                StatusCode::TOO_MANY_REQUESTS.as_u16(),
                 start,
             );
-            service_unavailable(Some(retry_after_secs(retry_after)))
+            rate_limited(retry_after_secs(retry_after))
         }
         // exhausted with no upstream response at all (only network errors)
         FinalOutcome::LastResponse(None) => {

@@ -15,8 +15,6 @@ const DEBOUNCE: Duration = Duration::from_millis(150);
 
 const MINIMAL: &str = r#"
 gateway_token: "gway-secret"
-upstream:
-  base_url: "https://api.opencode.go"
 keys:
   - "key-1"
 "#;
@@ -542,7 +540,6 @@ async fn apply_errors_never_leak_secrets_into_status() {
     let key_secret = "RAW-KEY-SECRET-77";
     let secret_cfg = format!(
         "gateway_token: \"{token_secret}\"\n\
-         upstream:\n  base_url: \"https://api.opencode.go\"\n\
          keys:\n  - \"{key_secret}\"\n"
     );
     let path = write_config(dir.path(), "config.yaml", &secret_cfg);

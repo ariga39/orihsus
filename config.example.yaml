@@ -10,10 +10,6 @@
 # Required: bearer token accepted from gateway clients.
 gateway_token: "CHANGE-ME-use-a-long-random-token"
 
-# Required: OpenCode Go HTTPS endpoint. A URL is naturally one string value.
-upstream:
-  base_url: "https://api.opencode.go"
-
 # Required: non-empty pool of unique OpenCode Go subscription keys.
 keys:
   - "CHANGE-ME-upstream-key-1"

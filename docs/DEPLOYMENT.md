@@ -21,7 +21,7 @@ sudo chown orihsus:orihsus /etc/orihsus/config.yaml
 sudo chmod 600 /etc/orihsus/config.yaml
 ```
 
-Replace every placeholder secret. The listener defaults to loopback port 8080. To change it, use separate scalar values such as `listen: { host: "127.0.0.1", port: 8081 }`; validation rejects non-loopback hosts. The upstream URL must remain HTTPS.
+Replace every placeholder secret. The listener defaults to loopback port 8080. To change it, use separate scalar values such as `listen: { host: "127.0.0.1", port: 8081 }`; validation rejects non-loopback hosts. Do not configure an upstream URL: orihsus fixes it to `https://opencode.ai/zen/go/` and rejects `upstream`/`base_url` fields.
 
 ## 3. Install the systemd service
 
@@ -153,7 +153,7 @@ sudo systemctl kill -s HUP orihsus
 
 ## 7. Reload and restart boundaries
 
-The gateway token, upstream base URL, key set, and model list are hot-reloadable. Listener/server settings, capacity, key-failure handling, audit, and usage-poll scheduling require an orihsus restart. nginx certificates and edge policy are reloaded independently with `nginx -t && systemctl reload nginx`.
+The gateway token, key set, and model list are hot-reloadable. Listener/server settings, capacity, key-failure handling, audit, and usage-poll scheduling require an orihsus restart. The upstream origin and API-path allowlist are compiled in. nginx certificates and edge policy are reloaded independently with `nginx -t && systemctl reload nginx`.
 
 ## 8. Resource discipline
 

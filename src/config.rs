@@ -3,10 +3,25 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
-use url::Url;
-
 use crate::pool::MAX_COOLDOWN;
+use serde::Deserialize;
+
+pub const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/";
+
+/// Closed set of upstream APIs that may receive an OpenCode Go key.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum UpstreamApi {
+    ChatCompletions,
+    Usage,
+}
+
+pub(crate) fn upstream_api_url(base: &url::Url, api: UpstreamApi) -> url::Url {
+    let path = match api {
+        UpstreamApi::ChatCompletions => "v1/chat/completions",
+        UpstreamApi::Usage => "v1/usage",
+    };
+    base.join(path).expect("fixed upstream API path is valid")
+}
 
 const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
 const DEFAULT_LISTEN_PORT: u16 = 8080;
@@ -99,7 +114,6 @@ fn check_permissions(_path: &Path) -> Result<(), ConfigError> {
 pub struct Config {
     pub listen: SocketAddr,
     pub gateway_token: Secret,
-    pub upstream: Upstream,
     pub keys: Vec<Secret>,
     /// Static model list advertised by `GET /v1/models` and hot-reloadable.
     pub models: Vec<String>,
@@ -115,12 +129,6 @@ pub struct Config {
 pub struct Usage {
     pub soft_threshold_percent: f64,
     pub poll_interval: Duration,
-}
-
-/// Upstream OpenAI-compatible endpoint.
-#[derive(Debug, Clone)]
-pub struct Upstream {
-    pub base_url: Url,
 }
 
 /// Capacity and admission bounds.
@@ -275,30 +283,6 @@ impl Config {
                 "listen.host must be a loopback address; expose the service through nginx".into(),
             ));
         }
-
-        let upstream = raw
-            .upstream
-            .ok_or_else(|| validation("upstream section is required".into()))?;
-        let base_url = non_empty_string(
-            upstream.base_url,
-            "upstream.base_url is required",
-            &validation,
-        )?;
-        let base_url = Url::parse(&base_url)
-            .map_err(|_| validation("upstream.base_url must be a valid URL".into()))?;
-        if base_url.scheme() != "https" {
-            return Err(validation("upstream.base_url must use https".into()));
-        }
-        if base_url.query().is_some() || base_url.fragment().is_some() {
-            return Err(validation(
-                "upstream.base_url must not contain a query or fragment".into(),
-            ));
-        }
-        // Normalize a path prefix to a trailing slash so `/openai` and
-        // `/openai/` resolve identically: `Url::join` drops the last path
-        // segment when the base path has no trailing slash, which would
-        // silently discard a configured path prefix when forwarding.
-        let base_url = normalize_base_url_path(base_url);
 
         let keys = raw.keys.unwrap_or_default();
         if keys.is_empty() {
@@ -574,7 +558,6 @@ impl Config {
         Ok(Config {
             listen,
             gateway_token,
-            upstream: Upstream { base_url },
             keys,
             models,
             limits: Limits {
@@ -612,35 +595,12 @@ impl Config {
     }
 }
 
-/// Normalize `base_url`'s path to a trailing slash (a root path is left
-/// alone), so a configured path prefix like `/openai` and `/openai/` both
-/// resolve to `/openai/` and `Url::join("v1/chat/completions")` keeps it.
-fn normalize_base_url_path(mut url: Url) -> Url {
-    let path = url.path();
-    if !path.is_empty() && !path.ends_with('/') {
-        url.set_path(&format!("{path}/"));
-    }
-    url
-}
-
-fn non_empty_string(
-    value: Option<String>,
-    message: &'static str,
-    validation: &impl Fn(String) -> ConfigError,
-) -> Result<String, ConfigError> {
-    match value {
-        Some(v) if !v.trim().is_empty() => Ok(v),
-        _ => Err(validation(message.into())),
-    }
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 struct RawConfig {
     gateway_token: Option<String>,
     listen: Option<RawListen>,
-    upstream: Option<RawUpstream>,
     keys: Option<Vec<String>>,
     models: Option<Vec<String>>,
     limits: Option<RawLimits>,
@@ -663,13 +623,6 @@ struct RawUsage {
 struct RawListen {
     host: Option<String>,
     port: Option<u16>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "snake_case")]
-struct RawUpstream {
-    base_url: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -715,4 +668,32 @@ struct RawServer {
     upstream_error_body_timeout_seconds: Option<u64>,
     response_write_timeout_seconds: Option<u64>,
     max_connections: Option<usize>,
+}
+
+#[cfg(test)]
+mod upstream_allowlist_tests {
+    use super::*;
+
+    #[test]
+    fn built_in_upstream_has_one_https_origin_without_query_or_fragment() {
+        let base = url::Url::parse(OPENCODE_GO_BASE_URL).unwrap();
+        assert_eq!(base.scheme(), "https");
+        assert_eq!(base.host_str(), Some("opencode.ai"));
+        assert_eq!(base.path(), "/zen/go/");
+        assert!(base.query().is_none());
+        assert!(base.fragment().is_none());
+    }
+
+    #[test]
+    fn upstream_api_allowlist_builds_only_fixed_paths() {
+        let base = url::Url::parse(OPENCODE_GO_BASE_URL).unwrap();
+        assert_eq!(
+            upstream_api_url(&base, UpstreamApi::ChatCompletions).as_str(),
+            "https://opencode.ai/zen/go/v1/chat/completions"
+        );
+        assert_eq!(
+            upstream_api_url(&base, UpstreamApi::Usage).as_str(),
+            "https://opencode.ai/zen/go/v1/usage"
+        );
+    }
 }
