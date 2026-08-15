@@ -4,7 +4,7 @@ A lightweight OpenAI-compatible gateway for OpenCode Go that rotates multiple su
 
 ## Features
 
-- Supports `POST /v1/chat/completions` with transparent SSE streaming and `GET /v1/models`; other routes return 404 or 405.
+- Transparently proxies `POST /v1/chat/completions`, Anthropic-format `POST /v1/messages`, and Responses-format `POST /v1/responses`, with no protocol conversion. `GET /v1/models` remains local; other routes return 404 or 405.
 - Uses a fill-first key pool. `GoUsageLimitError` cools a key by quota dimension, while ordinary 429 responses use `Retry-After` or exponential backoff.
 - Tries at most two keys per request. Retryable upstream errors become sanitized OpenAI-compatible JSON; upstream bodies and metadata are never exposed.
 - Enforces gateway bearer authentication, header-read timeouts, and a maximum header size; nginx terminates public TLS and HTTP/2.
@@ -33,7 +33,7 @@ Configuration values are scalar strings or numbers. Durations are integer second
 
 | Name | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `gateway_token` | string | yes | — | Bearer token required from gateway clients; must not be blank. Hot-reloadable. |
+| `gateway_token` | string | yes | — | Gateway client token: Bearer authentication on OpenAI endpoints, or `x-api-key` on `/v1/messages`; must not be blank. Hot-reloadable. |
 | `keys` | list of strings | yes | — | Non-empty, unique upstream key pool. Hot-reloadable. |
 | `listen.host` | string (IP) | no | `127.0.0.1` | Loopback IP address. Non-loopback addresses are rejected. |
 | `listen.port` | integer | no | `8080` | Local HTTP port, from 0 through 65535. |
@@ -62,7 +62,7 @@ Configuration values are scalar strings or numbers. Durations are integer second
 
 `key_failure_handling` configures what happens when the currently selected upstream key fails. Ordinary failures use exponential backoff; repeated failures open that key's circuit breaker; `max_attempts` controls whether the same client request may fail over to one other key. It does not configure scheduled key replacement.
 
-Only `gateway_token` and `keys` are required. Omitted optional sections use the defaults above. Listener, limits, key-failure handling, usage, audit, and server changes require restart. The upstream is fixed at `https://opencode.ai/zen/go/`; any `upstream` or `base_url` configuration is rejected. Only the fixed `/v1/chat/completions` and `/v1/usage` upstream paths can receive subscription keys; `/v1/models` is served locally.
+Only `gateway_token` and `keys` are required. Omitted optional sections use the defaults above. Listener, limits, key-failure handling, usage, audit, and server changes require restart. The upstream is fixed at `https://opencode.ai/zen/go/`; any `upstream` or `base_url` configuration is rejected. Only the fixed `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and `/v1/usage` upstream paths can receive subscription keys; `/v1/models` is served locally. Request and successful response bodies are forwarded unchanged; clients must choose the protocol endpoint matching their model.
 
 ## Testing
 

@@ -144,6 +144,8 @@ async fn start_mock(control: Arc<MockControl>) -> std::net::SocketAddr {
     let addr = listener.local_addr().unwrap();
     let app = axum::Router::new()
         .route("/v1/chat/completions", post(mock_chat))
+        .route("/v1/messages", post(mock_chat))
+        .route("/v1/responses", post(mock_chat))
         .with_state(control);
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -412,6 +414,8 @@ async fn every_client_route_writes_exactly_one_redacted_audit_record() {
         ("GET", "/v1/models", "rid-models-401", 401, false),
         ("POST", "/v1/models", "rid-models-405", 405, false),
         ("GET", "/v1/chat/completions", "rid-chat-405", 405, false),
+        ("GET", "/v1/messages", "rid-messages-405", 405, false),
+        ("GET", "/v1/responses", "rid-responses-405", 405, false),
         ("GET", "/unknown", "rid-not-found", 404, false),
     ];
 
@@ -625,7 +629,7 @@ async fn routing_returns_404_and_405_with_openai_error() {
 }
 
 #[tokio::test]
-async fn chat_rejects_models_outside_the_configured_bounded_allowlist() {
+async fn all_proxy_endpoints_reject_models_outside_the_configured_bounded_allowlist() {
     let control = Arc::new(MockControl::default());
     let addr = start_mock(control.clone()).await;
     let app = build_router(state(
@@ -635,19 +639,21 @@ async fn chat_rejects_models_outside_the_configured_bounded_allowlist() {
         TestSink::default(),
     ));
 
-    for model in ["not-configured".to_string(), "m".repeat(257)] {
-        let body = serde_json::json!({"model": model, "messages": []}).to_string();
-        let resp = send(
-            &app,
-            Request::builder()
-                .method("POST")
-                .uri("/v1/chat/completions")
-                .header("authorization", "Bearer gway-token")
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    for endpoint in ["/v1/chat/completions", "/v1/messages", "/v1/responses"] {
+        for model in ["not-configured".to_string(), "m".repeat(257)] {
+            let body = serde_json::json!({"model": model, "messages": []}).to_string();
+            let resp = send(
+                &app,
+                Request::builder()
+                    .method("POST")
+                    .uri(endpoint)
+                    .header("authorization", "Bearer gway-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{endpoint}");
+        }
     }
     assert!(
         control.requests.lock().unwrap().is_empty(),
@@ -905,6 +911,100 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
         "unknown fields forwarded byte-for-byte"
     );
     assert!(fwd["tools"].is_array(), "tools forwarded");
+}
+
+#[tokio::test]
+async fn messages_endpoint_transparently_uses_anthropic_transport() {
+    let control = Arc::new(MockControl::default());
+    let addr = start_mock(control.clone()).await;
+    let app = build_router(state(
+        &format!("http://{addr}"),
+        &["key-1"],
+        queue(2, 2, Duration::from_secs(30)),
+        TestSink::default(),
+    ));
+    let upstream_body =
+        br#"{"id":"msg_1","type":"message","content":[{"type":"text","text":"hi"}]}"#;
+    control
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(MockResponse::json(200, upstream_body));
+    let request_body = br#"{"model":"deepseek-chat","max_tokens":16,"messages":[{"role":"user","content":"hello"}]}"#;
+
+    let resp = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("x-api-key", "gway-token")
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", "prompt-caching-2024-07-31")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body.as_slice()))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_string(resp).await.as_bytes(), upstream_body);
+    let requests = control.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/messages");
+    assert_eq!(requests[0].body, request_body);
+    assert_eq!(requests[0].headers.get("x-api-key").unwrap(), "key-1");
+    assert!(!requests[0].headers.contains_key("authorization"));
+    assert_eq!(
+        requests[0].headers.get("anthropic-version").unwrap(),
+        "2023-06-01"
+    );
+    assert_eq!(
+        requests[0].headers.get("anthropic-beta").unwrap(),
+        "prompt-caching-2024-07-31"
+    );
+}
+
+#[tokio::test]
+async fn responses_endpoint_transparently_uses_openai_transport() {
+    let control = Arc::new(MockControl::default());
+    let addr = start_mock(control.clone()).await;
+    let app = build_router(state(
+        &format!("http://{addr}"),
+        &["key-1"],
+        queue(2, 2, Duration::from_secs(30)),
+        TestSink::default(),
+    ));
+    let upstream_body = br#"{"id":"resp_1","object":"response","status":"completed","output":[]}"#;
+    control
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(MockResponse::json(200, upstream_body));
+    let request_body = br#"{"model":"deepseek-chat","input":"hello","store":false}"#;
+
+    let resp = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer gway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body.as_slice()))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_string(resp).await.as_bytes(), upstream_body);
+    let requests = control.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/v1/responses");
+    assert_eq!(requests[0].body, request_body);
+    assert_eq!(
+        requests[0].headers.get("authorization").unwrap(),
+        "Bearer key-1"
+    );
+    assert!(!requests[0].headers.contains_key("x-api-key"));
 }
 
 #[tokio::test]

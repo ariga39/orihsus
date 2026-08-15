@@ -2,12 +2,12 @@
 
 ## Objective
 
-Build a production-oriented Rust gateway that exposes an OpenAI-compatible endpoint, forwards requests to OpenCode Go, rotates subscription API keys safely, and remains bounded under slow or hostile clients.
+Build a production-oriented Rust gateway that exposes native OpenAI Chat, Anthropic Messages, and OpenAI Responses endpoints, forwards requests to OpenCode Go without format conversion, rotates subscription API keys safely, and remains bounded under slow or hostile clients.
 
 ## Required behavior
 
-- Serve `POST /v1/chat/completions`, `GET /v1/models`, `/healthz`, and `/readyz` as loopback HTTP behind nginx.
-- Authenticate gateway clients with a bearer token before admission or body allocation.
+- Serve `POST /v1/chat/completions`, `POST /v1/messages`, `POST /v1/responses`, `GET /v1/models`, `/healthz`, and `/readyz` as loopback HTTP behind nginx.
+- Authenticate gateway clients before admission or body allocation: Bearer for OpenAI endpoints and Bearer or `x-api-key` for Anthropic Messages.
 - Select keys from a fill-first pool and fail over at most once per request.
 - Classify OpenCode usage-limit responses, ordinary rate limits, authentication failures, upstream failures, and network errors without leaking secrets.
 - Preserve SSE and non-SSE streaming and stop upstream work when the downstream disappears or exceeds its write deadline.

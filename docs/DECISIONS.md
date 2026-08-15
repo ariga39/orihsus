@@ -6,7 +6,7 @@ This document records the decisions that define the gateway contract.
 
 - Implement the service in stable Rust with Tokio, Axum, Reqwest, Rustls, Serde, and Tracing.
 - Ship one native binary with no database, container requirement, administrative UI, or metrics endpoint.
-- Expose only `POST /v1/chat/completions`, `GET /v1/models`, `/healthz`, and `/readyz`. Return explicit 404 or 405 responses for everything else.
+- Expose `POST /v1/chat/completions`, `POST /v1/messages`, `POST /v1/responses`, `GET /v1/models`, `/healthz`, and `/readyz`. Return explicit 404 or 405 responses for everything else. Proxy each request in its native protocol without OpenAI/Anthropic/Responses conversion.
 - Stream SSE and ordinary successful bodies without buffering them completely. Sanitize final upstream 401/403/429/5xx bodies into bounded OpenAI-compatible errors; preserve only a validated `Retry-After` on 429.
 
 ## Key rotation
@@ -31,15 +31,15 @@ This document records the decisions that define the gateway contract.
 
 ## Security
 
-- Fix the upstream service root to `https://opencode.ai/zen/go/`; reject every configurable `upstream` or `base_url` field. Construct credential-bearing requests only for the built-in `/v1/chat/completions` and `/v1/usage` paths; serve `/v1/models` locally. This removes the configuration SSRF and key-exfiltration surface, including private, loopback, metadata, query, fragment, and custom-path targets.
+- Fix the upstream service root to `https://opencode.ai/zen/go/`; reject every configurable `upstream` or `base_url` field. Construct credential-bearing requests only for the built-in `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and `/v1/usage` paths; serve `/v1/models` locally. This removes the configuration SSRF and key-exfiltration surface, including private, loopback, metadata, query, fragment, and custom-path targets.
 - Serve plaintext HTTP only on loopback and place nginx at the public boundary for TLS, HTTP/2, rate limiting, access logging, and fail2ban.
 - Never follow upstream redirects. Return 3xx responses unchanged so a selected key cannot escape the fixed API-path allowlist, even within the trusted origin.
-- Require bearer authentication before admission control and body buffering.
-- Revalidate bearer authentication after admission so a queued request cannot survive token rotation.
+- Require bearer authentication before admission control and body buffering on OpenAI-format endpoints. Accept the same gateway token as `x-api-key` on the Anthropic-format messages endpoint, replacing it with the selected upstream key.
+- Revalidate endpoint-appropriate authentication after admission so a queued request cannot survive token rotation.
 - Keep YAML as the operator format but parse it with maintained `yaml_serde`; do not depend on unmaintained `serde_yaml` or unsound `serde_yml`.
 - Reject release builds that enable `loadtest-insecure-upstream`; its debug-only client is pinned to the loopback mock and requires synthetic credentials.
 - On Unix, open configuration with `O_NOFOLLOW`, then verify the open descriptor is a regular file owned by the effective process user with mode `0600`, and read that same descriptor. Reject duplicate or blank secrets and redact secrets from formatting and errors.
-- Forward only `Content-Type`, `Accept`, and a sanitized gateway request ID alongside the selected upstream authorization. Drop all other client headers at the credential-bearing boundary.
+- Forward only `Content-Type`, `Accept`, and a sanitized gateway request ID alongside the selected upstream authorization. For `/v1/messages`, additionally forward `anthropic-version` and `anthropic-beta`, and authenticate upstream with `x-api-key`. Drop all other client headers at the credential-bearing boundary.
 - Refuse to run as root and use a dedicated system account with a restrictive systemd sandbox.
 
 ## Capacity and lifecycle

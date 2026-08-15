@@ -432,6 +432,11 @@ pub fn build_router(state: GatewayState) -> Router {
             "/v1/chat/completions",
             post(chat_completions).fallback(method_not_allowed),
         )
+        .route("/v1/messages", post(messages).fallback(method_not_allowed))
+        .route(
+            "/v1/responses",
+            post(responses).fallback(method_not_allowed),
+        )
         .fallback(not_found)
         .with_state(Arc::new(state))
 }
@@ -561,6 +566,33 @@ fn check_auth(state: &GatewayState, headers: &HeaderMap) -> Result<(), Response>
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn check_proxy_auth(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    api: UpstreamApi,
+) -> Result<(), Response> {
+    if check_auth(state, headers).is_ok() {
+        return Ok(());
+    }
+    if matches!(api, UpstreamApi::Messages) {
+        let rt = state.runtime.snapshot();
+        let valid = headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|given| {
+                given
+                    .as_bytes()
+                    .ct_eq(rt.gateway_token.as_str().as_bytes())
+                    .into()
+            });
+        if valid {
+            return Ok(());
+        }
+    }
+    Err(unauthorized())
+}
+
 async fn models(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
     let start = tokio::time::Instant::now();
     let request_id = request_id_for(req.headers());
@@ -670,8 +702,9 @@ async fn forward_request(
     body: &Bytes,
     base_url: &Url,
     request_id: &str,
+    api: UpstreamApi,
 ) -> Result<reqwest::Response, reqwest::Error> {
-    let url = upstream_api_url(base_url, UpstreamApi::ChatCompletions);
+    let url = upstream_api_url(base_url, api);
     let mut rb = state.http.post(url).body(body.clone());
     // Credential-bearing traffic receives only the OpenAI protocol headers.
     // Ambient cookies, proxy identity, API keys, and tracing baggage are never
@@ -681,9 +714,17 @@ async fn forward_request(
             rb = rb.header(allowed.clone(), value.clone());
         }
     }
-    rb = rb
-        .header("x-request-id", request_id)
-        .header(AUTHORIZATION, format!("Bearer {}", sel.key().as_str()));
+    if matches!(api, UpstreamApi::Messages) {
+        for allowed in ["anthropic-version", "anthropic-beta"] {
+            for value in headers.get_all(allowed) {
+                rb = rb.header(allowed, value.clone());
+            }
+        }
+        rb = rb.header("x-api-key", sel.key().as_str());
+    } else {
+        rb = rb.header(AUTHORIZATION, format!("Bearer {}", sel.key().as_str()));
+    }
+    rb = rb.header("x-request-id", request_id);
     rb.send().await
 }
 
@@ -799,8 +840,20 @@ fn record_audit_rejected(
 }
 
 async fn chat_completions(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
+    proxy_request(state, req, UpstreamApi::ChatCompletions).await
+}
+
+async fn messages(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
+    proxy_request(state, req, UpstreamApi::Messages).await
+}
+
+async fn responses(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
+    proxy_request(state, req, UpstreamApi::Responses).await
+}
+
+async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: UpstreamApi) -> Response {
     let start = tokio::time::Instant::now();
-    if let Err(resp) = check_auth(&state, req.headers()) {
+    if let Err(resp) = check_proxy_auth(&state, req.headers(), api) {
         // A rejected request is still audited exactly once. Only headers are
         // inspected for auth — the request body is never read — so model, key
         // and usage are unknown and recorded as JSON `null`; no secret or body
@@ -833,7 +886,7 @@ async fn chat_completions(State(state): State<Arc<GatewayState>>, req: Request<B
     // A queued request may have passed the first check before a hot token
     // rotation. Revalidate after admission, immediately before taking the
     // runtime/key snapshot and reading the body.
-    if let Err(resp) = check_auth(&state, req.headers()) {
+    if let Err(resp) = check_proxy_auth(&state, req.headers(), api) {
         record_audit_rejected(
             &state,
             &request_id,
@@ -948,6 +1001,7 @@ async fn chat_completions(State(state): State<Arc<GatewayState>>, req: Request<B
                 &body_bytes,
                 &rt.base_url,
                 &request_id,
+                api,
             ),
         )
         .await

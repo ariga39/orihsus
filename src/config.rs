@@ -20,12 +20,16 @@ pub const MAX_MODEL_BYTES: usize = 256;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum UpstreamApi {
     ChatCompletions,
+    Messages,
+    Responses,
     Usage,
 }
 
 pub(crate) fn upstream_api_url(base: &url::Url, api: UpstreamApi) -> url::Url {
     let path = match api {
         UpstreamApi::ChatCompletions => "v1/chat/completions",
+        UpstreamApi::Messages => "v1/messages",
+        UpstreamApi::Responses => "v1/responses",
         UpstreamApi::Usage => "v1/usage",
     };
     base.join(path).expect("fixed upstream API path is valid")
@@ -745,6 +749,14 @@ mod upstream_allowlist_tests {
         assert_eq!(
             upstream_api_url(&base, UpstreamApi::ChatCompletions).path(),
             format!("{expected_prefix}/v1/chat/completions")
+        );
+        assert_eq!(
+            upstream_api_url(&base, UpstreamApi::Messages).path(),
+            format!("{expected_prefix}/v1/messages")
+        );
+        assert_eq!(
+            upstream_api_url(&base, UpstreamApi::Responses).path(),
+            format!("{expected_prefix}/v1/responses")
         );
         assert_eq!(
             upstream_api_url(&base, UpstreamApi::Usage).path(),
