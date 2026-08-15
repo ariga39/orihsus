@@ -35,7 +35,7 @@ upstream:
 keys:
   - "key-1"
 limits:
-  queue_wait_timeout: "5m"
+  queue_wait_timeout_seconds: 300
 audit:
   path: "__AUDIT_PATH__"
 "#;
@@ -116,8 +116,8 @@ async fn assemble_wires_a_custom_body_budget() {
     let cfg_text = FIVE_MIN_QUEUE_WAIT
         .replace("__AUDIT_PATH__", audit_path.to_str().unwrap())
         .replace(
-            "limits:\n  queue_wait_timeout: \"5m\"",
-            "limits:\n  queue_wait_timeout: \"5m\"\n  max_inflight_body_bytes: \"64MiB\"",
+            "limits:\n  queue_wait_timeout_seconds: 300",
+            "limits:\n  queue_wait_timeout_seconds: 300\n  max_inflight_body_bytes: 67108864",
         );
     let path = write_config(dir.path(), &cfg_text);
     let cfg = orihsus::config::load(&path).unwrap();

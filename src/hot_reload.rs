@@ -47,7 +47,7 @@ pub struct RuntimeConfigSnapshot {
     pub keys: Vec<Secret>,
     pub models: Vec<String>,
     pub limits: config::Limits,
-    pub rotation: config::Rotation,
+    pub key_failure_handling: config::KeyFailureHandling,
     pub upstream: config::Upstream,
 }
 
@@ -58,7 +58,7 @@ impl RuntimeConfigSnapshot {
             keys: cfg.keys.clone(),
             models: cfg.models.clone(),
             limits: cfg.limits.clone(),
-            rotation: cfg.rotation.clone(),
+            key_failure_handling: cfg.key_failure_handling.clone(),
             upstream: cfg.upstream.clone(),
         }
     }
@@ -365,13 +365,13 @@ async fn worker(
 }
 
 /// True when the loaded config changes a field that cannot be hot-swapped
-/// (listen, limits/queue shape, rotation policy, audit and HTTP server
+/// (listen, limits/queue shape, key-failure policy, audit and HTTP server
 /// hardening). Such a reload is refused wholesale: applying only the hot
 /// fields would leave a half-applied configuration.
 fn non_hot_changed(cfg: &Config, baseline: &Config) -> bool {
     cfg.listen != baseline.listen
         || cfg.limits != baseline.limits
-        || cfg.rotation != baseline.rotation
+        || cfg.key_failure_handling != baseline.key_failure_handling
         || cfg.usage != baseline.usage
         || cfg.audit != baseline.audit
         || cfg.server != baseline.server

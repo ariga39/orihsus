@@ -368,7 +368,7 @@ async fn non_hot_changes_require_restart_and_are_not_applied() {
 
     let with_listen = MINIMAL.replace(
         "gateway_token: \"gway-secret\"",
-        "listen: \"127.0.0.1:8443\"\ngateway_token: \"gway-secret\"",
+        "listen:\n  host: \"127.0.0.1\"\n  port: 8443\ngateway_token: \"gway-secret\"",
     );
     fs::write(&path, &with_listen).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -383,7 +383,7 @@ async fn non_hot_changes_require_restart_and_are_not_applied() {
 
     let with_server_change = MINIMAL.replace(
         "gateway_token: \"gway-secret\"",
-        "server:\n  max_header_bytes: \"16KiB\"\ngateway_token: \"gway-secret\"",
+        "server:\n  max_header_bytes: 16384\ngateway_token: \"gway-secret\"",
     );
     fs::write(&path, &with_server_change).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -422,16 +422,22 @@ async fn non_dynamic_config_changes_require_restart_and_are_not_applied() {
     let reloader =
         HotReloader::start(&path, DEBOUNCE, initial, move |snap| rec.apply(snap)).unwrap();
 
-    // limits / rotation / server changes cannot be applied online: they must
+    // Limits, key-failure handling, and server changes cannot be applied online: they must
     // be refused wholesale (needs_restart), never half-applied.
     let cases: &[(&str, &str)] = &[
         ("limits", "limits:\n  max_concurrency: 300\n"),
-        ("rotation", "rotation:\n  backoff_initial: \"9s\"\n"),
-        ("server", "server:\n  read_header_timeout: \"3s\"\n"),
-        ("server timeout", "server:\n  body_read_timeout: \"40s\"\n"),
+        (
+            "key failure handling",
+            "key_failure_handling:\n  backoff_initial_seconds: 9\n",
+        ),
+        ("server", "server:\n  read_header_timeout_seconds: 3\n"),
+        (
+            "server timeout",
+            "server:\n  body_read_timeout_seconds: 40\n",
+        ),
         (
             "server upstream header timeout",
-            "server:\n  upstream_response_header_timeout: \"40s\"\n",
+            "server:\n  upstream_response_header_timeout_seconds: 40\n",
         ),
         (
             "audit",
@@ -695,8 +701,8 @@ async fn status_and_snapshots_never_leak_secrets() {
     let cfg = orihsus::config::load(&path).unwrap();
     let snapshot = RuntimeConfigSnapshot::from_config(&cfg);
     assert_eq!(
-        snapshot.rotation.backoff_initial, cfg.rotation.backoff_initial,
-        "the hot snapshot must carry the current Rotation type"
+        snapshot.key_failure_handling.backoff_initial, cfg.key_failure_handling.backoff_initial,
+        "the hot snapshot must carry the current key-failure policy"
     );
     let snap_debug = format!("{snapshot:?}");
     assert!(

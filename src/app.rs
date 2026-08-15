@@ -48,15 +48,15 @@ pub struct AppRuntime {
 pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
     let http = build_upstream_client().map_err(BootstrapError::Client)?;
     let policy = PoolPolicy {
-        backoff_initial: cfg.rotation.backoff_initial,
-        backoff_max: cfg.rotation.backoff_max,
-        breaker_threshold: u32::try_from(cfg.rotation.breaker_threshold)
+        backoff_initial: cfg.key_failure_handling.backoff_initial,
+        backoff_max: cfg.key_failure_handling.backoff_max,
+        breaker_threshold: u32::try_from(cfg.key_failure_handling.breaker_threshold)
             .expect("config validation caps breaker_threshold at u32::MAX"),
-        breaker_cooldown: cfg.rotation.breaker_cooldown,
+        breaker_cooldown: cfg.key_failure_handling.breaker_cooldown,
         // The pool has its own hard 30s wait budget, independent of the queue's
         // queue_wait_timeout (which only bounds admission waiting).
         wait_timeout: crate::pool::WAIT_TIMEOUT,
-        max_attempts: cfg.rotation.max_attempts,
+        max_attempts: cfg.key_failure_handling.max_attempts,
     };
     let pool = Arc::new(KeyPool::new(cfg.keys.clone(), policy).map_err(BootstrapError::Pool)?);
     let queue = Arc::new(AdmissionQueue::new(

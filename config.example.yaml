@@ -1,66 +1,26 @@
-# orihsus example configuration
+# Minimal orihsus configuration
 #
-# Install as the service user because the file contains plaintext credentials:
+# Install as the service user because this file contains plaintext credentials:
 #   sudo install -o orihsus -g orihsus -m 0600 config.example.yaml /etc/orihsus/config.yaml
 # The resulting ownership and mode must be orihsus:orihsus and 0600.
 #
-# orihsus serves plaintext HTTP on loopback only. nginx owns the public
-# TLS/HTTP2, rate-limit, and access-log boundary.
+# Optional settings are intentionally omitted. See README.md for the complete
+# schema, types, required status, and defaults.
 
-listen: "127.0.0.1:8080"
-
-# Bearer token required from gateway clients. Replace with a long random value.
+# Required: bearer token accepted from gateway clients.
 gateway_token: "CHANGE-ME-use-a-long-random-token"
 
-# OpenCode Go upstream. HTTPS is mandatory. A path prefix is normalized to a
-# trailing slash; query strings and fragments are rejected.
+# Required: OpenCode Go HTTPS endpoint. A URL is naturally one string value.
 upstream:
   base_url: "https://api.opencode.go"
 
-# Subscription API-key pool.
+# Required: non-empty pool of unique OpenCode Go subscription keys.
 keys:
   - "CHANGE-ME-upstream-key-1"
   - "CHANGE-ME-upstream-key-2"
 
-# Proactive OpenCode Go usage polling. Changes require restart; a hot-reloaded
-# key set is polled immediately. poll_interval must be at least 30 seconds.
-usage:
-  soft_threshold_percent: 80
-  poll_interval: "5m"
-
-# Static values returned by GET /v1/models. This list is hot-reloadable and
-# must contain unique, non-blank entries.
+# Optional, but normally a deployment decision: models advertised by
+# GET /v1/models. Remove this section to advertise only deepseek-chat.
 models:
   - "deepseek-chat"
   - "deepseek-reasoner"
-
-limits:
-  max_concurrency: 200
-  max_queue: 500
-  queue_wait_timeout: "30s"
-  max_body_bytes: "10MiB"
-  # Each body reserves max_body_bytes from this global budget before reading.
-  # The value must be >= max_body_bytes and <= u32::MAX.
-  max_inflight_body_bytes: "256MiB"
-
-rotation:
-  backoff_initial: "5s"
-  backoff_max: "60s"
-  breaker_threshold: 5
-  breaker_cooldown: "60s"
-  max_attempts: 2
-
-audit:
-  path: "/var/log/orihsus/audit.jsonl"
-  queue_capacity: 4096
-
-server:
-  # These are defense-in-depth limits for the nginx-to-orihsus hop. nginx must
-  # independently enforce its public-client limits and timeouts.
-  read_header_timeout: "5s"
-  max_header_bytes: "32KiB"
-  max_connections: 1024
-  body_read_timeout: "30s"
-  upstream_response_header_timeout: "60s"
-  upstream_error_body_timeout: "5s"
-  response_write_timeout: "30s"

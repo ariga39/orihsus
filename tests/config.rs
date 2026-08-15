@@ -44,11 +44,20 @@ fn minimal_valid_config_yields_defaults() {
         "default inflight body budget is 256MiB, not 200×10MiB"
     );
 
-    assert_eq!(cfg.rotation.backoff_initial, Duration::from_secs(5));
-    assert_eq!(cfg.rotation.backoff_max, Duration::from_secs(60));
-    assert_eq!(cfg.rotation.breaker_threshold, 5);
-    assert_eq!(cfg.rotation.breaker_cooldown, Duration::from_secs(60));
-    assert_eq!(cfg.rotation.max_attempts, 2);
+    assert_eq!(
+        cfg.key_failure_handling.backoff_initial,
+        Duration::from_secs(5)
+    );
+    assert_eq!(
+        cfg.key_failure_handling.backoff_max,
+        Duration::from_secs(60)
+    );
+    assert_eq!(cfg.key_failure_handling.breaker_threshold, 5);
+    assert_eq!(
+        cfg.key_failure_handling.breaker_cooldown,
+        Duration::from_secs(60)
+    );
+    assert_eq!(cfg.key_failure_handling.max_attempts, 2);
 
     assert_eq!(cfg.usage.soft_threshold_percent, 80.0);
     assert_eq!(cfg.usage.poll_interval, Duration::from_secs(5 * 60));
@@ -83,7 +92,7 @@ fn non_loopback_listener_is_rejected() {
     let path = write_config(
         dir.path(),
         "public-listener.yaml",
-        &format!("listen: \"0.0.0.0:8080\"\n{MINIMAL}"),
+        &format!("listen:\n  host: \"0.0.0.0\"\n  port: 8080\n{MINIMAL}"),
     );
     let err = orihsus::config::load(&path).unwrap_err();
     let rendered = format!("{err}");
@@ -104,6 +113,20 @@ fn obsolete_tls_section_is_rejected() {
 }
 
 #[test]
+fn composite_string_schema_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    for (name, prefix) in [
+        ("listen.yaml", "listen: \"127.0.0.1:8080\"\n"),
+        ("duration.yaml", "usage:\n  poll_interval_seconds: \"5m\"\n"),
+        ("bytes.yaml", "limits:\n  max_body_bytes: \"10MiB\"\n"),
+    ] {
+        let path = write_config(dir.path(), name, &format!("{prefix}{MINIMAL}"));
+        let err = orihsus::config::load(path).unwrap_err();
+        assert!(format!("{err}").contains("invalid YAML"), "{name}: {err}");
+    }
+}
+
+#[test]
 fn explicit_usage_values_are_parsed() {
     let dir = TempDir::new().unwrap();
     let path = write_config(
@@ -111,7 +134,7 @@ fn explicit_usage_values_are_parsed() {
         "usage.yaml",
         &MINIMAL.replace(
             "keys:\n  - \"key-1\"",
-            "keys:\n  - \"key-1\"\nusage:\n  soft_threshold_percent: 73.5\n  poll_interval: \"45s\"",
+            "keys:\n  - \"key-1\"\nusage:\n  soft_threshold_percent: 73.5\n  poll_interval_seconds: 45",
         ),
     );
 
@@ -140,17 +163,17 @@ fn invalid_usage_thresholds_are_rejected_without_leaking_secrets() {
 #[test]
 fn usage_poll_interval_shorter_than_thirty_seconds_is_rejected() {
     let dir = TempDir::new().unwrap();
-    for (name, value) in [("zero", "0s"), ("short", "29s")] {
+    for (name, value) in [("zero", 0), ("short", 29)] {
         let path = write_config(
             dir.path(),
             &format!("interval-{name}.yaml"),
             &MINIMAL.replace(
                 "keys:\n  - \"key-1\"",
-                &format!("keys:\n  - \"key-1\"\nusage:\n  poll_interval: \"{value}\""),
+                &format!("keys:\n  - \"key-1\"\nusage:\n  poll_interval_seconds: {value}"),
             ),
         );
         let err = orihsus::config::load(path).unwrap_err();
-        assert!(format!("{err}").contains("poll_interval"), "{err}");
+        assert!(format!("{err}").contains("poll_interval_seconds"), "{err}");
     }
 }
 
@@ -170,12 +193,12 @@ audit:
   path: "/srv/orihsus/audit.log"
   queue_capacity: 128
 server:
-  read_header_timeout: "2s"
-  max_header_bytes: "8KiB"
-  body_read_timeout: "20s"
-  upstream_response_header_timeout: "45s"
-  upstream_error_body_timeout: "7s"
-  response_write_timeout: "45s"
+  read_header_timeout_seconds: 2
+  max_header_bytes: 8192
+  body_read_timeout_seconds: 20
+  upstream_response_header_timeout_seconds: 45
+  upstream_error_body_timeout_seconds: 7
+  response_write_timeout_seconds: 45
   max_connections: 2048
 "#,
     );
@@ -225,18 +248,18 @@ keys:
     let zero_timeout = write_config(
         dir.path(),
         "timeout.yaml",
-        &base("server:\n  read_header_timeout: \"0s\"\n"),
+        &base("server:\n  read_header_timeout_seconds: 0\n"),
     );
     let err = orihsus::config::load(&zero_timeout).unwrap_err();
     assert!(
-        format!("{err}").contains("read_header_timeout"),
+        format!("{err}").contains("read_header_timeout_seconds"),
         "got: {err}"
     );
 
     let zero_headers = write_config(
         dir.path(),
         "headers.yaml",
-        &base("server:\n  max_header_bytes: \"0KiB\"\n"),
+        &base("server:\n  max_header_bytes: 0\n"),
     );
     let err = orihsus::config::load(&zero_headers).unwrap_err();
     assert!(format!("{err}").contains("max_header_bytes"), "got: {err}");
@@ -244,41 +267,44 @@ keys:
     let zero_body_read = write_config(
         dir.path(),
         "body_read.yaml",
-        &base("server:\n  body_read_timeout: \"0s\"\n"),
+        &base("server:\n  body_read_timeout_seconds: 0\n"),
     );
     let err = orihsus::config::load(&zero_body_read).unwrap_err();
-    assert!(format!("{err}").contains("body_read_timeout"), "got: {err}");
+    assert!(
+        format!("{err}").contains("body_read_timeout_seconds"),
+        "got: {err}"
+    );
 
     let zero_upstream_header = write_config(
         dir.path(),
         "upstream_header.yaml",
-        &base("server:\n  upstream_response_header_timeout: \"0s\"\n"),
+        &base("server:\n  upstream_response_header_timeout_seconds: 0\n"),
     );
     let err = orihsus::config::load(&zero_upstream_header).unwrap_err();
     assert!(
-        format!("{err}").contains("upstream_response_header_timeout"),
+        format!("{err}").contains("upstream_response_header_timeout_seconds"),
         "got: {err}"
     );
 
     let zero_error_body = write_config(
         dir.path(),
         "error_body.yaml",
-        &base("server:\n  upstream_error_body_timeout: \"0s\"\n"),
+        &base("server:\n  upstream_error_body_timeout_seconds: 0\n"),
     );
     let err = orihsus::config::load(&zero_error_body).unwrap_err();
     assert!(
-        format!("{err}").contains("upstream_error_body_timeout"),
+        format!("{err}").contains("upstream_error_body_timeout_seconds"),
         "got: {err}"
     );
 
     let zero_response_write = write_config(
         dir.path(),
         "response_write.yaml",
-        &base("server:\n  response_write_timeout: \"0s\"\n"),
+        &base("server:\n  response_write_timeout_seconds: 0\n"),
     );
     let err = orihsus::config::load(&zero_response_write).unwrap_err();
     assert!(
-        format!("{err}").contains("response_write_timeout"),
+        format!("{err}").contains("response_write_timeout_seconds"),
         "got: {err}"
     );
 
@@ -473,7 +499,7 @@ upstream:
   base_url: "https://api.opencode.go"
 keys:
   - "key-1"
-rotation:
+key_failure_handling:
   soft_threshold: 0.8
 "#,
     );
@@ -509,7 +535,7 @@ upstream:
   base_url: "https://api.opencode.go"
 keys:
   - "key-1"
-rotation:
+key_failure_handling:
   soft_threshold: "{secret}"
 "#
         ),
@@ -555,12 +581,12 @@ limits:
         ),
         (
             "queue_timeout_zero.yaml",
-            "  queue_wait_timeout: \"0s\"\n",
-            "queue_wait_timeout",
+            "  queue_wait_timeout_seconds: 0\n",
+            "queue_wait_timeout_seconds",
         ),
         (
             "body_bytes_zero.yaml",
-            "  max_body_bytes: \"0MiB\"\n",
+            "  max_body_bytes: 0\n",
             "max_body_bytes",
         ),
     ];
@@ -651,7 +677,7 @@ upstream:
   base_url: "https://api.opencode.go"
 keys:
   - "key-1"
-rotation:
+key_failure_handling:
   breaker_threshold: 4294967296
 "#,
     );
@@ -673,7 +699,7 @@ upstream:
 keys:
   - "key-1"
 server:
-  max_header_bytes: "4294967296"
+  max_header_bytes: 4294967296
 "#,
     );
 
@@ -694,8 +720,8 @@ upstream:
 keys:
   - "key-1"
 limits:
-  max_body_bytes: "20MiB"
-  max_inflight_body_bytes: "64MiB"
+  max_body_bytes: 20971520
+  max_inflight_body_bytes: 67108864
 "#,
     );
 
@@ -728,22 +754,22 @@ limits:
     let cases: &[(&str, &str, &str)] = &[
         (
             "inflight_zero.yaml",
-            "  max_inflight_body_bytes: \"0MiB\"\n",
+            "  max_inflight_body_bytes: 0\n",
             "max_inflight_body_bytes",
         ),
         (
             "inflight_lt_body.yaml",
-            "  max_body_bytes: \"10MiB\"\n  max_inflight_body_bytes: \"1MiB\"\n",
+            "  max_body_bytes: 10485760\n  max_inflight_body_bytes: 1048576\n",
             "max_inflight_body_bytes",
         ),
         (
             "inflight_exceeds_u32.yaml",
-            "  max_inflight_body_bytes: \"5GiB\"\n",
+            "  max_inflight_body_bytes: 5368709120\n",
             "max_inflight_body_bytes",
         ),
         (
             "body_exceeds_u32.yaml",
-            "  max_body_bytes: \"5GiB\"\n",
+            "  max_body_bytes: 5368709120\n",
             "max_body_bytes",
         ),
     ];
@@ -755,9 +781,9 @@ limits:
 }
 
 #[test]
-fn rotation_bounds_are_enforced() {
+fn key_failure_handling_bounds_are_enforced() {
     let dir = TempDir::new().unwrap();
-    let with_rotation = |name: &str, rotation: &str| {
+    let with_key_failure_handling = |name: &str, key_failure_handling: &str| {
         write_config(
             dir.path(),
             name,
@@ -768,8 +794,8 @@ upstream:
   base_url: "https://api.opencode.go"
 keys:
   - "key-1"
-rotation:
-{rotation}
+key_failure_handling:
+{key_failure_handling}
 "#
             ),
         )
@@ -778,18 +804,18 @@ rotation:
     let cases: &[(&str, &str, &str)] = &[
         (
             "backoff_initial_zero.yaml",
-            "  backoff_initial: \"0s\"\n",
-            "backoff_initial",
+            "  backoff_initial_seconds: 0\n",
+            "backoff_initial_seconds",
         ),
         (
             "backoff_max_zero.yaml",
-            "  backoff_max: \"0s\"\n",
-            "backoff_max",
+            "  backoff_max_seconds: 0\n",
+            "backoff_max_seconds",
         ),
         (
             "backoff_max_lt_initial.yaml",
-            "  backoff_initial: \"60s\"\n  backoff_max: \"5s\"\n",
-            "backoff_max",
+            "  backoff_initial_seconds: 60\n  backoff_max_seconds: 5\n",
+            "backoff_max_seconds",
         ),
         (
             "breaker_threshold_zero.yaml",
@@ -798,17 +824,17 @@ rotation:
         ),
         (
             "breaker_cooldown_zero.yaml",
-            "  breaker_cooldown: \"0s\"\n",
-            "breaker_cooldown",
+            "  breaker_cooldown_seconds: 0\n",
+            "breaker_cooldown_seconds",
         ),
         (
             "backoff_max_extreme.yaml",
-            "  backoff_max: \"18446744073709551615s\"\n",
-            "backoff_max",
+            "  backoff_max_seconds: 18446744073709551615\n",
+            "backoff_max_seconds",
         ),
     ];
     for (name, snippet, field) in cases {
-        let path = with_rotation(name, snippet);
+        let path = with_key_failure_handling(name, snippet);
         let err = orihsus::config::load(&path).unwrap_err();
         assert!(format!("{err}").contains(field), "{field}: got: {err}");
     }
@@ -817,7 +843,7 @@ rotation:
 #[test]
 fn backoff_max_is_capped_at_the_ops_cooldown_ceiling() {
     let dir = TempDir::new().unwrap();
-    let with_backoff = |name: &str, max: &str| {
+    let with_backoff = |name: &str, max: u64| {
         write_config(
             dir.path(),
             name,
@@ -828,35 +854,35 @@ upstream:
   base_url: "https://api.opencode.go"
 keys:
   - "key-1"
-rotation:
-  backoff_max: "{max}"
+key_failure_handling:
+  backoff_max_seconds: {max}
 "#
             ),
         )
     };
 
-    // A huge-but-parseable humantime value would overflow the jitter addition
+    // A huge numeric duration would overflow the jitter addition
     // (process abort under panic="abort"); the config layer must reject it as
     // invalid instead of accepting it.
-    let extreme = with_backoff("extreme.yaml", "18446744073709551615s");
+    let extreme = with_backoff("extreme.yaml", 18446744073709551615);
     let err = orihsus::config::load(&extreme).unwrap_err();
     assert!(
-        format!("{err}").contains("backoff_max"),
-        "an extreme backoff_max must be rejected: {err}"
+        format!("{err}").contains("backoff_max_seconds"),
+        "an extreme backoff_max_seconds must be rejected: {err}"
     );
 
     // The ops ceiling (MAX_COOLDOWN = 90 days) is the sane upper bound: at the
     // ceiling the config still loads, just past it the load fails.
-    let at_ceiling = with_backoff("ceiling.yaml", "90d");
+    let at_ceiling = with_backoff("ceiling.yaml", 90 * 24 * 60 * 60);
     assert!(
         orihsus::config::load(&at_ceiling).is_ok(),
-        "backoff_max at the 90d ops ceiling must be accepted"
+        "backoff_max_seconds at the 90d ops ceiling must be accepted"
     );
-    let past_ceiling = with_backoff("past.yaml", "91d");
+    let past_ceiling = with_backoff("past.yaml", 91 * 24 * 60 * 60);
     let err = orihsus::config::load(&past_ceiling).unwrap_err();
     assert!(
-        format!("{err}").contains("backoff_max"),
-        "backoff_max past the 90d ops ceiling must be rejected: {err}"
+        format!("{err}").contains("backoff_max_seconds"),
+        "backoff_max_seconds past the 90d ops ceiling must be rejected: {err}"
     );
 }
 
@@ -874,7 +900,7 @@ upstream:
   base_url: "https://api.opencode.go"
 keys:
   - "key-1"
-rotation:
+key_failure_handling:
   max_attempts: {value}
 "#
             ),
@@ -953,9 +979,9 @@ keys:
             "max_header_bytes",
         ),
         (
-            "rotation-typo.yaml",
-            "rotation:\n  backoff_maximum: \"60s\"\n",
-            "backoff_max",
+            "key-failure-handling-typo.yaml",
+            "key_failure_handling:\n  backoff_maximum: \"60s\"\n",
+            "backoff_max_seconds",
         ),
     ];
     for (name, snippet, field) in cases {
@@ -1109,7 +1135,7 @@ keys:
             r#"
 gateway_token: "{secret_token}"
 upstream: [unclosed
-rotation:
+key_failure_handling:
   base_url: "https://api.opencode.go"
 keys:
   - "{secret_key}"

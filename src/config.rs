@@ -1,5 +1,5 @@
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -8,7 +8,8 @@ use url::Url;
 
 use crate::pool::MAX_COOLDOWN;
 
-const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
+const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
+const DEFAULT_LISTEN_PORT: u16 = 8080;
 const DEFAULT_MAX_CONCURRENCY: usize = 200;
 const DEFAULT_MAX_QUEUE: usize = 500;
 const DEFAULT_QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -103,7 +104,7 @@ pub struct Config {
     /// Static model list advertised by `GET /v1/models` and hot-reloadable.
     pub models: Vec<String>,
     pub limits: Limits,
-    pub rotation: Rotation,
+    pub key_failure_handling: KeyFailureHandling,
     pub usage: Usage,
     pub audit: Audit,
     pub server: Server,
@@ -135,9 +136,10 @@ pub struct Limits {
     pub max_inflight_body_bytes: usize,
 }
 
-/// Key rotation and failure-handling bounds.
+/// Backoff, circuit-breaker, and cross-key retry policy after an upstream key
+/// fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Rotation {
+pub struct KeyFailureHandling {
     pub backoff_initial: Duration,
     pub backoff_max: Duration,
     pub breaker_threshold: usize,
@@ -262,17 +264,15 @@ impl Config {
             _ => return Err(validation("gateway token must be set and non-empty".into())),
         };
 
-        let listen = match raw.listen {
-            Some(addr) => addr.parse::<SocketAddr>().map_err(|_| {
-                validation(format!(
-                    "listen must be a valid socket address, got {addr:?}"
-                ))
-            })?,
-            None => DEFAULT_LISTEN.parse::<SocketAddr>().unwrap(),
-        };
+        let listen = raw.listen.unwrap_or_default();
+        let listen_host = listen.host.as_deref().unwrap_or(DEFAULT_LISTEN_HOST);
+        let listen_host = listen_host
+            .parse::<IpAddr>()
+            .map_err(|_| validation("listen.host must be a valid IP address".into()))?;
+        let listen = SocketAddr::new(listen_host, listen.port.unwrap_or(DEFAULT_LISTEN_PORT));
         if !listen.ip().is_loopback() {
             return Err(validation(
-                "listen must use a loopback address; expose the service through nginx".into(),
+                "listen.host must be a loopback address; expose the service through nginx".into(),
             ));
         }
 
@@ -360,19 +360,16 @@ impl Config {
                 tokio::sync::Semaphore::MAX_PERMITS
             )));
         }
-        let queue_wait_timeout = match limits.queue_wait_timeout {
-            Some(raw) => parse_duration(&raw).map_err(validation)?,
+        let queue_wait_timeout = match limits.queue_wait_timeout_seconds {
+            Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_QUEUE_WAIT_TIMEOUT,
         };
         if queue_wait_timeout.is_zero() {
             return Err(validation(
-                "limits.queue_wait_timeout must be greater than zero".into(),
+                "limits.queue_wait_timeout_seconds must be greater than zero".into(),
             ));
         }
-        let max_body_bytes = match limits.max_body_bytes {
-            Some(raw) => parse_bytes(&raw).map_err(validation)?,
-            None => DEFAULT_MAX_BODY_BYTES,
-        };
+        let max_body_bytes = limits.max_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES);
         if max_body_bytes == 0 {
             return Err(validation(
                 "limits.max_body_bytes must be at least 1 byte".into(),
@@ -384,10 +381,9 @@ impl Config {
                     .into(),
             ));
         }
-        let max_inflight_body_bytes = match limits.max_inflight_body_bytes {
-            Some(raw) => parse_bytes(&raw).map_err(validation)?,
-            None => DEFAULT_MAX_INFLIGHT_BODY_BYTES,
-        };
+        let max_inflight_body_bytes = limits
+            .max_inflight_body_bytes
+            .unwrap_or(DEFAULT_MAX_INFLIGHT_BODY_BYTES);
         if max_inflight_body_bytes == 0 {
             return Err(validation(
                 "limits.max_inflight_body_bytes must be at least 1 byte".into(),
@@ -404,68 +400,69 @@ impl Config {
             ));
         }
 
-        let rotation = raw.rotation.unwrap_or_default();
-        if rotation.soft_threshold.is_some() {
+        let key_failure = raw.key_failure_handling.unwrap_or_default();
+        if key_failure.soft_threshold.is_some() {
             return Err(validation(
-                "rotation.soft_threshold is no longer supported; remove it from the config".into(),
+                "key_failure_handling.soft_threshold is no longer supported; remove it from the config"
+                    .into(),
             ));
         }
-        let backoff_initial = match rotation.backoff_initial {
-            Some(raw) => parse_duration(&raw).map_err(validation)?,
+        let backoff_initial = match key_failure.backoff_initial_seconds {
+            Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_BACKOFF_INITIAL,
         };
         if backoff_initial.is_zero() {
             return Err(validation(
-                "rotation.backoff_initial must be greater than zero".into(),
+                "key_failure_handling.backoff_initial_seconds must be greater than zero".into(),
             ));
         }
-        let backoff_max = match rotation.backoff_max {
-            Some(raw) => parse_duration(&raw).map_err(validation)?,
+        let backoff_max = match key_failure.backoff_max_seconds {
+            Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_BACKOFF_MAX,
         };
         if backoff_max.is_zero() {
             return Err(validation(
-                "rotation.backoff_max must be greater than zero".into(),
+                "key_failure_handling.backoff_max_seconds must be greater than zero".into(),
             ));
         }
         if backoff_max < backoff_initial {
             return Err(validation(
-                "rotation.backoff_max must be >= rotation.backoff_initial".into(),
+                "key_failure_handling.backoff_max_seconds must be >= key_failure_handling.backoff_initial_seconds".into(),
             ));
         }
         if backoff_max > MAX_COOLDOWN {
             return Err(validation(
-                "rotation.backoff_max must be at most the ops cooldown ceiling (90d): a larger value would overflow the jittered backoff"
+                "key_failure_handling.backoff_max_seconds must be at most the ops cooldown ceiling (7776000 seconds)"
                     .into(),
             ));
         }
-        let breaker_threshold = rotation
+        let breaker_threshold = key_failure
             .breaker_threshold
             .unwrap_or(DEFAULT_BREAKER_THRESHOLD);
         if breaker_threshold == 0 {
             return Err(validation(
-                "rotation.breaker_threshold must be at least 1".into(),
+                "key_failure_handling.breaker_threshold must be at least 1".into(),
             ));
         }
         if breaker_threshold > u32::MAX as usize {
             return Err(validation(
-                "rotation.breaker_threshold must fit u32 (the key pool breaker counts failures in u32)"
+                "key_failure_handling.breaker_threshold must fit u32 (the key pool breaker counts failures in u32)"
                     .into(),
             ));
         }
-        let breaker_cooldown = match rotation.breaker_cooldown {
-            Some(raw) => parse_duration(&raw).map_err(validation)?,
+        let breaker_cooldown = match key_failure.breaker_cooldown_seconds {
+            Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_BREAKER_COOLDOWN,
         };
         if breaker_cooldown.is_zero() {
             return Err(validation(
-                "rotation.breaker_cooldown must be greater than zero".into(),
+                "key_failure_handling.breaker_cooldown_seconds must be greater than zero".into(),
             ));
         }
-        let max_attempts = rotation.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
+        let max_attempts = key_failure.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
         if max_attempts == 0 || max_attempts > 2 {
             return Err(validation(
-                "rotation.max_attempts must be between 1 and 2".into(),
+                "key_failure_handling.max_attempts must be between 1 and 2".into(),
             ));
         }
 
@@ -481,13 +478,13 @@ impl Config {
                 "usage.soft_threshold_percent must be finite and in (0, 100]".into(),
             ));
         }
-        let poll_interval = match usage.poll_interval {
-            Some(raw) => parse_duration(&raw).map_err(validation)?,
+        let poll_interval = match usage.poll_interval_seconds {
+            Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_USAGE_POLL_INTERVAL,
         };
         if poll_interval < Duration::from_secs(30) {
             return Err(validation(
-                "usage.poll_interval must be at least 30 seconds".into(),
+                "usage.poll_interval_seconds must be at least 30".into(),
             ));
         }
 
@@ -502,19 +499,16 @@ impl Config {
         }
 
         let server = raw.server.unwrap_or_default();
-        let read_header_timeout = match server.read_header_timeout {
-            Some(raw) => parse_duration(&raw).map_err(validation)?,
+        let read_header_timeout = match server.read_header_timeout_seconds {
+            Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_READ_HEADER_TIMEOUT,
         };
         if read_header_timeout.is_zero() {
             return Err(validation(
-                "server.read_header_timeout must be greater than zero".into(),
+                "server.read_header_timeout_seconds must be greater than zero".into(),
             ));
         }
-        let max_header_bytes = match server.max_header_bytes {
-            Some(raw) => parse_bytes(&raw).map_err(validation)?,
-            None => DEFAULT_MAX_HEADER_BYTES,
-        };
+        let max_header_bytes = server.max_header_bytes.unwrap_or(DEFAULT_MAX_HEADER_BYTES);
         if max_header_bytes < 8192 {
             return Err(validation(
                 "server.max_header_bytes must be at least 8192 bytes (HTTP/1 minimum)".into(),
@@ -526,40 +520,41 @@ impl Config {
                     .into(),
             ));
         }
-        let body_read_timeout = match server.body_read_timeout {
-            Some(raw) => parse_duration(&raw).map_err(validation)?,
+        let body_read_timeout = match server.body_read_timeout_seconds {
+            Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_BODY_READ_TIMEOUT,
         };
         if body_read_timeout.is_zero() {
             return Err(validation(
-                "server.body_read_timeout must be greater than zero".into(),
+                "server.body_read_timeout_seconds must be greater than zero".into(),
             ));
         }
-        let upstream_response_header_timeout = match server.upstream_response_header_timeout {
-            Some(raw) => parse_duration(&raw).map_err(validation)?,
+        let upstream_response_header_timeout = match server.upstream_response_header_timeout_seconds
+        {
+            Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_UPSTREAM_RESPONSE_HEADER_TIMEOUT,
         };
         if upstream_response_header_timeout.is_zero() {
             return Err(validation(
-                "server.upstream_response_header_timeout must be greater than zero".into(),
+                "server.upstream_response_header_timeout_seconds must be greater than zero".into(),
             ));
         }
-        let upstream_error_body_timeout = match server.upstream_error_body_timeout {
-            Some(raw) => parse_duration(&raw).map_err(validation)?,
+        let upstream_error_body_timeout = match server.upstream_error_body_timeout_seconds {
+            Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_UPSTREAM_ERROR_BODY_TIMEOUT,
         };
         if upstream_error_body_timeout.is_zero() {
             return Err(validation(
-                "server.upstream_error_body_timeout must be greater than zero".into(),
+                "server.upstream_error_body_timeout_seconds must be greater than zero".into(),
             ));
         }
-        let response_write_timeout = match server.response_write_timeout {
-            Some(raw) => parse_duration(&raw).map_err(validation)?,
+        let response_write_timeout = match server.response_write_timeout_seconds {
+            Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_RESPONSE_WRITE_TIMEOUT,
         };
         if response_write_timeout.is_zero() {
             return Err(validation(
-                "server.response_write_timeout must be greater than zero".into(),
+                "server.response_write_timeout_seconds must be greater than zero".into(),
             ));
         }
         let max_connections = server.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS);
@@ -589,7 +584,7 @@ impl Config {
                 max_body_bytes,
                 max_inflight_body_bytes,
             },
-            rotation: Rotation {
+            key_failure_handling: KeyFailureHandling {
                 backoff_initial,
                 backoff_max,
                 breaker_threshold,
@@ -639,41 +634,17 @@ fn non_empty_string(
     }
 }
 
-fn parse_duration(raw: &str) -> Result<Duration, String> {
-    humantime::parse_duration(raw).map_err(|_| format!("invalid duration {raw:?}"))
-}
-
-fn parse_bytes(raw: &str) -> Result<usize, String> {
-    let raw = raw.trim();
-    let split = raw.find(|c: char| !c.is_ascii_digit()).unwrap_or(raw.len());
-    let (num, suffix) = raw.split_at(split);
-    let value: u64 = num
-        .parse()
-        .map_err(|_| format!("invalid byte size {raw:?}"))?;
-    let multiplier: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1,
-        "k" | "kb" | "kib" => 1024,
-        "m" | "mb" | "mib" => 1024 * 1024,
-        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
-        other => return Err(format!("invalid byte size suffix {other:?}")),
-    };
-    let bytes = value
-        .checked_mul(multiplier)
-        .ok_or_else(|| format!("byte size too large: {raw:?}"))?;
-    usize::try_from(bytes).map_err(|_| format!("byte size too large: {raw:?}"))
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 struct RawConfig {
     gateway_token: Option<String>,
-    listen: Option<String>,
+    listen: Option<RawListen>,
     upstream: Option<RawUpstream>,
     keys: Option<Vec<String>>,
     models: Option<Vec<String>>,
     limits: Option<RawLimits>,
-    rotation: Option<RawRotation>,
+    key_failure_handling: Option<RawKeyFailureHandling>,
     usage: Option<RawUsage>,
     audit: Option<RawAudit>,
     server: Option<RawServer>,
@@ -684,7 +655,14 @@ struct RawConfig {
 #[serde(rename_all = "snake_case")]
 struct RawUsage {
     soft_threshold_percent: Option<f64>,
-    poll_interval: Option<String>,
+    poll_interval_seconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawListen {
+    host: Option<String>,
+    port: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -700,23 +678,21 @@ struct RawUpstream {
 struct RawLimits {
     max_concurrency: Option<usize>,
     max_queue: Option<usize>,
-    queue_wait_timeout: Option<String>,
-    max_body_bytes: Option<String>,
-    max_inflight_body_bytes: Option<String>,
+    queue_wait_timeout_seconds: Option<u64>,
+    max_body_bytes: Option<usize>,
+    max_inflight_body_bytes: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
-struct RawRotation {
-    /// Deprecated since the soft-threshold/quota strategy was removed. Kept
-    /// only to detect and reject a leftover field; the value is never echoed
-    /// (a catch-all type avoids any parse/type error that could leak it).
+struct RawKeyFailureHandling {
+    /// Retained only to provide a redacted migration error for an old field.
     soft_threshold: Option<serde_yaml::Value>,
-    backoff_initial: Option<String>,
-    backoff_max: Option<String>,
+    backoff_initial_seconds: Option<u64>,
+    backoff_max_seconds: Option<u64>,
     breaker_threshold: Option<usize>,
-    breaker_cooldown: Option<String>,
+    breaker_cooldown_seconds: Option<u64>,
     max_attempts: Option<usize>,
 }
 
@@ -732,11 +708,11 @@ struct RawAudit {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 struct RawServer {
-    read_header_timeout: Option<String>,
-    max_header_bytes: Option<String>,
-    body_read_timeout: Option<String>,
-    upstream_response_header_timeout: Option<String>,
-    upstream_error_body_timeout: Option<String>,
-    response_write_timeout: Option<String>,
+    read_header_timeout_seconds: Option<u64>,
+    max_header_bytes: Option<usize>,
+    body_read_timeout_seconds: Option<u64>,
+    upstream_response_header_timeout_seconds: Option<u64>,
+    upstream_error_body_timeout_seconds: Option<u64>,
+    response_write_timeout_seconds: Option<u64>,
     max_connections: Option<usize>,
 }

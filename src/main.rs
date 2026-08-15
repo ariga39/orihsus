@@ -214,7 +214,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
         // Only hot fields are applied, atomically: keys + token/base_url/max_body/
         // models are swapped under one lock, so a failure never half-applies and
         // a request never observes mixed generations. Non-hot changes
-        // (limits/rotation/audit/server/listen) are refused by the reloader
+        // (limits/key-failure handling/audit/server/listen) are refused by the reloader
         // before this callback ever runs.
         HotReloader::start(&config_path, RELOAD_DEBOUNCE, initial, move |snap| {
             store
