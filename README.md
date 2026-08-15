@@ -1,13 +1,13 @@
 # orihsus
 
-A lightweight OpenAI-compatible gateway for OpenCode Go that rotates multiple subscription API keys. It is a single Rust binary built with Tokio and Axum; it requires neither Docker nor a database.
+A lightweight OpenAI-compatible gateway for OpenCode Go that rotates multiple subscription API keys. It is a single Rust binary built with Tokio and Axum, served as loopback HTTP behind nginx; it requires neither Docker nor a database.
 
 ## Features
 
 - Supports `POST /v1/chat/completions` with transparent SSE streaming and `GET /v1/models`; other routes return 404 or 405.
 - Uses a fill-first key pool. `GoUsageLimitError` cools a key by quota dimension, while ordinary 429 responses use `Retry-After` or exponential backoff.
 - Tries at most two keys per request: the initially selected key and one failover key. The final upstream error is forwarded unchanged.
-- Enforces TLS, gateway bearer authentication, header-read timeouts, and a maximum header size.
+- Enforces gateway bearer authentication, header-read timeouts, and a maximum header size; nginx terminates public TLS and HTTP/2.
 - Writes JSONL audit records with token counts. Keys are represented only by the first 12 hexadecimal characters of a SHA-256 fingerprint.
 - Hot-reloads tokens, the upstream base URL, keys, and models. Other configuration changes require a restart.
 - Bounds concurrency, queued requests, request bodies, error bodies, and the audit queue.
@@ -21,7 +21,7 @@ sudo install -m 0600 config.example.yaml /etc/orihsus/config.yaml
 orihsus --config /etc/orihsus/config.yaml
 ```
 
-Production setup, including the dedicated user, systemd sandbox, TLS, and audit permissions, is documented in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The unit file is [deploy/orihsus.service](deploy/orihsus.service).
+Production setup, including nginx TLS termination, the dedicated user, systemd sandbox, and audit permissions, is documented in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). The unit file is [deploy/orihsus.service](deploy/orihsus.service).
 
 ## Configuration
 
@@ -29,8 +29,7 @@ Run `orihsus --config <path>`; the default is `/etc/orihsus/config.yaml`. The co
 
 | Section | Purpose | Default |
 | --- | --- | --- |
-| `listen` | Listen address; a non-root process cannot bind port 443 | `0.0.0.0:8443` |
-| `tls.cert_path`, `tls.key_path` | Existing certificate and private-key files | required |
+| `listen` | Loopback HTTP address; non-loopback values are rejected | `127.0.0.1:8080` |
 | `gateway_token` | Gateway bearer token | required |
 | `upstream.base_url` | HTTPS upstream URL | required |
 | `keys` | Non-empty, unique key list | required |
@@ -69,5 +68,6 @@ The hooks run `cargo fmt --check` and Clippy with warnings denied. Rust filename
 
 - The process refuses to run as root. Production uses a dedicated account and a systemd sandbox with `NoNewPrivileges`, `ProtectSystem=strict`, and no capabilities.
 - Configuration must be mode `0600`; keys and tokens are never emitted through `Debug`, `Display`, or logs.
-- The upstream must use HTTPS. Redirects are followed only when scheme, host, and effective port are unchanged, so the selected `Authorization` header cannot reach another origin.
+- nginx is the only public listener and owns TLS, HTTP/2, edge rate limiting, and fail2ban-compatible access logs. orihsus rejects non-loopback listen addresses.
+- The OpenCode upstream must use HTTPS. Redirects are followed only when scheme, host, and effective port are unchanged, so the selected `Authorization` header cannot reach another origin.
 - Only the documented routes are exposed; the service cannot act as an arbitrary proxy.

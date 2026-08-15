@@ -227,20 +227,12 @@ async fn window_rate_limited_cools_without_a_percentage() {
     assert_eq!(selected.fingerprint(), fingerprint("key-b"));
 }
 
-async fn start_https(app: axum::Router) -> (std::net::SocketAddr, tempfile::TempDir) {
-    let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let dir = tempfile::TempDir::new().unwrap();
-    let cert = dir.path().join("cert.pem");
-    let key = dir.path().join("key.pem");
-    std::fs::write(&cert, certified.cert.pem()).unwrap();
-    std::fs::write(&key, certified.key_pair.serialize_pem()).unwrap();
-    let tls = orihsus::server::load_server_config(&cert, &key).unwrap();
+async fn start_http(app: axum::Router) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(orihsus::server::serve(
         listener,
         app,
-        Some(tokio_rustls::TlsAcceptor::from(Arc::new(tls))),
         orihsus::server::Http1Limits {
             header_read_timeout: Duration::from_secs(5),
             max_header_bytes: 32 * 1024,
@@ -249,7 +241,7 @@ async fn start_https(app: axum::Router) -> (std::net::SocketAddr, tempfile::Temp
         Duration::from_secs(5),
         std::future::pending(),
     ));
-    (addr, dir)
+    addr
 }
 
 #[tokio::test]
@@ -268,7 +260,7 @@ async fn http_adapter_uses_fixed_get_endpoint_and_bearer_header() {
             br#"{"usage":{}}"#.as_slice()
         }),
     );
-    let (addr, _cert) = start_https(app).await;
+    let addr = start_http(app).await;
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -276,7 +268,7 @@ async fn http_adapter_uses_fixed_get_endpoint_and_bearer_header() {
         .unwrap();
     let fetcher = orihsus::usage::HttpUsageFetcher::for_test_endpoint(
         client,
-        format!("https://127.0.0.1:{}/zen/go/v1/usage", addr.port())
+        format!("http://127.0.0.1:{}/zen/go/v1/usage", addr.port())
             .parse()
             .unwrap(),
     );
@@ -298,7 +290,7 @@ async fn http_adapter_classifies_non_success_without_exposing_key_or_body() {
         "/zen/go/v1/usage",
         get(|| async { (StatusCode::UNAUTHORIZED, "response-body-must-not-leak") }),
     );
-    let (addr, _cert) = start_https(app).await;
+    let addr = start_http(app).await;
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -306,7 +298,7 @@ async fn http_adapter_classifies_non_success_without_exposing_key_or_body() {
         .unwrap();
     let fetcher = orihsus::usage::HttpUsageFetcher::for_test_endpoint(
         client,
-        format!("https://127.0.0.1:{}/zen/go/v1/usage", addr.port())
+        format!("http://127.0.0.1:{}/zen/go/v1/usage", addr.port())
             .parse()
             .unwrap(),
     );
@@ -331,7 +323,7 @@ async fn http_adapter_rejects_response_bodies_over_sixty_four_kibibytes() {
             async move { body }
         }),
     );
-    let (addr, _cert) = start_https(app).await;
+    let addr = start_http(app).await;
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -339,7 +331,7 @@ async fn http_adapter_rejects_response_bodies_over_sixty_four_kibibytes() {
         .unwrap();
     let fetcher = orihsus::usage::HttpUsageFetcher::for_test_endpoint(
         client,
-        format!("https://127.0.0.1:{}/zen/go/v1/usage", addr.port())
+        format!("http://127.0.0.1:{}/zen/go/v1/usage", addr.port())
             .parse()
             .unwrap(),
     );
@@ -364,7 +356,7 @@ async fn http_adapter_times_out_the_whole_request_after_ten_seconds() {
         .unwrap();
     let fetcher = orihsus::usage::HttpUsageFetcher::for_test_endpoint(
         client,
-        format!("https://127.0.0.1:{}/zen/go/v1/usage", addr.port())
+        format!("http://127.0.0.1:{}/zen/go/v1/usage", addr.port())
             .parse()
             .unwrap(),
     );

@@ -20,9 +20,6 @@ fn write_config(dir: &Path, contents: &str) -> std::path::PathBuf {
 
 const MINIMAL: &str = r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -33,9 +30,6 @@ audit:
 
 const FIVE_MIN_QUEUE_WAIT: &str = r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:

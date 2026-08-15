@@ -15,9 +15,6 @@ fn write_config(dir: &Path, name: &str, contents: &str) -> PathBuf {
 
 const MINIMAL: &str = r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -33,9 +30,8 @@ fn minimal_valid_config_yields_defaults() {
 
     assert_eq!(cfg.gateway_token.as_str(), "gway-secret");
     assert_eq!(cfg.keys, vec![Secret::new("key-1")]);
-    assert_eq!(cfg.listen.ip().to_string(), "0.0.0.0");
-    assert_eq!(cfg.tls.cert, PathBuf::from("/etc/orihsus/cert.pem"));
-    assert_eq!(cfg.tls.key, PathBuf::from("/etc/orihsus/key.pem"));
+    assert_eq!(cfg.listen.ip().to_string(), "127.0.0.1");
+    assert_eq!(cfg.listen.port(), 8080);
     assert_eq!(cfg.upstream.base_url.as_str(), "https://api.opencode.go/");
 
     assert_eq!(cfg.limits.max_concurrency, 200);
@@ -79,6 +75,32 @@ fn minimal_valid_config_yields_defaults() {
         "default per-chunk response write timeout"
     );
     assert_eq!(cfg.server.max_connections, 1024);
+}
+
+#[test]
+fn non_loopback_listener_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(
+        dir.path(),
+        "public-listener.yaml",
+        &format!("listen: \"0.0.0.0:8080\"\n{MINIMAL}"),
+    );
+    let err = orihsus::config::load(&path).unwrap_err();
+    let rendered = format!("{err}");
+    assert!(rendered.contains("loopback"), "got: {rendered}");
+    assert!(rendered.contains("nginx"), "got: {rendered}");
+}
+
+#[test]
+fn obsolete_tls_section_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(
+        dir.path(),
+        "obsolete-tls.yaml",
+        &format!("tls:\n  cert_path: /tmp/cert.pem\n  key_path: /tmp/key.pem\n{MINIMAL}"),
+    );
+    let err = orihsus::config::load(&path).unwrap_err();
+    assert!(format!("{err}").contains("invalid YAML"), "got: {err}");
 }
 
 #[test]
@@ -140,9 +162,6 @@ fn custom_audit_and_server_values_are_parsed() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -186,9 +205,6 @@ fn invalid_audit_and_server_values_are_rejected() {
         format!(
             r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -290,9 +306,6 @@ fn missing_gateway_token_is_rejected() {
         dir.path(),
         "config.yaml",
         r#"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -306,43 +319,6 @@ keys:
 }
 
 #[test]
-fn missing_tls_paths_are_rejected() {
-    let dir = TempDir::new().unwrap();
-
-    let missing_cert = write_config(
-        dir.path(),
-        "no-cert.yaml",
-        r#"
-gateway_token: "gway-secret"
-tls:
-  key_path: "/etc/orihsus/key.pem"
-upstream:
-  base_url: "https://api.opencode.go"
-keys:
-  - "key-1"
-"#,
-    );
-    let err = orihsus::config::load(&missing_cert).unwrap_err();
-    assert!(format!("{err}").contains("cert_path"), "got: {err}");
-
-    let missing_key = write_config(
-        dir.path(),
-        "no-key.yaml",
-        r#"
-gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-upstream:
-  base_url: "https://api.opencode.go"
-keys:
-  - "key-1"
-"#,
-    );
-    let err = orihsus::config::load(&missing_key).unwrap_err();
-    assert!(format!("{err}").contains("key_path"), "got: {err}");
-}
-
-#[test]
 fn non_https_upstream_is_rejected() {
     let dir = TempDir::new().unwrap();
     let path = write_config(
@@ -350,9 +326,6 @@ fn non_https_upstream_is_rejected() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "http://api.opencode.go"
 keys:
@@ -392,9 +365,6 @@ fn base_url_path_prefix_normalizes_to_a_trailing_slash() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "{input}"
 keys:
@@ -433,9 +403,6 @@ fn base_url_with_query_or_fragment_is_rejected() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "{bad}"
 keys:
@@ -455,9 +422,6 @@ fn empty_or_duplicate_keys_are_rejected() {
         format!(
             r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -505,9 +469,6 @@ fn deprecated_soft_threshold_is_rejected_with_a_static_message() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -544,9 +505,6 @@ fn deprecated_soft_threshold_error_never_leaks_value_or_secrets() {
         &format!(
             r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -578,9 +536,6 @@ fn zero_or_out_of_range_limit_values_are_rejected() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -624,9 +579,6 @@ fn max_queue_zero_is_allowed() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -653,9 +605,6 @@ fn max_concurrency_and_max_queue_above_semaphore_max_permits_are_rejected() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -698,9 +647,6 @@ fn breaker_threshold_above_u32_max_is_rejected() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -722,9 +668,6 @@ fn max_header_bytes_above_u32_max_is_rejected() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -746,9 +689,6 @@ fn custom_max_inflight_body_bytes_is_parsed() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -774,9 +714,6 @@ fn invalid_max_inflight_body_bytes_is_rejected() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -827,9 +764,6 @@ fn rotation_bounds_are_enforced() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -890,9 +824,6 @@ fn backoff_max_is_capped_at_the_ops_cooldown_ceiling() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -939,9 +870,6 @@ fn max_attempts_must_be_within_one_and_two() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -971,9 +899,6 @@ fn unknown_top_level_fields_are_rejected() {
         "unknown-top.yaml",
         r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -999,9 +924,6 @@ fn unknown_nested_fields_are_rejected() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -1035,11 +957,6 @@ keys:
             "rotation:\n  backoff_maximum: \"60s\"\n",
             "backoff_max",
         ),
-        (
-            "tls-typo.yaml",
-            "tls:\n  certpath: \"/etc/orihsus/cert.pem\"\n",
-            "cert_path",
-        ),
     ];
     for (name, snippet, field) in cases {
         let path = base(name, snippet);
@@ -1067,9 +984,6 @@ fn models_default_and_custom_values() {
         "custom.yaml",
         r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -1096,9 +1010,6 @@ fn empty_blank_or_duplicate_models_are_rejected() {
             &format!(
                 r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -1138,9 +1049,6 @@ fn config_file_must_have_0600_permissions() {
         "config.yaml",
         r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -1168,9 +1076,6 @@ fn errors_and_debug_never_leak_secrets() {
         &format!(
             r#"
 gateway_token: "{secret_token}"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -1203,8 +1108,8 @@ keys:
         &format!(
             r#"
 gateway_token: "{secret_token}"
-tls: [unclosed
-upstream:
+upstream: [unclosed
+rotation:
   base_url: "https://api.opencode.go"
 keys:
   - "{secret_key}"
@@ -1227,9 +1132,6 @@ keys:
         &format!(
             r#"
 gateway_token: "{secret_token}"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:

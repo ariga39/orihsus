@@ -6,7 +6,7 @@ Build a production-oriented Rust gateway that exposes an OpenAI-compatible endpo
 
 ## Required behavior
 
-- Serve `POST /v1/chat/completions`, `GET /v1/models`, `/healthz`, and `/readyz` over TLS.
+- Serve `POST /v1/chat/completions`, `GET /v1/models`, `/healthz`, and `/readyz` as loopback HTTP behind nginx.
 - Authenticate gateway clients with a bearer token before admission or body allocation.
 - Select keys from a fill-first pool and fail over at most once per request.
 - Classify OpenCode usage-limit responses, ordinary rate limits, authentication failures, upstream failures, and network errors without leaking secrets.
@@ -32,7 +32,7 @@ Build a production-oriented Rust gateway that exposes an OpenAI-compatible endpo
 - `gateway`: routing, authentication, retries, error classification, and streaming.
 - `audit`: bounded JSONL writer, rotation, counters, and shutdown.
 - `hot_reload`: filesystem watching and atomic runtime updates.
-- `server`: TLS, connection limits, protocol watchdogs, and graceful shutdown.
+- `server`: loopback HTTP, connection limits, protocol watchdogs, and graceful shutdown.
 - `usage`: proactive usage polling and key cooldown updates.
 - `main`: process validation, component assembly, signals, and lifecycle ordering.
 

@@ -1,4 +1,4 @@
-# orihsus — OpenCode Go key rotation gateway
+# orihsus — loopback HTTP OpenCode Go key rotation gateway behind nginx
 # systemd unit. Install: sudo cp deploy/orihsus.service /etc/systemd/system/
 # then enable+start. See docs/DEPLOYMENT.md.
 
@@ -14,6 +14,7 @@ Group=orihsus
 ExecStart=/usr/local/bin/orihsus --config /etc/orihsus/config.yaml
 Restart=on-failure
 RestartSec=3
+UMask=0077
 
 # --- sandbox (non-root user, no capabilities) ---
 NoNewPrivileges=true

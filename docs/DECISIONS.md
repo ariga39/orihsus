@@ -29,7 +29,7 @@ This document records the decisions that define the gateway contract.
 
 ## Security
 
-- Require HTTPS upstream URLs and serve TLS directly.
+- Require HTTPS upstream URLs. Serve plaintext HTTP only on loopback and place nginx at the public boundary for TLS, HTTP/2, rate limiting, access logging, and fail2ban.
 - Follow redirects only within the same origin. Never forward the selected authorization header across an origin, port, or scheme boundary.
 - Require bearer authentication before admission control and body buffering.
 - Require configuration mode `0600`, reject duplicate or blank secrets, and redact secrets from formatting and errors.
@@ -40,15 +40,15 @@ This document records the decisions that define the gateway contract.
 - Bound active requests, queued requests, total accepted connections, request-body memory, error-body classification, and audit buffering.
 - Reject a full admission queue immediately with `503` and `Retry-After: 1`; apply a finite queue wait deadline.
 - Reserve body-budget permits before buffering a request body and hold them through upstream request construction.
-- Apply deadlines independently to TLS/header reads, request bodies, upstream response headers, upstream error-body reads, and downstream writes.
+- Apply deadlines independently to HTTP header reads, request bodies, upstream response headers, upstream error-body reads, and downstream writes. nginx independently bounds public TLS and client behavior.
 - Hold an admission permit until a streamed response reaches EOF, fails, or is cancelled.
 - Reap completed connection tasks continuously and bound graceful shutdown even if an audit writer is blocked.
 
 ## Deployment and testing
 
-- Deploy with systemd, a dedicated account, explicit file ownership, restart policy, and bounded stop time.
-- Hot-reload only the gateway token, upstream base URL, keys, and model list. Capacity, TLS, server, audit, and proactive-usage scheduling changes require restart.
-- Test state machines deterministically and use real sockets/files for lifecycle, timeout, reload, TLS, and streaming boundaries.
+- Deploy orihsus with systemd as a dedicated account and nginx as the only public listener. Keep certificate lifecycle and public edge policy outside the application.
+- Hot-reload only the gateway token, upstream base URL, keys, and model list. Listener, capacity, server, audit, and proactive-usage scheduling changes require restart.
+- Test state machines deterministically and use real sockets/files for lifecycle, timeout, reload, and streaming boundaries.
 - Treat formatter, Clippy with warnings denied, unit/integration tests, release build, and load-test tooling checks as release gates.
 
 ## Accepted trade-offs

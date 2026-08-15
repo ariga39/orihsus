@@ -100,3 +100,10 @@ This log summarizes implementation work and verification. It intentionally recor
 - Confirmed that the system allocator retained a large RSS high-water mark after large payload tests even though permits, connections, and request objects were released.
 - Switched production allocation to jemalloc after comparison runs showed materially better idle RSS reclamation without changing gateway semantics.
 - Captured the reproducible plan and measurements in `docs/loadtest-plan.md`, `docs/loadtest-results.md`, and `docs/rss-investigation.md`.
+
+## 2026-08-15 — nginx edge migration
+
+- Removed direct TLS certificate/key configuration and Rustls server acceptance from orihsus.
+- Changed the default listener to `127.0.0.1:8080` and rejected non-loopback listener addresses.
+- Assigned public TLS, HTTP/2, rate limiting, access logging, and fail2ban integration to nginx while preserving HTTPS for the OpenCode upstream.
+- Updated systemd, configuration, deployment guidance, and server/configuration tests for the loopback HTTP boundary.

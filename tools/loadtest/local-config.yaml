@@ -1,9 +1,6 @@
 # Loopback-only load-test configuration. The upstream certificate is accepted
 # only by an orihsus binary built with `loadtest-insecure-upstream`.
 listen: "127.0.0.1:18444"
-tls:
-  cert_path: "/tmp/orihsus-loadtest/certs/server-cert.pem"
-  key_path: "/tmp/orihsus-loadtest/certs/server-key.pem"
 gateway_token: "loadtest-gateway-token"
 upstream:
   base_url: "https://127.0.0.1:18443"

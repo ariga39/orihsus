@@ -38,7 +38,7 @@ const RELOAD_REFUSED_SUMMARY: &str = "orihsus: config reload refused: a restart 
 const RELOAD_APPLY_SUMMARY: &str =
     "orihsus: config apply failed; keeping the previous configuration";
 
-/// A consistent snapshot of the fields that may be hot-swapped. TLS/listen are
+/// A consistent snapshot of the fields that may be hot-swapped. The listener is
 /// intentionally absent: they are not hot-reloadable in this version and are
 /// guarded separately.
 #[derive(Debug, Clone)]
@@ -365,13 +365,11 @@ async fn worker(
 }
 
 /// True when the loaded config changes a field that cannot be hot-swapped
-/// (listen/TLS, limits/queue shape, rotation policy, audit and HTTP server
+/// (listen, limits/queue shape, rotation policy, audit and HTTP server
 /// hardening). Such a reload is refused wholesale: applying only the hot
 /// fields would leave a half-applied configuration.
 fn non_hot_changed(cfg: &Config, baseline: &Config) -> bool {
     cfg.listen != baseline.listen
-        || cfg.tls.cert != baseline.tls.cert
-        || cfg.tls.key != baseline.tls.key
         || cfg.limits != baseline.limits
         || cfg.rotation != baseline.rotation
         || cfg.usage != baseline.usage

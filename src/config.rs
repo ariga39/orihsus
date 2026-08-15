@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::pool::MAX_COOLDOWN;
 
-const DEFAULT_LISTEN: &str = "0.0.0.0:8443";
+const DEFAULT_LISTEN: &str = "127.0.0.1:8080";
 const DEFAULT_MAX_CONCURRENCY: usize = 200;
 const DEFAULT_MAX_QUEUE: usize = 500;
 const DEFAULT_QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -32,7 +32,7 @@ const DEFAULT_AUDIT_QUEUE_CAPACITY: usize = 4096;
 const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_MAX_HEADER_BYTES: usize = 32 * 1024;
 /// Hard cap on simultaneous TCP connections accepted by the server, across all
-/// TLS/handshake/header phases. Tied to the systemd `LimitNOFILE=65536` FD
+/// connection/header phases. Tied to the systemd `LimitNOFILE=65536` FD
 /// budget: beyond it a connection cannot be served anyway.
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 const MAX_CONNECTIONS_CEILING: usize = 65_536;
@@ -97,7 +97,6 @@ fn check_permissions(_path: &Path) -> Result<(), ConfigError> {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen: SocketAddr,
-    pub tls: TlsPaths,
     pub gateway_token: Secret,
     pub upstream: Upstream,
     pub keys: Vec<Secret>,
@@ -115,13 +114,6 @@ pub struct Config {
 pub struct Usage {
     pub soft_threshold_percent: f64,
     pub poll_interval: Duration,
-}
-
-/// TLS certificate and private key paths.
-#[derive(Debug, Clone)]
-pub struct TlsPaths {
-    pub cert: PathBuf,
-    pub key: PathBuf,
 }
 
 /// Upstream OpenAI-compatible endpoint.
@@ -183,9 +175,9 @@ pub struct Server {
     /// that consumes at least once per window keeps the stream alive, and the
     /// bound never applies to a quiet SSE upstream, which can idle forever.
     pub response_write_timeout: Duration,
-    /// Hard cap on simultaneous TCP connections (TLS handshake, header read
-    /// and serving alike). A connection past the cap is closed immediately at
-    /// accept, so slowloris clients that never complete TLS/headers cannot
+    /// Hard cap on simultaneous TCP connections (header read and serving
+    /// alike). A connection past the cap is closed immediately at accept, so
+    /// slowloris clients that never complete headers cannot
     /// grow the task/FD set.
     pub max_connections: usize,
 }
@@ -278,12 +270,11 @@ impl Config {
             })?,
             None => DEFAULT_LISTEN.parse::<SocketAddr>().unwrap(),
         };
-
-        let tls = raw
-            .tls
-            .ok_or_else(|| validation("tls section is required".into()))?;
-        let cert = non_empty(tls.cert_path, "tls.cert_path is required", &validation)?;
-        let key = non_empty(tls.key_path, "tls.key_path is required", &validation)?;
+        if !listen.ip().is_loopback() {
+            return Err(validation(
+                "listen must use a loopback address; expose the service through nginx".into(),
+            ));
+        }
 
         let upstream = raw
             .upstream
@@ -587,7 +578,6 @@ impl Config {
 
         Ok(Config {
             listen,
-            tls: TlsPaths { cert, key },
             gateway_token,
             upstream: Upstream { base_url },
             keys,
@@ -624,17 +614,6 @@ impl Config {
                 max_connections,
             },
         })
-    }
-}
-
-fn non_empty(
-    value: Option<String>,
-    message: &'static str,
-    validation: &impl Fn(String) -> ConfigError,
-) -> Result<PathBuf, ConfigError> {
-    match value {
-        Some(v) if !v.trim().is_empty() => Ok(PathBuf::from(v)),
-        _ => Err(validation(message.into())),
     }
 }
 
@@ -690,7 +669,6 @@ fn parse_bytes(raw: &str) -> Result<usize, String> {
 struct RawConfig {
     gateway_token: Option<String>,
     listen: Option<String>,
-    tls: Option<RawTls>,
     upstream: Option<RawUpstream>,
     keys: Option<Vec<String>>,
     models: Option<Vec<String>>,
@@ -707,14 +685,6 @@ struct RawConfig {
 struct RawUsage {
     soft_threshold_percent: Option<f64>,
     poll_interval: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "snake_case")]
-struct RawTls {
-    cert_path: Option<String>,
-    key_path: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]

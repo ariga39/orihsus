@@ -19,11 +19,11 @@ OpenCode Go subscription keys have independent usage limits and recovery times. 
 
 ### System boundary
 
-Implement one Rust process that terminates TLS, authenticates gateway clients, exposes a small OpenAI-compatible route set, forwards to an HTTPS OpenCode upstream, rotates keys, and writes JSONL audit records. Do not add a database, management UI, or arbitrary proxying.
+Implement one Rust process that authenticates gateway clients, exposes a small OpenAI-compatible route set on loopback HTTP, forwards to an HTTPS OpenCode upstream, rotates keys, and writes JSONL audit records. nginx is the only public listener and terminates TLS/HTTP2. Do not add a database, management UI, or arbitrary proxying.
 
 ### Components
 
-Use separate modules for configuration/runtime snapshots, key-pool state, admission and body budgets, gateway protocol handling, audit output, file watching, proactive usage polling, and the TLS server lifecycle. Keep public seams narrow enough for deterministic tests.
+Use separate modules for configuration/runtime snapshots, key-pool state, admission and body budgets, gateway protocol handling, audit output, file watching, proactive usage polling, and the HTTP server lifecycle. Keep public seams narrow enough for deterministic tests.
 
 ### Key state machine
 
@@ -41,11 +41,11 @@ Forward SSE and ordinary successful bodies incrementally. Retries are allowed on
 
 ### Configuration
 
-Parse and validate a mode-`0600` YAML file. Publish one immutable runtime snapshot containing the hot-reloadable token, upstream URL, keys, and model list. Changes to listener, TLS, capacity, audit, or polling schedules require restart.
+Parse and validate a mode-`0600` YAML file. Require a loopback listen address. Publish one immutable runtime snapshot containing the hot-reloadable token, upstream URL, keys, and model list. Changes to listener, capacity, audit, or polling schedules require restart.
 
 ### Network and security
 
-Require upstream HTTPS and follow redirects only within the same origin. Serve TLS directly, reject root execution, limit header size/read time, and apply dedicated TLS/HTTP watchdogs. Authenticate before admission or body allocation.
+Require upstream HTTPS and follow redirects only within the same origin. Reject root execution, bind loopback HTTP only, limit header size/read time, and authenticate before admission or body allocation. nginx owns public TLS, HTTP/2, connection policy, rate limiting, and fail2ban-visible access logs.
 
 ### Audit
 

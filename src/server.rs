@@ -1,4 +1,4 @@
-//! HTTP serving with header hardening and optional TLS.
+//! Loopback HTTP serving with header hardening.
 //!
 //! This module owns the listener/accept loop so the HTTP/1 header-read timeout
 //! and max header size (and the HTTP/2 header-list cap) are actually enforced,
@@ -6,7 +6,6 @@
 //! cheap to construct, so the accept loop builds one per connection.
 
 use std::future::Future;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,87 +18,6 @@ use tokio::net::TcpListener;
 use tower::{Service, ServiceExt};
 
 use crate::config;
-
-/// Errors from [`load_server_config`]. Contains only paths and OS/rustls
-/// errors, never certificate/key material.
-#[derive(Debug)]
-pub enum ServerTlsError {
-    ReadCert {
-        path: std::path::PathBuf,
-        source: std::io::Error,
-    },
-    ReadKey {
-        path: std::path::PathBuf,
-        source: std::io::Error,
-    },
-    ParseCert {
-        source: std::io::Error,
-    },
-    MissingKey,
-    Rustls {
-        source: rustls::Error,
-    },
-}
-
-impl std::fmt::Display for ServerTlsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ServerTlsError::ReadCert { path, source } => {
-                write!(
-                    f,
-                    "cannot read TLS certificate {}: {}",
-                    path.display(),
-                    source
-                )
-            }
-            ServerTlsError::ReadKey { path, source } => {
-                write!(f, "cannot read TLS key {}: {}", path.display(), source)
-            }
-            ServerTlsError::ParseCert { source } => {
-                write!(f, "cannot parse TLS certificate: {source}")
-            }
-            ServerTlsError::MissingKey => write!(f, "no private key found in the TLS key file"),
-            ServerTlsError::Rustls { source } => write!(f, "cannot configure TLS: {source}"),
-        }
-    }
-}
-
-impl std::error::Error for ServerTlsError {}
-
-/// Load a rustls server config from PEM certificate/key files. ALPN advertises
-/// `h2` and `http/1.1`; the config enforces the protocol (never plaintext).
-pub fn load_server_config(
-    cert_path: &Path,
-    key_path: &Path,
-) -> Result<rustls::ServerConfig, ServerTlsError> {
-    let cert_pem = std::fs::read(cert_path).map_err(|source| ServerTlsError::ReadCert {
-        path: cert_path.to_path_buf(),
-        source,
-    })?;
-    let key_pem = std::fs::read(key_path).map_err(|source| ServerTlsError::ReadKey {
-        path: key_path.to_path_buf(),
-        source,
-    })?;
-    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_pem.as_slice())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| ServerTlsError::ParseCert { source })?;
-    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-        .map_err(|source| ServerTlsError::ReadKey {
-            path: key_path.to_path_buf(),
-            source,
-        })?
-        .ok_or(ServerTlsError::MissingKey)?;
-    // Multiple rustls features (ring + aws-lc-rs) are enabled transitively by
-    // the dependency tree, so rustls cannot auto-pick; choose ring explicitly.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|source| ServerTlsError::Rustls { source })?;
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(config)
-}
 
 /// Server hardening knobs derived from the config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,18 +148,17 @@ fn accept_retry_delay(err: &std::io::Error) -> Duration {
     }
 }
 
-/// Serve `router` on `listener`. When `tls` is `Some` every accepted stream is
-/// upgraded to TLS before serving; otherwise it is served as plaintext (used by
-/// tests). `connection_cap` bounds the number of simultaneous TCP connections
-/// (TLS handshake, header read and serving alike): an accepted socket beyond
+/// Serve `router` as plaintext HTTP on `listener`. The validated production
+/// listener is loopback-only and nginx owns the public TLS/HTTP2 boundary.
+/// `connection_cap` bounds the number of simultaneous TCP connections
+/// (header read and serving alike): an accepted socket beyond
 /// the cap is closed immediately and no task is spawned, so slowloris clients
-/// that never complete TLS or headers cannot grow the task/FD set. Once
+/// that never complete headers cannot grow the task/FD set. Once
 /// `shutdown` resolves, stops accepting new connections, then drains in-flight
 /// connections up to `drain_timeout` before returning.
 pub async fn serve(
     listener: TcpListener,
     router: Router,
-    tls: Option<tokio_rustls::TlsAcceptor>,
     limits: Http1Limits,
     connection_cap: Arc<tokio::sync::Semaphore>,
     drain_timeout: Duration,
@@ -267,36 +184,18 @@ pub async fn serve(
                         let Ok(permit) = connection_cap.clone().try_acquire_owned() else {
                             // At the connection cap: close the socket immediately and
                             // spawn nothing. A slowloris client that never completes
-                            // TLS or headers therefore cannot push the task/FD set
+                            // headers therefore cannot push the task/FD set
                             // past max_connections.
                             drop(tcp);
                             continue;
                         };
                         let mut make_service = make_service.clone();
-                        let tls = tls.clone();
                         connections.spawn(async move {
                             // Hold the connection permit for the whole lifecycle. It is
-                            // released (RAII) when the TLS handshake times out, the
-                            // connection ends, or the drain aborts this task.
+                            // released (RAII) when the connection ends or the drain
+                            // aborts this task.
                             let _permit = permit;
-                            let stream = match tls {
-                                Some(acceptor) => {
-                                    // Bound the TLS handshake with the header-read
-                                    // timeout: a client that never sends a ClientHello
-                                    // is dropped instead of holding the task forever.
-                                    match tokio::time::timeout(
-                                        limits.header_read_timeout,
-                                        acceptor.accept(tcp),
-                                    )
-                                    .await
-                                    {
-                                        Ok(Ok(s)) => ServerStream::Tls(Box::new(s)),
-                                        _ => return,
-                                    }
-                                }
-                                None => ServerStream::Plain(tcp),
-                            };
-                            let io = TokioIo::new(stream);
+                            let io = TokioIo::new(tcp);
                             let tower_service = match make_service.call(()).await {
                                 Ok(s) => s,
                                 Err(infallible) => match infallible {},
@@ -381,57 +280,6 @@ pub async fn serve(
         }
     }
     Ok(())
-}
-
-enum ServerStream {
-    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
-    Plain(tokio::net::TcpStream),
-}
-
-impl tokio::io::AsyncRead for ServerStream {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match &mut *self {
-            ServerStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
-            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-        }
-    }
-}
-
-impl tokio::io::AsyncWrite for ServerStream {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match &mut *self {
-            ServerStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
-            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match &mut *self {
-            ServerStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
-            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match &mut *self {
-            ServerStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
-            ServerStream::Plain(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -529,7 +377,6 @@ mod tests {
         let handle = tokio::spawn(serve(
             listener,
             router,
-            None,
             limits,
             Arc::new(Semaphore::new(1024)),
             Duration::from_secs(5),
@@ -616,49 +463,6 @@ mod tests {
         handle.abort();
     }
 
-    fn test_tls_config() -> (rustls::ServerConfig, tempfile::TempDir) {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-        let dir = tempfile::TempDir::new().unwrap();
-        let cert_path = dir.path().join("cert.pem");
-        let key_path = dir.path().join("key.pem");
-        std::fs::write(&cert_path, certified.cert.pem()).unwrap();
-        std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
-        let config = load_server_config(&cert_path, &key_path).unwrap();
-        (config, dir)
-    }
-
-    #[tokio::test]
-    async fn tls_server_serves_over_https() {
-        let (config, _dir) = test_tls_config();
-        let router = Router::new().route("/healthz", get(|| async { "ok" }));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
-        let handle = tokio::spawn(serve(
-            listener,
-            router,
-            Some(acceptor),
-            Http1Limits {
-                header_read_timeout: Duration::from_secs(5),
-                max_header_bytes: 32 * 1024,
-            },
-            Arc::new(Semaphore::new(1024)),
-            Duration::from_secs(5),
-            std::future::pending(),
-        ));
-
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap();
-        let url = format!("https://127.0.0.1:{}/healthz", addr.port());
-        let resp = client.get(url).send().await.unwrap();
-        assert_eq!(resp.status(), 200);
-        assert_eq!(resp.text().await.unwrap(), "ok");
-
-        handle.abort();
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn serve_returns_after_drain_timeout_even_with_stuck_connections() {
         use axum::routing::get;
@@ -682,7 +486,6 @@ mod tests {
         let handle = tokio::spawn(serve(
             listener,
             router,
-            None,
             limits,
             Arc::new(Semaphore::new(1024)),
             Duration::from_millis(100),
@@ -709,45 +512,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tls_handshake_times_out_and_closes_the_connection() {
-        let (config, _dir) = test_tls_config();
-        let router = Router::new().route("/healthz", get(|| async { "ok" }));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let limits = Http1Limits {
-            header_read_timeout: Duration::from_millis(300),
-            max_header_bytes: 8192,
-        };
-        let handle = tokio::spawn(serve(
-            listener,
-            router,
-            Some(acceptor),
-            limits,
-            Arc::new(Semaphore::new(1024)),
-            Duration::from_secs(5),
-            std::future::pending(),
-        ));
-
-        // Connect without sending a ClientHello: the server must time out the
-        // handshake (real signal, no long sleeps) and close the connection.
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        let mut buf = [0u8; 1];
-        let result = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf)).await;
-        assert!(
-            result.is_ok(),
-            "a TLS client that never sends ClientHello must be dropped after the handshake timeout"
-        );
-        let n = result.unwrap().unwrap_or(0);
-        assert_eq!(
-            n, 0,
-            "the connection must be closed after the handshake timeout"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plaintext_connection_cap_closes_third_and_recovers_after_a_close() {
         let router = Router::new().route("/", get(|| async { "ok" }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -756,7 +520,6 @@ mod tests {
         let handle = tokio::spawn(serve(
             listener,
             router,
-            None,
             Http1Limits {
                 header_read_timeout: Duration::from_secs(10),
                 max_header_bytes: 8192,
@@ -805,53 +568,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tls_connection_cap_closes_third_slow_handshake_promptly() {
-        let (config, _dir) = test_tls_config();
-        let router = Router::new().route("/healthz", get(|| async { "ok" }));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let cap = Arc::new(Semaphore::new(2));
-        let handle = tokio::spawn(serve(
-            listener,
-            router,
-            Some(acceptor),
-            Http1Limits {
-                header_read_timeout: Duration::from_secs(10),
-                max_header_bytes: 8192,
-            },
-            Arc::clone(&cap),
-            Duration::from_secs(5),
-            std::future::pending(),
-        ));
-
-        // Two TLS clients that never send a ClientHello occupy both permits
-        // while their handshakes wait out the (long) handshake timeout.
-        let a = TcpStream::connect(addr).await.unwrap();
-        let b = TcpStream::connect(addr).await.unwrap();
-        wait_for_permits(&cap, 0).await;
-
-        // A third slow client must be closed promptly at accept.
-        let mut c = TcpStream::connect(addr).await.unwrap();
-        let mut buf = [0u8; 1];
-        let read = tokio::time::timeout(Duration::from_secs(1), c.read(&mut buf)).await;
-        assert!(
-            read.is_ok() && read.unwrap().unwrap_or(0) == 0,
-            "the third TLS connection must be closed promptly, not held by a spawned handshake task"
-        );
-        assert_eq!(
-            cap.available_permits(),
-            0,
-            "no permit may be freed for the rejected third TLS connection"
-        );
-
-        drop(a);
-        drop(b);
-        handle.abort();
-        let _ = handle.await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connection_permits_are_released_on_drain() {
         let router = Router::new().route("/", get(|| async { "ok" }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -861,7 +577,6 @@ mod tests {
         let handle = tokio::spawn(serve(
             listener,
             router,
-            None,
             Http1Limits {
                 header_read_timeout: Duration::from_secs(10),
                 max_header_bytes: 8192,
@@ -890,14 +605,6 @@ mod tests {
             2,
             "draining must release every connection permit (no leak)"
         );
-    }
-
-    #[test]
-    fn tls_load_fails_when_files_are_missing() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let err = load_server_config(&dir.path().join("nope.pem"), &dir.path().join("nope.key"))
-            .unwrap_err();
-        assert!(matches!(err, ServerTlsError::ReadCert { .. }));
     }
 
     #[tokio::test]
@@ -953,7 +660,6 @@ mod tests {
         let handle = tokio::spawn(serve(
             listener,
             router,
-            None,
             Http1Limits {
                 header_read_timeout: Duration::from_secs(5),
                 max_header_bytes: 8192,
@@ -981,90 +687,6 @@ mod tests {
         );
     }
 
-    /// Minimal no-verify server-cert verifier for the raw TLS test client.
-    #[derive(Debug)]
-    struct NoVerify;
-
-    impl rustls::client::danger::ServerCertVerifier for NoVerify {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &rustls::pki_types::CertificateDer<'_>,
-            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-            _server_name: &rustls::pki_types::ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: rustls::pki_types::UnixTime,
-        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms
-                .supported_schemes()
-        }
-    }
-
-    /// Raw TLS client that completes the handshake with ALPN `h2` and sends no
-    /// further bytes (no HTTP/2 client preface). Returns the established
-    /// stream, whose peer (the server) must then close it within the bound.
-    async fn silent_h2_client(
-        addr: std::net::SocketAddr,
-    ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let mut client_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerify))
-            .with_no_client_auth();
-        client_config.alpn_protocols = vec![b"h2".to_vec()];
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        let tls = connector.connect(server_name, stream).await.unwrap();
-        assert_eq!(
-            tls.get_ref().1.alpn_protocol(),
-            Some(b"h2".as_slice()),
-            "the raw client must negotiate h2 via ALPN"
-        );
-        tls
-    }
-
-    /// The established stream must be closed by the server within a bounded
-    /// window (EOF), never held open holding a connection permit. The server may
-    /// push a SETTINGS frame before closing, so drain until EOF.
-    async fn assert_h2_silent_closed(
-        client: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
-    ) {
-        let mut buf = [0u8; 64];
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                match client.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => continue,
-                }
-            }
-        })
-        .await
-        .expect("a silent h2 client must be closed within the bound, not hold the permit forever");
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn h1_keep_alive_connection_closes_after_one_request_and_releases_the_permit() {
         // An HTTP/1 client that sends one keep-alive request and then idles
@@ -1081,7 +703,6 @@ mod tests {
         let handle = tokio::spawn(serve(
             listener,
             router,
-            None,
             Http1Limits {
                 header_read_timeout: Duration::from_secs(5),
                 max_header_bytes: 8192,
@@ -1144,126 +765,6 @@ mod tests {
             "a fresh connection must be served: {resp:?}"
         );
 
-        handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn silent_h2_connection_is_closed_after_tls_and_releases_the_permit() {
-        // Clients that complete TLS with ALPN h2 and then stop talking — either
-        // sending no HTTP/2 client preface at all, or sending the preface and
-        // SETTINGS but never a request — must be closed within a bounded window
-        // and release the single connection permit; a legal connection must then
-        // be served. The auto builder's protocol-detection read has no timeout
-        // of its own, so without a first-request watchdog these connections
-        // would hold the permit forever.
-        let (config, _dir) = test_tls_config();
-        let router = Router::new().route("/healthz", get(|| async { "ok" }));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let cap = Arc::new(Semaphore::new(1));
-        let handle = tokio::spawn(serve(
-            listener,
-            router,
-            Some(acceptor),
-            Http1Limits {
-                header_read_timeout: Duration::from_millis(300),
-                max_header_bytes: 8192,
-            },
-            Arc::clone(&cap),
-            Duration::from_secs(5),
-            std::future::pending(),
-        ));
-
-        // Scenario 1: TLS + ALPN h2, no preface at all.
-        let mut client = silent_h2_client(addr).await;
-        assert_h2_silent_closed(&mut client).await;
-        wait_for_permits(&cap, 1).await;
-
-        // Scenario 2: TLS + ALPN h2, client preface + SETTINGS, then silent.
-        let mut client = silent_h2_client(addr).await;
-        let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-        let settings = [0u8, 0, 0, 4, 0, 0, 0, 0, 0];
-        client.write_all(preface).await.unwrap();
-        client.write_all(&settings).await.unwrap();
-        client.flush().await.unwrap();
-        assert_h2_silent_closed(&mut client).await;
-        wait_for_permits(&cap, 1).await;
-
-        // A legal connection must now be served.
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap();
-        let url = format!("https://127.0.0.1:{}/healthz", addr.port());
-        let resp = client.get(url).send().await.unwrap();
-        assert_eq!(resp.status(), 200);
-
-        handle.abort();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn active_h2_stream_with_traffic_survives_the_keepalive_window() {
-        use futures_util::StreamExt;
-
-        // An SSE-like route that sends one chunk then stays open silently: the
-        // first-request watchdog and the h2 keep-alive must never kill a stream
-        // that is actively served.
-        let (config, _dir) = test_tls_config();
-        let router = Router::new().route(
-            "/stream",
-            get(|| async {
-                axum::body::Body::from_stream(
-                    futures_util::stream::once(async {
-                        Ok::<axum::body::Bytes, std::convert::Infallible>(
-                            axum::body::Bytes::from_static(b"data: hello\n\n"),
-                        )
-                    })
-                    .chain(futures_util::stream::pending::<
-                        Result<axum::body::Bytes, std::convert::Infallible>,
-                    >()),
-                )
-            }),
-        );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-        let handle = tokio::spawn(serve(
-            listener,
-            router,
-            Some(acceptor),
-            Http1Limits {
-                header_read_timeout: Duration::from_millis(300),
-                max_header_bytes: 8192,
-            },
-            Arc::new(Semaphore::new(4)),
-            Duration::from_secs(5),
-            std::future::pending(),
-        ));
-
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap();
-        let url = format!("https://127.0.0.1:{}/stream", addr.port());
-        let resp = client.get(url).send().await.unwrap();
-        assert_eq!(resp.status(), 200);
-        let mut body = resp.bytes_stream();
-        let first = tokio::time::timeout(Duration::from_secs(3), body.next())
-            .await
-            .expect("the first SSE chunk must arrive")
-            .expect("a data chunk")
-            .unwrap();
-        assert_eq!(&first[..], b"data: hello\n\n");
-
-        // Hold the stream open well past the keep-alive window (2x header bound):
-        // the connection must stay alive — the next read blocks, it does not EOF.
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        let next = tokio::time::timeout(Duration::from_millis(200), body.next()).await;
-        assert!(
-            next.is_err(),
-            "an active h2 stream must not be killed by the keep-alive or the first-request watchdog"
-        );
         handle.abort();
     }
 }

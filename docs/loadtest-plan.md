@@ -22,7 +22,7 @@ The body budget is separate. Each request reserves the full `max_body_bytes`, no
 
 Run the load generator, orihsus, and mock upstream on separate hosts or isolated CPU groups. If they share a machine, record CPU for all three and treat throughput as a local regression baseline rather than a production SLO.
 
-Use a release build, fixed CPU and memory allocation, stable file-descriptor limits, fixed TLS/protocol settings, a dedicated JSONL path, synthetic keys, and unique request IDs. Record:
+Use a release build, fixed CPU and memory allocation, stable file-descriptor limits, fixed nginx TLS/protocol settings, a dedicated JSONL path, synthetic keys, and unique request IDs. Run application-capacity cases directly against loopback HTTP and repeat public-edge cases through nginx.
 
 - per-request connection, TTFB, first-event, completion, status, response bytes, and termination cause;
 - gateway RSS/high-water mark, CPU, thread/task indicators, descriptors, network, disk, stderr, and audit output;
@@ -45,7 +45,7 @@ Its connection/request caps must be configurable and visible. Hot-path observati
 
 ### Load generator
 
-`tools/loadtest/loadgen` must support HTTP/1.1 and HTTP/2, a start barrier, exactly N unfinished requests, incremental JSON/SSE parsing, slow or stopped reads, structured latency output, and TCP/TLS/header/body/HTTP2-preface slowloris modes.
+`tools/loadtest/loadgen` must support HTTP/1.1 and HTTP/2, a start barrier, exactly N unfinished requests, incremental JSON/SSE parsing, slow or stopped reads, structured latency output, and TCP/TLS/header/body/HTTP2-preface slowloris modes. TLS and HTTP/2 edge tests target nginx; private orihsus tests use loopback HTTP/1.1.
 
 Generic tools such as `wrk` or `hey` may establish a short-response baseline but cannot validate stateful capacity and streaming cases.
 
@@ -90,7 +90,7 @@ Under normal storage, require one valid JSONL record for every auditable request
 
 ### 6. Slowloris and request bodies
 
-Fill the connection cap with clients that stop during TLS, HTTP/1 headers, or before the first HTTP/2 request. Confirm excess connections are rejected/closed and watchdogs restore capacity. Send slow request bodies and require body deadlines and budget release.
+Test TLS and HTTP/2 slowloris behavior at nginx. Separately fill the orihsus loopback connection cap with clients that stop during HTTP/1 headers; confirm excess connections are closed and watchdogs restore capacity. Send slow request bodies through both paths and require body deadlines and budget release.
 
 ### 7. Large payloads
 

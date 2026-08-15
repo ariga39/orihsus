@@ -15,9 +15,6 @@ const DEBOUNCE: Duration = Duration::from_millis(150);
 
 const MINIMAL: &str = r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -384,8 +381,11 @@ async fn non_hot_changes_require_restart_and_are_not_applied() {
     assert_eq!(reloader.status().failed_reloads, 1);
     assert!(reloader.status().last_error.is_some());
 
-    let with_tls = MINIMAL.replace("/cert.pem", "/cert2.pem");
-    fs::write(&path, &with_tls).unwrap();
+    let with_server_change = MINIMAL.replace(
+        "gateway_token: \"gway-secret\"",
+        "server:\n  max_header_bytes: \"16KiB\"\ngateway_token: \"gway-secret\"",
+    );
+    fs::write(&path, &with_server_change).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(
         wait_for(
@@ -393,7 +393,7 @@ async fn non_hot_changes_require_restart_and_are_not_applied() {
             Duration::from_secs(10)
         )
         .await,
-        "a TLS change must also be refused"
+        "a server change must also be refused"
     );
     assert!(reloader.status().needs_restart);
     assert_eq!(recorder.count(), 0);
@@ -536,7 +536,6 @@ async fn apply_errors_never_leak_secrets_into_status() {
     let key_secret = "RAW-KEY-SECRET-77";
     let secret_cfg = format!(
         "gateway_token: \"{token_secret}\"\n\
-         tls:\n  cert_path: \"/etc/orihsus/cert.pem\"\n  key_path: \"/etc/orihsus/key.pem\"\n\
          upstream:\n  base_url: \"https://api.opencode.go\"\n\
          keys:\n  - \"{key_secret}\"\n"
     );
@@ -656,7 +655,7 @@ async fn status_and_snapshots_never_leak_secrets() {
     let reloader =
         HotReloader::start(&path, DEBOUNCE, initial, move |snap| rec.apply(snap)).unwrap();
 
-    let malformed = format!("gateway_token: \"{secret}\"\ntls: [unclosed\n");
+    let malformed = format!("gateway_token: \"{secret}\"\nupstream: [unclosed\n");
     fs::write(&path, &malformed).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     assert!(

@@ -1,7 +1,7 @@
 //! orihsus — OpenCode Go key rotation gateway (single binary entry point).
 //!
-//! Startup order: CLI parse → root guard → config load → TLS load → assemble
-//! runtime → bind → serve (TLS) with graceful shutdown → hot reload → flush
+//! Startup order: CLI parse → root guard → config load → assemble runtime →
+//! bind loopback HTTP → serve with graceful shutdown → hot reload → flush
 //! audit. Any startup failure prints a redacted message to stderr and exits
 //! non-zero; secrets never reach the logs.
 
@@ -15,7 +15,7 @@ use orihsus::app::assemble;
 use orihsus::config::{self, Config};
 use orihsus::gateway::RuntimeState;
 use orihsus::hot_reload::{ApplyError, HotReloader};
-use orihsus::server::{load_server_config, serve, Http1Limits, ServerSettings};
+use orihsus::server::{serve, Http1Limits, ServerSettings};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
@@ -108,7 +108,6 @@ fn reject_root() -> Result<(), MainError> {
 pub enum MainError {
     Root,
     Config(config::ConfigError),
-    Tls(orihsus::server::ServerTlsError),
     Bootstrap(orihsus::app::BootstrapError),
     HotReload(orihsus::hot_reload::HotReloadError),
     Io(std::io::Error),
@@ -120,7 +119,6 @@ impl std::fmt::Display for MainError {
         match self {
             MainError::Root => write!(f, "refusing to run as root; use a dedicated user"),
             MainError::Config(e) => write!(f, "{e}"),
-            MainError::Tls(e) => write!(f, "{e}"),
             MainError::Bootstrap(e) => write!(f, "{e}"),
             MainError::HotReload(e) => write!(f, "{e}"),
             MainError::Io(e) => write!(f, "I/O error: {e}"),
@@ -134,12 +132,6 @@ impl std::error::Error for MainError {}
 impl From<config::ConfigError> for MainError {
     fn from(e: config::ConfigError) -> Self {
         MainError::Config(e)
-    }
-}
-
-impl From<orihsus::server::ServerTlsError> for MainError {
-    fn from(e: orihsus::server::ServerTlsError) -> Self {
-        MainError::Tls(e)
     }
 }
 
@@ -201,7 +193,6 @@ async fn load_config(config_path: &PathBuf) -> Result<Config, MainError> {
 }
 
 async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
-    let tls = load_server_config(&cfg.tls.cert, &cfg.tls.key)?;
     let (mut runtime, router) = assemble(&cfg)?;
 
     let listener = tokio::net::TcpListener::bind(cfg.listen)
@@ -210,7 +201,6 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
 
     let settings = ServerSettings::from_config(&cfg.server);
     let limits = Http1Limits::from_settings(&settings);
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
 
     let reloader = {
         let initial = cfg.clone();
@@ -224,7 +214,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
         // Only hot fields are applied, atomically: keys + token/base_url/max_body/
         // models are swapped under one lock, so a failure never half-applies and
         // a request never observes mixed generations. Non-hot changes
-        // (limits/rotation/audit/server/listen/TLS) are refused by the reloader
+        // (limits/rotation/audit/server/listen) are refused by the reloader
         // before this callback ever runs.
         HotReloader::start(&config_path, RELOAD_DEBOUNCE, initial, move |snap| {
             store
@@ -285,7 +275,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
     };
 
     eprintln!(
-        "orihsus: serving on {} (TLS) with {} key(s); watching {}",
+        "orihsus: serving HTTP on {} behind nginx with {} key(s); watching {}",
         cfg.listen,
         cfg.keys.len(),
         config_path.display()
@@ -296,7 +286,6 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
     let server = tokio::spawn(serve(
         listener,
         router,
-        Some(acceptor),
         limits,
         connection_cap,
         DRAIN_TIMEOUT,
@@ -699,7 +688,6 @@ mod tests {
         let audit_path = dir.path().join("audit.jsonl");
         let config = format!(
             "gateway_token: \"gway-secret\"\n\
-             tls:\n  cert_path: \"/etc/orihsus/cert.pem\"\n  key_path: \"/etc/orihsus/key.pem\"\n\
              upstream:\n  base_url: \"https://api.opencode.go\"\n\
              keys:\n  - \"key-1\"\n\
              audit:\n  path: \"{}\"\n",
@@ -884,7 +872,6 @@ mod tests {
         let cfg_path = dir.path().join("config.yaml");
         let config = format!(
             "gateway_token: \"gway-secret\"\n\
-             tls:\n  cert_path: \"/etc/orihsus/cert.pem\"\n  key_path: \"/etc/orihsus/key.pem\"\n\
              upstream:\n  base_url: \"https://api.opencode.go\"\n\
              keys:\n  - \"key-1\"\n\
              audit:\n  path: \"{}\"\n",

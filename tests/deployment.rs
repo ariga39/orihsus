@@ -114,7 +114,7 @@ fn example_config_loads_when_copied_and_chmod_600() {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
     let cfg = orihsus::config::load(&path).unwrap();
-    assert_eq!(cfg.listen.port(), 8443);
+    assert_eq!(cfg.listen, "127.0.0.1:8080".parse().unwrap());
     assert_eq!(cfg.server.max_header_bytes, 32 * 1024);
     assert_eq!(cfg.server.max_connections, 1024);
     assert_eq!(cfg.audit.queue_capacity, 4096);
@@ -147,27 +147,26 @@ fn docs_and_example_recommend_service_user_readable_ownership() {
 }
 
 #[test]
-fn docs_apply_the_readable_owner_to_config_and_tls_key() {
+fn docs_keep_credentials_private_and_put_tls_at_nginx() {
     let deployment = fs::read_to_string("docs/DEPLOYMENT.md").unwrap();
     assert!(
         deployment.contains("chown orihsus:orihsus /etc/orihsus/config.yaml"),
         "config ownership must be orihsus:orihsus"
     );
     assert!(
-        deployment.contains("orihsus:orihsus /etc/orihsus/cert.pem /etc/orihsus/key.pem"),
-        "TLS cert/key ownership must be orihsus:orihsus"
+        deployment.contains("chmod 600"),
+        "the credential-bearing config must stay 0600"
     );
     assert!(
-        deployment.contains("chmod 600"),
-        "config and TLS files must stay 0600"
+        deployment.contains("proxy_pass http://127.0.0.1:8080")
+            && deployment.contains("ssl_certificate")
+            && deployment.contains("fail2ban"),
+        "deployment must document nginx TLS termination and fail2ban"
     );
 }
 
 const MINIMAL_NO_LISTEN: &str = r#"
 gateway_token: "gway-secret"
-tls:
-  cert_path: "/etc/orihsus/cert.pem"
-  key_path: "/etc/orihsus/key.pem"
 upstream:
   base_url: "https://api.opencode.go"
 keys:
@@ -175,26 +174,20 @@ keys:
 "#;
 
 #[test]
-fn default_and_example_listen_are_bindable_by_nonroot_without_capabilities() {
+fn default_and_example_listen_are_loopback_only() {
     let dir = tempfile::TempDir::new().unwrap();
 
     let example = dir.path().join("example.yaml");
     fs::write(&example, fs::read_to_string("config.example.yaml").unwrap()).unwrap();
     fs::set_permissions(&example, fs::Permissions::from_mode(0o600)).unwrap();
     let cfg = orihsus::config::load(&example).unwrap();
-    assert!(
-        cfg.listen.port() >= 1024,
-        "example listen port {} must be a high port bindable by non-root",
-        cfg.listen.port()
-    );
+    assert!(cfg.listen.ip().is_loopback());
+    assert_eq!(cfg.listen.port(), 8080);
 
     let minimal = dir.path().join("minimal.yaml");
     fs::write(&minimal, MINIMAL_NO_LISTEN).unwrap();
     fs::set_permissions(&minimal, fs::Permissions::from_mode(0o600)).unwrap();
     let cfg = orihsus::config::load(&minimal).unwrap();
-    assert!(
-        cfg.listen.port() >= 1024,
-        "default listen port {} must be a high port bindable by non-root",
-        cfg.listen.port()
-    );
+    assert!(cfg.listen.ip().is_loopback());
+    assert_eq!(cfg.listen.port(), 8080);
 }

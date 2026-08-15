@@ -46,9 +46,6 @@ subtle = "2"
 notify = "8"
 hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
-tokio-rustls = "0.26"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pemfile = "2"
 libc = "0.2"
 tower = { version = "0.5", features = ["util"] }
 async-trait = "0.1"
@@ -58,7 +55,6 @@ tikv-jemallocator = "0.6"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
-rcgen = "0.13"
 
 [profile.release]
 strip = true

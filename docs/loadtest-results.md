@@ -1,4 +1,4 @@
-# orihsus Local Load-Test Results
+# orihsus Local Load-Test Results (Pre-nginx Baseline)
 
 ## Summary
 
@@ -6,7 +6,7 @@ Local implementation tests passed the exact admission boundary, queue timeout, u
 
 Slow-client cleanup was partially demonstrated: 7 of 10 stopped readers hit the approximately 30-second downstream-write timeout, while 3 continued making progress through shared HTTP/2 buffering until the client dropped. Application resources were released in every case. RSS permits and connections recovered, but the system allocator retained a large resident high-water mark; a jemalloc comparison resolved most idle retention and motivated the allocator change.
 
-These were short local acceptance runs, not production SLO measurements. The planned five-minute repeated throughput runs, 60-minute mixed endurance run, and real slow-disk injection remain future work.
+These measurements predate the nginx edge migration and include the former direct-TLS/HTTP2 listener. They remain historical evidence for gateway admission, streaming, and allocator behavior, but TLS/HTTP2/slowloris edge results must be re-baselined through nginx. These were short local acceptance runs, not production SLO measurements.
 
 ## Environment and tools
 
