@@ -114,8 +114,14 @@ async fn public_http_adapter_uses_the_models_endpoint_without_authentication() {
         fetcher.fetch().await.unwrap(),
         br#"{"data":[{"id":"deepseek-chat"}]}"#
     );
+    #[cfg(not(feature = "loadtest-insecure-upstream"))]
     assert_eq!(
         orihsus::models::HttpModelFetcher::endpoint().as_str(),
         "https://opencode.ai/zen/go/v1/models"
+    );
+    #[cfg(feature = "loadtest-insecure-upstream")]
+    assert_eq!(
+        orihsus::models::HttpModelFetcher::endpoint().as_str(),
+        "https://127.0.0.1:18443/v1/models"
     );
 }
