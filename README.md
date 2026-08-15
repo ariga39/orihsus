@@ -95,3 +95,12 @@ The hooks run `cargo fmt --check` and Clippy with warnings denied. Rust filename
 - Credential-bearing upstream requests receive only `Content-Type`, `Accept`, the sanitized gateway request ID, and the selected upstream authorization; client cookies, API-key headers, forwarding identity, tracing baggage, and arbitrary extension headers are dropped.
 - Only the documented routes are exposed; the service cannot act as an arbitrary proxy.
 - Production builds cannot enable the certificate-verification bypass used by the isolated loopback load-test harness.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
