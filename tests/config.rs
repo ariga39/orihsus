@@ -195,6 +195,11 @@ server:
   upstream_response_header_timeout_seconds: 45
   first_event_timeout_seconds: 70
   inter_event_timeout_seconds: 110
+  model_event_timeouts:
+    deepseek-reasoner:
+      first_event_timeout_seconds: 140
+    deepseek-chat:
+      inter_event_timeout_seconds: 220
   upstream_error_body_timeout_seconds: 7
   response_write_timeout_seconds: 45
   max_connections: 2048
@@ -213,6 +218,40 @@ server:
     );
     assert_eq!(cfg.server.first_event_timeout, Duration::from_secs(70));
     assert_eq!(cfg.server.inter_event_timeout, Duration::from_secs(110));
+    assert_eq!(
+        cfg.server
+            .model_event_timeouts
+            .get("deepseek-reasoner")
+            .unwrap()
+            .first_event_timeout,
+        Duration::from_secs(140)
+    );
+    assert_eq!(
+        cfg.server
+            .model_event_timeouts
+            .get("deepseek-reasoner")
+            .unwrap()
+            .inter_event_timeout,
+        Duration::from_secs(110),
+        "missing model field inherits the global default"
+    );
+    assert_eq!(
+        cfg.server
+            .model_event_timeouts
+            .get("deepseek-chat")
+            .unwrap()
+            .first_event_timeout,
+        Duration::from_secs(70),
+        "missing model field inherits the global default"
+    );
+    assert_eq!(
+        cfg.server
+            .model_event_timeouts
+            .get("deepseek-chat")
+            .unwrap()
+            .inter_event_timeout,
+        Duration::from_secs(220)
+    );
     assert_eq!(
         cfg.server.upstream_error_body_timeout,
         Duration::from_secs(7)
@@ -283,6 +322,24 @@ keys:
         format!("{err}").contains("upstream_response_header_timeout_seconds"),
         "got: {err}"
     );
+
+    for (name, field) in [
+        ("first_event", "first_event_timeout_seconds"),
+        ("inter_event", "inter_event_timeout_seconds"),
+    ] {
+        let path = write_config(
+            dir.path(),
+            &format!("{name}.yaml"),
+            &base(&format!(
+                "server:\n  model_event_timeouts:\n    deepseek-chat:\n      {field}: 0\n"
+            )),
+        );
+        let err = orihsus::config::load(&path).unwrap_err();
+        assert!(
+            format!("{err}").contains("model_event_timeouts"),
+            "got: {err}"
+        );
+    }
 
     let zero_error_body = write_config(
         dir.path(),

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 #[cfg(unix)]
@@ -235,6 +236,9 @@ pub struct Server {
     pub first_event_timeout: Duration,
     /// Maximum silence between complete SSE events after downstream commit.
     pub inter_event_timeout: Duration,
+    /// Model-specific event liveness policies, with omitted fields inherited
+    /// from the two global defaults above.
+    pub model_event_timeouts: BTreeMap<String, EventTimeouts>,
     /// Independent bound on reading a retryable error body (up to the 64KiB
     /// classification cap) so a stalled upstream error cannot hang a request.
     pub upstream_error_body_timeout: Duration,
@@ -250,6 +254,12 @@ pub struct Server {
     /// slowloris clients that never complete headers cannot
     /// grow the task/FD set.
     pub max_connections: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventTimeouts {
+    pub first_event_timeout: Duration,
+    pub inter_event_timeout: Duration,
 }
 
 /// A secret value whose `Debug` never reveals its contents.
@@ -619,6 +629,37 @@ impl Config {
                 "server.inter_event_timeout_seconds must be greater than zero".into(),
             ));
         }
+        let mut model_event_timeouts = BTreeMap::new();
+        for (model, policy) in server.model_event_timeouts {
+            if model.trim().is_empty() || model.len() > MAX_MODEL_BYTES {
+                return Err(validation(
+                    "server.model_event_timeouts model names must be non-blank and at most 256 bytes"
+                        .into(),
+                ));
+            }
+            let model_first = Duration::from_secs(
+                policy
+                    .first_event_timeout_seconds
+                    .unwrap_or(first_event_timeout.as_secs()),
+            );
+            let model_inter = Duration::from_secs(
+                policy
+                    .inter_event_timeout_seconds
+                    .unwrap_or(inter_event_timeout.as_secs()),
+            );
+            if model_first.is_zero() || model_inter.is_zero() {
+                return Err(validation(
+                    "server.model_event_timeouts values must be greater than zero".into(),
+                ));
+            }
+            model_event_timeouts.insert(
+                model,
+                EventTimeouts {
+                    first_event_timeout: model_first,
+                    inter_event_timeout: model_inter,
+                },
+            );
+        }
         let upstream_error_body_timeout = match server.upstream_error_body_timeout_seconds {
             Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_UPSTREAM_ERROR_BODY_TIMEOUT,
@@ -689,6 +730,7 @@ impl Config {
                 upstream_response_header_timeout,
                 first_event_timeout,
                 inter_event_timeout,
+                model_event_timeouts,
                 upstream_error_body_timeout,
                 response_write_timeout,
                 max_connections,
@@ -778,9 +820,19 @@ struct RawServer {
     upstream_response_header_timeout_seconds: Option<u64>,
     first_event_timeout_seconds: Option<u64>,
     inter_event_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    model_event_timeouts: BTreeMap<String, RawEventTimeouts>,
     upstream_error_body_timeout_seconds: Option<u64>,
     response_write_timeout_seconds: Option<u64>,
     max_connections: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+struct RawEventTimeouts {
+    first_event_timeout_seconds: Option<u64>,
+    inter_event_timeout_seconds: Option<u64>,
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +25,7 @@ use crate::audit::{
     AttemptSummaries, AttemptSummary, AttemptTerminalReason, AuditError, AuditOutcome, AuditRecord,
     Outcome,
 };
-use crate::config::{upstream_api_url, Secret, UpstreamApi, MAX_MODEL_BYTES};
+use crate::config::{upstream_api_url, EventTimeouts, Secret, UpstreamApi, MAX_MODEL_BYTES};
 use crate::pool::{AttemptResult, Failure, KeyPool, UsageDimension};
 use crate::queue::{AdmissionError, AdmissionQueue, Permit};
 
@@ -387,6 +387,7 @@ pub struct GatewayState {
     pub(crate) body_budget: BodyBudget,
     pub(crate) stream_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) timeouts: IoTimeouts,
+    pub(crate) model_event_timeouts: BTreeMap<String, EventTimeouts>,
 }
 
 impl GatewayState {
@@ -441,7 +442,26 @@ impl GatewayState {
             body_budget,
             stream_slots: Arc::new(tokio::sync::Semaphore::new(max_streams)),
             timeouts,
+            model_event_timeouts: BTreeMap::new(),
         }
+    }
+
+    pub fn with_model_event_timeouts(
+        mut self,
+        model_event_timeouts: BTreeMap<String, EventTimeouts>,
+    ) -> Self {
+        self.model_event_timeouts = model_event_timeouts;
+        self
+    }
+
+    fn event_timeouts_for(&self, model: &str) -> EventTimeouts {
+        self.model_event_timeouts
+            .get(model)
+            .copied()
+            .unwrap_or(EventTimeouts {
+                first_event_timeout: self.timeouts.first_event,
+                inter_event_timeout: self.timeouts.inter_event,
+            })
     }
 }
 
@@ -1283,7 +1303,7 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
                 }
                 let prepared = match prepare_response(
                     resp,
-                    state.timeouts.first_event,
+                    state.event_timeouts_for(&model),
                     SSE_EVENT_CAP,
                     attempt_start,
                 )
@@ -1456,6 +1476,7 @@ struct PreparedResponse {
     prefetched: Vec<Bytes>,
     first_byte_latency: Option<Duration>,
     first_event_latency: Option<Duration>,
+    inter_event_timeout: Duration,
 }
 
 struct PrefetchFailure {
@@ -1468,7 +1489,7 @@ struct PrefetchFailure {
 
 async fn prepare_response(
     resp: reqwest::Response,
-    first_event_timeout: Duration,
+    event_timeouts: EventTimeouts,
     buffer_cap: usize,
     attempt_start: tokio::time::Instant,
 ) -> Result<PreparedResponse, PrefetchFailure> {
@@ -1485,6 +1506,7 @@ async fn prepare_response(
             prefetched: Vec::new(),
             first_byte_latency: None,
             first_event_latency: None,
+            inter_event_timeout: event_timeouts.inter_event_timeout,
         });
     }
 
@@ -1515,7 +1537,7 @@ async fn prepare_response(
             }
         }
     };
-    match tokio::time::timeout(first_event_timeout, read).await {
+    match tokio::time::timeout(event_timeouts.first_event_timeout, read).await {
         Ok(Ok(first_event_latency)) => Ok(PreparedResponse {
             status,
             headers,
@@ -1524,6 +1546,7 @@ async fn prepare_response(
             prefetched,
             first_byte_latency,
             first_event_latency: Some(first_event_latency),
+            inter_event_timeout: event_timeouts.inter_event_timeout,
         }),
         Ok(Err(reason)) => Err(PrefetchFailure {
             reason,
@@ -1828,6 +1851,7 @@ async fn stream_response(
     let prefetched = prepared.prefetched;
     let initial_first_byte_latency = prepared.first_byte_latency;
     let initial_first_event_latency = prepared.first_event_latency;
+    let inter_event_timeout = prepared.inter_event_timeout;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let client_gone = Arc::new(tokio::sync::Notify::new());
@@ -1838,7 +1862,7 @@ async fn stream_response(
     tokio::spawn(async move {
         let mut upstream = upstream;
         let idle = if streaming {
-            Some(state.timeouts.inter_event)
+            Some(inter_event_timeout)
         } else {
             Some(state.timeouts.upstream_error_body)
         };
@@ -2047,25 +2071,35 @@ async fn pump_upstream(
             };
         }
     }
+    let mut event_deadline = if streaming {
+        idle.map(|idle| tokio::time::Instant::now() + idle)
+    } else {
+        None
+    };
     loop {
-        let next = match idle {
-            Some(idle) => match tokio::time::timeout(idle, upstream.next()).await {
-                // A finite, content-length-delimited non-SSE body that stalls
-                // mid-body is a network failure, never a success: the body can
-                // never complete, so the key is failed and the stream ends.
+        let next = match (event_deadline, idle) {
+            (Some(deadline), _) => match tokio::time::timeout_at(deadline, upstream.next()).await {
                 Err(_) => {
                     return PumpResult {
-                        outcome: if streaming {
-                            PumpOutcome::EventIdleTimeout
-                        } else {
-                            PumpOutcome::UpstreamError
-                        },
+                        outcome: PumpOutcome::EventIdleTimeout,
                         metrics,
                     }
                 }
                 Ok(r) => r,
             },
-            None => upstream.next().await,
+            (None, Some(idle)) => match tokio::time::timeout(idle, upstream.next()).await {
+                // A finite, content-length-delimited non-SSE body that stalls
+                // mid-body is a network failure, never a success: the body can
+                // never complete, so the key is failed and the stream ends.
+                Err(_) => {
+                    return PumpResult {
+                        outcome: PumpOutcome::UpstreamError,
+                        metrics,
+                    }
+                }
+                Ok(r) => r,
+            },
+            (None, None) => upstream.next().await,
         };
         match next {
             Some(Ok(bytes)) => {
@@ -2082,6 +2116,9 @@ async fn pump_upstream(
                 metrics.upstream_events = metrics.upstream_events.saturating_add(events);
                 if events > 0 && metrics.first_event_latency.is_none() {
                     metrics.first_event_latency = Some(now.duration_since(attempt_start));
+                }
+                if events > 0 {
+                    event_deadline = idle.map(|idle| now + idle);
                 }
                 if !send_with_timeout(tx, bytes, write_budget).await {
                     return PumpResult {

@@ -48,8 +48,9 @@ This document records the decisions that define the gateway contract.
 - Bound active requests, queued requests, total accepted connections, request-body memory, model values (256 bytes and configured allowlist), error-body classification, audit buffering, and SSE streams.
 - Reject a full admission queue immediately with `503` and `Retry-After: 1`; apply a finite queue wait deadline.
 - Reserve body-budget permits before buffering a request body and hold them through upstream request construction.
-- Apply deadlines independently to HTTP header reads, request bodies, upstream response headers, the first complete SSE event, gaps between committed SSE events, upstream error-body reads, and downstream writes. nginx independently bounds public TLS and client behavior.
+- Apply deadlines independently to HTTP header reads, request bodies, upstream response headers, the first complete SSE event, gaps between committed SSE events, upstream error-body reads, and downstream writes. Global first/inter-event defaults may be overridden per model. nginx independently bounds public TLS and client behavior.
 - Treat the first complete SSE `data:` event as the downstream commit point. Preserve every prefetched byte verbatim under a 256 KiB cap; before commit a silent/broken attempt may fail over, while after commit a silent stream is terminated without changing keys or stitching streams.
+- Reset committed-stream liveness only after parsing a complete event with a `data:` field. Forward comments, keepalives, and event fragments unchanged, but do not let raw transport activity extend the model-activity deadline.
 - Track no-first-event and committed event-idle failures by `(key, model)`, so one model's liveness does not cool unrelated models. A client cancellation before the first-event deadline is not a key failure.
 - Hold an admission permit until a streamed response reaches EOF, fails, or is cancelled.
 - Give SSE responses a separate cap of one quarter of `max_concurrency` (at least one); reject excess streams with 503 and `Retry-After: 1`.

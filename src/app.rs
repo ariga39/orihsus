@@ -97,7 +97,8 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
         audit.clone(),
         body_budget.clone(),
         timeouts,
-    );
+    )
+    .with_model_event_timeouts(cfg.server.model_event_timeouts.clone());
     let router = build_router(state);
     let usage_monitor = UsageMonitor::start(cfg.usage.clone(), cfg.keys.clone(), pool.clone())
         .map_err(BootstrapError::Client)?;

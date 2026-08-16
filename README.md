@@ -61,6 +61,8 @@ Configuration values are scalar strings or numbers. Durations are integer second
 | `server.upstream_response_header_timeout_seconds` | integer | no | `60` | Deadline from sending upstream request to receiving response headers. |
 | `server.first_event_timeout_seconds` | integer | no | `60` | Deadline from upstream headers to the first complete SSE `data:` event. Before this event the response is uncommitted and may fail over. |
 | `server.inter_event_timeout_seconds` | integer | no | `90` | Maximum silence between complete SSE events after commit; expiry terminates the stream without failover. |
+| `server.model_event_timeouts.<model>.first_event_timeout_seconds` | integer | no | global value | Per-model first-event override; omitted fields inherit the global default. Model names are non-blank and at most 256 bytes. |
+| `server.model_event_timeouts.<model>.inter_event_timeout_seconds` | integer | no | global value | Per-model inter-event override; omitted fields inherit the global default. |
 | `server.upstream_error_body_timeout_seconds` | integer | no | `5` | Deadline for reading a retryable error body for classification. |
 | `server.response_write_timeout_seconds` | integer | no | `30` | Per-chunk deadline when forwarding a response to a slow client. |
 
@@ -68,7 +70,17 @@ Configuration values are scalar strings or numbers. Durations are integer second
 
 Only `gateway_token` and `keys` are required. Omitted optional sections use the defaults above. Before the first successful automatic refresh, the service retains `deepseek-chat` as a fail-safe allowlist. Listener, limits, key-failure handling, usage, audit, and server changes require restart. The upstream is fixed at `https://opencode.ai/zen/go/`; any `upstream` or `base_url` configuration is rejected. Only the fixed `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and authenticated `/v1/usage` upstream paths can receive subscription keys; model synchronization uses unauthenticated `GET /v1/models`, while the gateway's own `/v1/models` remains local. Request and successful response bodies are forwarded unchanged; clients must choose the protocol endpoint matching their model.
 
-For SSE, orihsus buffers raw upstream bytes only until the first complete `data:` event (bounded by 256 KiB). A timeout, connection failure, or EOF in that precommit window may use the second configured attempt; the client sees only the winning attempt. After the first event is committed, orihsus never splices streams or changes keys. An inter-event timeout ends that stream and records a key-and-model-scoped liveness failure.
+For SSE, orihsus buffers raw upstream bytes only until the first complete `data:` event (bounded by 256 KiB). A timeout, connection failure, or EOF in that precommit window may use the second configured attempt; the client sees only the winning attempt. After the first event is committed, orihsus never splices streams or changes keys. Only a complete SSE event containing a `data:` field resets the inter-event deadline: comments, keepalives, and incomplete fragments are forwarded transparently but do not count as model activity. An inter-event timeout ends that stream and records a key-and-model-scoped liveness failure.
+
+```yaml
+server:
+  first_event_timeout_seconds: 60
+  inter_event_timeout_seconds: 90
+  model_event_timeouts:
+    deepseek-reasoner:
+      first_event_timeout_seconds: 120
+      inter_event_timeout_seconds: 180
+```
 
 ## Testing
 

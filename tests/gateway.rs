@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,7 +9,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use orihsus::audit::{fingerprint, AuditError, AuditOutcome, AuditRecord, AuditWriter, Outcome};
-use orihsus::config::Secret;
+use orihsus::config::{EventTimeouts, Secret};
 use orihsus::gateway::{
     build_router, AuditSink, BodyBudget, GatewayState, IoTimeouts, RuntimeState, RuntimeStore,
 };
@@ -153,6 +153,40 @@ async fn start_mock(control: Arc<MockControl>) -> std::net::SocketAddr {
     addr
 }
 
+async fn start_channel_sse_mock() -> (
+    std::net::SocketAddr,
+    tokio::sync::mpsc::Sender<axum::body::Bytes>,
+) {
+    use axum::extract::State;
+    use axum::routing::post;
+    use futures_util::StreamExt;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    type ChannelState = Arc<Mutex<Option<tokio::sync::mpsc::Receiver<axum::body::Bytes>>>>;
+
+    async fn channel_sse(State(state): State<ChannelState>) -> axum::response::Response {
+        let rx = state.lock().unwrap().take().unwrap();
+        axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "text/event-stream")
+            .body(axum::body::Body::from_stream(
+                ReceiverStream::new(rx).map(Ok::<_, std::convert::Infallible>),
+            ))
+            .unwrap()
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new()
+        .route("/v1/chat/completions", post(channel_sse))
+        .with_state(Arc::new(Mutex::new(Some(rx))));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, tx)
+}
+
 #[tokio::test(start_paused = true)]
 async fn silent_first_sse_attempt_fails_over_before_client_commit() {
     let control = Arc::new(MockControl::default());
@@ -230,6 +264,59 @@ async fn silent_first_sse_attempt_fails_over_before_client_commit() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn model_first_event_timeout_override_controls_precommit_failover() {
+    let control = Arc::new(MockControl::default());
+    let (_gate_tx, gate_rx) = tokio::sync::mpsc::channel(1);
+    control.sse.lock().unwrap().replace(SseControl {
+        event1: Vec::new(),
+        event2: b"data: [DONE]\n\n".to_vec(),
+        event2b: None,
+        gate2: gate_rx,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        cancel_notify: Arc::new(tokio::sync::Notify::new()),
+    });
+    control.responses.lock().unwrap().push_back(MockResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        body: b"data: {\"model_override\":true}\n\ndata: [DONE]\n\n".to_vec(),
+        extra_headers: Vec::new(),
+    });
+    let addr = start_mock(control.clone()).await;
+    let p = pool(&["key-1", "key-2"]);
+    let q = queue(2, 2, Duration::from_secs(30));
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        "deepseek-chat".to_string(),
+        EventTimeouts {
+            first_event_timeout: Duration::from_secs(3),
+            inter_event_timeout: Duration::from_secs(8),
+        },
+    );
+    let app = build_router(
+        state_with_timeouts(
+            &p,
+            &q,
+            &format!("http://{addr}"),
+            TestSink::default(),
+            IoTimeouts {
+                first_event: Duration::from_secs(30),
+                ..IoTimeouts::default()
+            },
+        )
+        .with_model_event_timeouts(overrides),
+    );
+
+    let task = tokio::spawn(async move { send(&app, chat_req()).await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(3)).await;
+    tokio::task::yield_now().await;
+    let resp = task.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_string(resp).await.contains("model_override"));
+    assert_eq!(control.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
 async fn active_reasoning_events_reset_the_inter_event_watchdog() {
     let control = Arc::new(MockControl::default());
     let (gate_tx, gate_rx) = tokio::sync::mpsc::channel(1);
@@ -273,6 +360,68 @@ async fn active_reasoning_events_reset_the_inter_event_watchdog() {
     }
     assert!(String::from_utf8_lossy(&rest).contains("still thinking"));
     assert_eq!(q.snapshot().active, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn sse_comments_and_fragments_do_not_reset_the_inter_event_watchdog() {
+    let (addr, tx) = start_channel_sse_mock().await;
+    let q = queue(2, 2, Duration::from_secs(30));
+    let sink = TestSink::default();
+    let mut overrides = BTreeMap::new();
+    overrides.insert(
+        "deepseek-chat".to_string(),
+        EventTimeouts {
+            first_event_timeout: Duration::from_secs(5),
+            inter_event_timeout: Duration::from_secs(5),
+        },
+    );
+    let app = build_router(
+        state_with_timeouts(
+            &pool(&["key-1"]),
+            &q,
+            &format!("http://{addr}"),
+            sink.clone(),
+            IoTimeouts {
+                first_event: Duration::from_secs(30),
+                inter_event: Duration::from_secs(30),
+                ..IoTimeouts::default()
+            },
+        )
+        .with_model_event_timeouts(overrides),
+    );
+
+    tx.send(Bytes::from_static(b"data: {\"ready\":true}\n\n"))
+        .await
+        .unwrap();
+    let request = tokio::spawn(async move { send(&app, chat_req()).await });
+    while !request.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let resp = request.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body();
+    assert!(next_data_frame(&mut body).await.is_some());
+
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tx.send(Bytes::from_static(b": keepalive\n\n"))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tx.send(Bytes::from_static(b"data: {\"partial\":"))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        q.snapshot().active,
+        0,
+        "five seconds without a complete data event must end the stream"
+    );
+    let records = sink.0.lock().unwrap();
+    assert_eq!(records[0].outcome, Some(AuditOutcome::EventIdleTimeout));
 }
 
 #[tokio::test(start_paused = true)]
