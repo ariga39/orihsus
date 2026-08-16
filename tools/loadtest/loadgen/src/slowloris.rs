@@ -1,11 +1,11 @@
 use crate::cli::{SlowArgs, SlowStage};
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, ServerName, UnixTime},
     ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme,
 };
+use rustls_pki_types::{pem::PemObject, CertificateDer, ServerName, UnixTime};
 use serde::Serialize;
-use std::{io::BufReader, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 use tokio::{
     io::{AsyncWrite, AsyncWriteExt},
     net::TcpStream,
@@ -169,8 +169,7 @@ async fn tls_config(args: &SlowArgs) -> Result<Arc<ClientConfig>, String> {
         let pem = tokio::fs::read(path)
             .await
             .map_err(|e| format!("read CA: {e}"))?;
-        let mut reader = BufReader::new(pem.as_slice());
-        for cert in rustls_pemfile::certs(&mut reader) {
+        for cert in CertificateDer::pem_slice_iter(&pem) {
             roots
                 .add(cert.map_err(|e| format!("parse CA: {e}"))?)
                 .map_err(|e| format!("add CA: {e}"))?
