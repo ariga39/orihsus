@@ -798,11 +798,22 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
             .header("authorization", "Bearer gway-token")
             .header("content-type", "application/json")
             .header("accept", "application/json")
+            .header("user-agent", "opencode/1.2.3")
             .header("x-request-id", "my-req-1")
+            .header("x-opencode-project", "project-42")
+            .header("x-opencode-session", "session-7")
+            .header("x-opencode-request", "request-9")
+            .header("x-opencode-client", "desktop")
+            .header("x-opencode-directory", "%2Fworkspace")
+            .header("x-opencode-workspace", "workspace-3")
             .header("cookie", "session=client-secret")
             .header("x-api-key", "client-api-secret")
+            .header("x-opencode-api-key", "prefixed-client-secret")
+            .header("proxy-authorization", "Basic client-secret")
             .header("x-forwarded-for", "203.0.113.9")
             .header("traceparent", "00-secret-trace-01")
+            .header("tracestate", "vendor=secret")
+            .header("baggage", "account=secret")
             .header("x-custom", "drop-me")
             .header("connection", "x-dyn")
             .header("x-dyn", "strip-me")
@@ -844,7 +855,21 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
         "application/json"
     );
     assert_eq!(upstream_headers.get("accept").unwrap(), "application/json");
+    assert_eq!(
+        upstream_headers.get("user-agent").unwrap(),
+        "opencode/1.2.3"
+    );
     assert_eq!(upstream_headers.get("x-request-id").unwrap(), "my-req-1");
+    for (name, expected) in [
+        ("x-opencode-project", "project-42"),
+        ("x-opencode-session", "session-7"),
+        ("x-opencode-request", "request-9"),
+        ("x-opencode-client", "desktop"),
+        ("x-opencode-directory", "%2Fworkspace"),
+        ("x-opencode-workspace", "workspace-3"),
+    ] {
+        assert_eq!(upstream_headers.get(name).unwrap(), expected);
+    }
     assert_eq!(
         upstream_headers.get("authorization").unwrap(),
         "Bearer key-1"
@@ -852,8 +877,12 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
     for rejected in [
         "cookie",
         "x-api-key",
+        "x-opencode-api-key",
+        "proxy-authorization",
         "x-forwarded-for",
         "traceparent",
+        "tracestate",
+        "baggage",
         "x-custom",
         "connection",
         "x-dyn",

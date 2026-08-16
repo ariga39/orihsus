@@ -707,6 +707,55 @@ fn is_hop_by_hop(lowercased: &str) -> bool {
     HOP_BY_HOP.contains(&lowercased)
 }
 
+fn is_sensitive_request_header(lowercased: &str) -> bool {
+    matches!(
+        lowercased,
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "cookie2"
+            | "x-api-key"
+            | "api-key"
+            | "x-real-ip"
+            | "forwarded"
+            | "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-proto"
+            | "x-forwarded-port"
+            | "baggage"
+            | "traceparent"
+            | "tracestate"
+            | "b3"
+            | "x-ot-span-context"
+            | "grpc-trace-bin"
+    ) || lowercased.ends_with("-authorization")
+        || lowercased.ends_with("-api-key")
+        || lowercased.starts_with("x-forwarded-")
+        || lowercased.starts_with("x-b3-")
+}
+
+fn should_forward_request_header(
+    lowercased: &str,
+    connection: &HashSet<String>,
+    api: UpstreamApi,
+) -> bool {
+    if is_hop_by_hop(lowercased)
+        || connection.contains(lowercased)
+        || is_sensitive_request_header(lowercased)
+    {
+        return false;
+    }
+
+    // OpenCode's Go-provider request path currently emits client/project/
+    // request/session; @opencode-ai/sdk also emits directory/workspace. Keep
+    // the namespace open for compatible additions while the deny rules above
+    // prevent credential-shaped names from riding the prefix rule.
+    lowercased.starts_with("x-opencode-")
+        || matches!(lowercased, "content-type" | "accept" | "user-agent")
+        || (matches!(api, UpstreamApi::Messages)
+            && matches!(lowercased, "anthropic-version" | "anthropic-beta"))
+}
+
 async fn forward_request(
     state: &GatewayState,
     sel: &crate::pool::Selection,
@@ -718,20 +767,16 @@ async fn forward_request(
 ) -> Result<reqwest::Response, reqwest::Error> {
     let url = upstream_api_url(base_url, api);
     let mut rb = state.http.post(url).body(body.clone());
-    // Credential-bearing traffic receives only the OpenAI protocol headers.
-    // Ambient cookies, proxy identity, API keys, and tracing baggage are never
-    // relayed to the upstream.
-    for allowed in [CONTENT_TYPE, axum::http::header::ACCEPT] {
-        for value in headers.get_all(&allowed) {
-            rb = rb.header(allowed.clone(), value.clone());
+    // Preserve OpenCode client semantics through an explicit allowlist and
+    // prefix rule. Sensitive classes take precedence over prefix allowance.
+    let connection = connection_named_headers(headers);
+    for (name, value) in headers {
+        let lowercased = name.as_str().to_ascii_lowercase();
+        if should_forward_request_header(&lowercased, &connection, api) {
+            rb = rb.header(name, value);
         }
     }
     if matches!(api, UpstreamApi::Messages) {
-        for allowed in ["anthropic-version", "anthropic-beta"] {
-            for value in headers.get_all(allowed) {
-                rb = rb.header(allowed, value.clone());
-            }
-        }
         rb = rb.header("x-api-key", sel.key().as_str());
     } else {
         rb = rb.header(AUTHORIZATION, format!("Bearer {}", sel.key().as_str()));
