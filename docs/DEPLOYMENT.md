@@ -33,7 +33,7 @@ sudo systemctl enable --now orihsus
 sudo systemctl status orihsus
 ```
 
-The unit runs without root or capabilities and grants write access only to the audit directory. `TimeoutStopSec=45` covers the ≤30s connection drain, 5s audit flush, and scheduling margin.
+The unit runs without root or capabilities and grants write access only to `/var/log/orihsus`, which contains audit and usage-history logs. `TimeoutStopSec=45` covers the ≤30s connection drain, 5s audit flush, and scheduling margin.
 
 Verify the private HTTP listener locally:
 
@@ -152,9 +152,17 @@ The installed `deploy/orihsus.logrotate` policy is the audit capacity and retent
 sudo systemctl kill -s HUP orihsus
 ```
 
+Successful five-minute usage polls are also recorded under `/var/log/orihsus/usage` by default. Each UTC day has one append-only `YYYY-MM-DD.jsonl` file; these files are deliberately outside the audit logrotate policy and are never merged or rotated by the process. Every line contains a timestamp, a 12-hex SHA-256 key fingerprint, and the rolling/weekly/monthly status, percent, and reset time. It never contains a raw key. Configure another directory with top-level `usage_history_dir`; ensure the `orihsus` user can create and append files there and extend the systemd `ReadWritePaths` sandbox if it is outside `/var/log/orihsus`.
+
+Usage-history writes use a bounded background queue. A full queue, unwritable directory, or file error drops history without delaying the usage request or its cooldown decision; monitor the static warning in the journal. Choose retention according to capacity-planning needs. To aggregate a UTC date range by fingerprint:
+
+```bash
+node tools/usage-summary.mjs --dir /var/log/orihsus/usage --days 30
+```
+
 ## 7. Reload and restart boundaries
 
-The gateway token, key set, and model list are hot-reloadable. Listener/server settings, capacity, key-failure handling, audit, and usage-poll scheduling require an orihsus restart. The upstream origin and API-path allowlist are compiled in. nginx certificates and edge policy are reloaded independently with `nginx -t && systemctl reload nginx`.
+The gateway token, key set, and model list are hot-reloadable. Listener/server settings, capacity, key-failure handling, audit, usage-poll scheduling, and `usage_history_dir` require an orihsus restart. The upstream origin and API-path allowlist are compiled in. nginx certificates and edge policy are reloaded independently with `nginx -t && systemctl reload nginx`.
 
 ## 8. Resource discipline
 

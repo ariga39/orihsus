@@ -100,8 +100,13 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
     )
     .with_model_event_timeouts(cfg.server.model_event_timeouts.clone());
     let router = build_router(state);
-    let usage_monitor = UsageMonitor::start(cfg.usage.clone(), cfg.keys.clone(), pool.clone())
-        .map_err(BootstrapError::Client)?;
+    let usage_monitor = UsageMonitor::start(
+        cfg.usage.clone(),
+        cfg.usage_history_dir.clone(),
+        cfg.keys.clone(),
+        pool.clone(),
+    )
+    .map_err(BootstrapError::Client)?;
     let model_monitor = ModelMonitor::start(cfg.model_sync.clone(), runtime.clone())
         .map_err(BootstrapError::Client)?;
     Ok((

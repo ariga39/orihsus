@@ -9,6 +9,7 @@ A lightweight OpenAI-compatible gateway for OpenCode Go that rotates multiple su
 - Tries at most two keys per request. Retryable upstream errors become sanitized OpenAI-compatible JSON; upstream bodies and metadata are never exposed.
 - Enforces gateway bearer authentication, header-read timeouts, and a maximum header size; nginx terminates public TLS and HTTP/2.
 - Writes JSONL audit records with OpenCode session/project/request IDs, token counts, and bounded per-attempt streaming telemetry. Keys are represented only by the first 12 hexadecimal characters of a SHA-256 fingerprint.
+- Records each successful usage poll as redacted daily JSONL history for capacity planning; disk failures never block polling or cooldown decisions.
 - Hot-reloads tokens, keys, and models. When no manual model list is configured, the allowlist is refreshed from OpenCode Go at startup and hourly thereafter.
 - Bounds concurrency, queued requests, request bodies, model names, SSE streams, error classification, and the audit queue.
 
@@ -52,6 +53,7 @@ Configuration values are scalar strings or numbers. Durations are integer second
 | `key_failure_handling.max_attempts` | integer | no | `2` | Total attempts across keys for one request; `1` or `2`. |
 | `usage.soft_threshold_percent` | number | no | `80` | Usage percentage above which a key is proactively cooled; in `(0, 100]`. |
 | `usage.poll_interval_seconds` | integer | no | `300` | OpenCode Go usage polling interval; at least `30`. |
+| `usage_history_dir` | string (path) | no | `/var/log/orihsus/usage` | Directory for UTC-daily `YYYY-MM-DD.jsonl` usage snapshots. Changes require restart. |
 | `audit.path` | string (path) | no | `/var/log/orihsus/audit.jsonl` | JSONL audit file. |
 | `audit.queue_capacity` | integer | no | `4096` | In-memory audit queue capacity; must be positive. |
 | `server.read_header_timeout_seconds` | integer | no | `5` | Deadline for reading request headers. |
@@ -69,6 +71,14 @@ Configuration values are scalar strings or numbers. Durations are integer second
 `key_failure_handling` configures what happens when the currently selected upstream key fails. Ordinary failures use exponential backoff; repeated failures open that key's circuit breaker; `max_attempts` controls whether the same client request may fail over to one other key. It does not configure scheduled key replacement.
 
 Only `gateway_token` and `keys` are required. Omitted optional sections use the defaults above. Before the first successful automatic refresh, the service retains `deepseek-chat` as a fail-safe allowlist. Listener, limits, key-failure handling, usage, audit, and server changes require restart. The upstream is fixed at `https://opencode.ai/zen/go/`; any `upstream` or `base_url` configuration is rejected. Only the fixed `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and authenticated `/v1/usage` upstream paths can receive subscription keys; model synchronization uses unauthenticated `GET /v1/models`, while the gateway's own `/v1/models` remains local. Request and successful response bodies are forwarded unchanged; clients must choose the protocol endpoint matching their model.
+
+Each successful per-key usage response appends one record to `<usage_history_dir>/YYYY-MM-DD.jsonl`, selected by the poll's UTC timestamp. Records contain only the key fingerprint plus `rolling`, `weekly`, and `monthly` status, percent, and reset time; raw keys and monetary estimates are never written. Missing API fields are represented as `null`. Files are not merged or rotated by orihsus. Summarize the last seven UTC days with:
+
+```bash
+node tools/usage-summary.mjs --dir /var/log/orihsus/usage --days 7
+```
+
+The summary emits one row per day and fingerprint with sample count and each window's latest, maximum, and average percentage and latest `resetsAt`.
 
 For SSE, orihsus buffers raw upstream bytes only until the first complete `data:` event (bounded by 256 KiB). A timeout, connection failure, or EOF in that precommit window may use the second configured attempt; the client sees only the winning attempt. After the first event is committed, orihsus never splices streams or changes keys. Only a complete SSE event containing a `data:` field resets the inter-event deadline: comments, keepalives, and incomplete fragments are forwarded transparently but do not count as model activity. An inter-event timeout ends that stream and records a key-and-model-scoped liveness failure.
 

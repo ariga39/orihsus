@@ -57,6 +57,10 @@ fn minimal_valid_config_yields_defaults() {
 
     assert_eq!(cfg.usage.soft_threshold_percent, 80.0);
     assert_eq!(cfg.usage.poll_interval, Duration::from_secs(5 * 60));
+    assert_eq!(
+        cfg.usage_history_dir,
+        PathBuf::from("/var/log/orihsus/usage")
+    );
 
     assert_eq!(
         cfg.audit.path,
@@ -132,13 +136,32 @@ fn explicit_usage_values_are_parsed() {
         "usage.yaml",
         &MINIMAL.replace(
             "keys:\n  - \"key-1\"",
-            "keys:\n  - \"key-1\"\nusage:\n  soft_threshold_percent: 73.5\n  poll_interval_seconds: 45",
+            "keys:\n  - \"key-1\"\nusage_history_dir: /srv/orihsus/usage-history\nusage:\n  soft_threshold_percent: 73.5\n  poll_interval_seconds: 45",
         ),
     );
 
     let cfg = orihsus::config::load(&path).unwrap();
     assert_eq!(cfg.usage.soft_threshold_percent, 73.5);
     assert_eq!(cfg.usage.poll_interval, Duration::from_secs(45));
+    assert_eq!(
+        cfg.usage_history_dir,
+        PathBuf::from("/srv/orihsus/usage-history")
+    );
+}
+
+#[test]
+fn empty_usage_history_directory_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(
+        dir.path(),
+        "usage-history.yaml",
+        &MINIMAL.replace(
+            "keys:\n  - \"key-1\"",
+            "keys:\n  - \"key-1\"\nusage_history_dir: \"\"",
+        ),
+    );
+    let error = orihsus::config::load(path).unwrap_err();
+    assert!(format!("{error}").contains("usage_history_dir"));
 }
 
 #[test]

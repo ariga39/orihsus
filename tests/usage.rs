@@ -1,3 +1,4 @@
+use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,7 +7,8 @@ use chrono::{DateTime, Utc};
 use orihsus::audit::fingerprint;
 use orihsus::config::Secret;
 use orihsus::pool::{AttemptResult, KeyPool, NoJitter, PoolPolicy};
-use orihsus::usage::{Clock, UsageFetchError, UsageFetcher, UsageMonitor};
+use orihsus::usage::{Clock, UsageFetchError, UsageFetcher, UsageHistoryWriter, UsageMonitor};
+use tempfile::TempDir;
 
 fn pool() -> Arc<KeyPool> {
     Arc::new(
@@ -47,6 +49,75 @@ impl UsageFetcher for ErrorFetcher {
     async fn fetch(&self, _key: &Secret) -> Result<Vec<u8>, UsageFetchError> {
         Err(UsageFetchError::Timeout)
     }
+}
+
+#[tokio::test]
+async fn successful_polls_write_redacted_daily_usage_history() {
+    let dir = TempDir::new().unwrap();
+    let mut writer = UsageHistoryWriter::start(dir.path());
+    let sink = writer.sink();
+    let key = Secret::new("history-raw-key-must-not-leak");
+    let body = br#"{"usage":{"rolling":{"status":"ok","percent":12.5,"resetsAt":"2026-08-15T00:00:00Z"},"weekly":{"status":"ok","percent":42,"resetsAt":"2026-08-20T00:00:00Z"},"monthly":{"status":"rate-limited","percent":100,"resetsAt":"2026-09-01T00:00:00Z"}}}"#;
+
+    for timestamp in ["2026-08-14T23:59:00Z", "2026-08-15T00:01:00Z"] {
+        UsageMonitor::poll_once_with_history(
+            &StaticFetcher(body),
+            &FixedClock(timestamp.parse().unwrap()),
+            80.0,
+            std::slice::from_ref(&key),
+            &pool(),
+            Some(&sink),
+        )
+        .await;
+    }
+    drop(sink);
+    writer.shutdown();
+
+    for day in ["2026-08-14", "2026-08-15"] {
+        let text = fs::read_to_string(dir.path().join(format!("{day}.jsonl"))).unwrap();
+        assert!(!text.contains(key.as_str()), "raw key leaked into history");
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["timestamp"].as_str().unwrap()[..10], *day);
+        assert_eq!(value["key_fingerprint"], fingerprint(key.as_str()));
+        assert_eq!(value["rolling"]["status"], "ok");
+        assert_eq!(value["rolling"]["percent"], 12.5);
+        assert_eq!(value["rolling"]["resetsAt"], "2026-08-15T00:00:00Z");
+        assert_eq!(value["weekly"]["percent"].as_f64(), Some(42.0));
+        assert_eq!(value["monthly"]["status"], "rate-limited");
+    }
+}
+
+#[tokio::test]
+async fn usage_history_write_failure_does_not_block_cooldown() {
+    let dir = TempDir::new().unwrap();
+    let not_a_directory = dir.path().join("blocked");
+    fs::write(&not_a_directory, "file").unwrap();
+    let mut writer = UsageHistoryWriter::start(&not_a_directory);
+    let sink = writer.sink();
+    let now = "2026-08-14T12:00:00Z".parse().unwrap();
+    let target_pool = pool();
+
+    UsageMonitor::poll_once_with_history(
+        &StaticFetcher(
+            br#"{"usage":{"rolling":{"percent":90,"resetsAt":"2026-08-14T12:10:00Z"}}}"#,
+        ),
+        &FixedClock(now),
+        80.0,
+        &[Secret::new("key-a")],
+        &target_pool,
+        Some(&sink),
+    )
+    .await;
+
+    let mut request = target_pool.request();
+    let selected = match request.next().await {
+        AttemptResult::Selected(selected) => selected,
+        other => panic!("expected selected key, got {other:?}"),
+    };
+    assert_eq!(selected.fingerprint(), fingerprint("key-b"));
+    drop(sink);
+    writer.shutdown();
+    assert_eq!(writer.write_failures(), 1);
 }
 
 #[tokio::test(start_paused = true)]

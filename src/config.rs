@@ -59,6 +59,7 @@ const DEFAULT_BREAKER_COOLDOWN: Duration = Duration::from_secs(60);
 const DEFAULT_MAX_ATTEMPTS: usize = 2;
 const DEFAULT_USAGE_SOFT_THRESHOLD_PERCENT: f64 = 80.0;
 const DEFAULT_USAGE_POLL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_USAGE_HISTORY_DIR: &str = "/var/log/orihsus/usage";
 const DEFAULT_AUDIT_PATH: &str = "/var/log/orihsus/audit.jsonl";
 const DEFAULT_AUDIT_QUEUE_CAPACITY: usize = 4096;
 const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -171,6 +172,7 @@ pub struct Config {
     pub limits: Limits,
     pub key_failure_handling: KeyFailureHandling,
     pub usage: Usage,
+    pub usage_history_dir: PathBuf,
     pub audit: Audit,
     pub server: Server,
 }
@@ -559,6 +561,13 @@ impl Config {
                 "usage.poll_interval_seconds must be at least 30".into(),
             ));
         }
+        let usage_history_dir = raw
+            .usage_history_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_USAGE_HISTORY_DIR));
+        if usage_history_dir.as_os_str().is_empty() {
+            return Err(validation("usage_history_dir must not be empty".into()));
+        }
 
         let audit = raw.audit.unwrap_or_default();
         let audit_path = match audit.path {
@@ -719,6 +728,7 @@ impl Config {
                 soft_threshold_percent,
                 poll_interval,
             },
+            usage_history_dir,
             audit: Audit {
                 path: audit_path,
                 queue_capacity: audit_queue_capacity,
@@ -751,6 +761,7 @@ struct RawConfig {
     limits: Option<RawLimits>,
     key_failure_handling: Option<RawKeyFailureHandling>,
     usage: Option<RawUsage>,
+    usage_history_dir: Option<String>,
     audit: Option<RawAudit>,
     server: Option<RawServer>,
 }
