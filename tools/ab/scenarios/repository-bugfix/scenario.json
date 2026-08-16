@@ -1,0 +1,15 @@
+{
+  "id": "repository-bugfix",
+  "level": "L3",
+  "priority": "P0",
+  "task_file": "task.md",
+  "initial_snapshot_sha256": "3f341fdec70eed34c4228c57dc3c0d63f8192ee13480a9ccbae100f2a14c0d93",
+  "model": "deepseek-v4-flash",
+  "agent": "build",
+  "acceptance": { "command": "npm test" },
+  "review_rubric": [
+    "literal regex metacharacters are escaped before parameter placeholders are expanded",
+    "named parameters still match exactly one path segment and existing tests remain intact",
+    "the patch is narrowly scoped and introduces no dependency or generated artifact"
+  ]
+}

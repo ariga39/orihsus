@@ -1,0 +1,15 @@
+{
+  "id": "usine-bootstrap",
+  "level": "L3",
+  "priority": "P0",
+  "task_file": "task.md",
+  "initial_snapshot_sha256": "0e433ca7d0472da002233310f392e147850dead02a8e59d8a53fdcf7f6ad6c89",
+  "model": "deepseek-v4-flash",
+  "agent": "build",
+  "acceptance": { "command": "test -f src/pipeline.js && test -f README.md && test -f package.json && npm test" },
+  "review_rubric": [
+    "the public API enforces bounded concurrency, unique IDs, failure isolation, and graceful close semantics",
+    "tests cover observable behavior without timing-fragile sleeps or external dependencies",
+    "README documents architecture, API, failure semantics, and test command; implementation contains no placeholders"
+  ]
+}

@@ -1,0 +1,1 @@
+Fix the existing repository bug described by the failing regression test. Investigate the implementation and test before editing. Keep the patch local and preserve all existing behavior: route matching must treat literal route text literally while still supporting `:parameter` segments. Run the complete test suite and leave it passing. Do not modify the tests.

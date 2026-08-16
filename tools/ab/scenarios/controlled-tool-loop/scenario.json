@@ -1,0 +1,15 @@
+{
+  "id": "controlled-tool-loop",
+  "level": "L2",
+  "priority": "P0",
+  "task_file": "task.md",
+  "initial_snapshot_sha256": "b5d6223615f9b09e43f46829dafe34c343f43b6c1457769a4279d356cb7a4bf7",
+  "model": "deepseek-v4-flash",
+  "agent": "build",
+  "acceptance": { "command": "npm test" },
+  "review_rubric": [
+    "parseInteger accepts only complete signed decimal integer strings and returns null otherwise",
+    "summarize sums valid values and counts invalid input without changing the exported API",
+    "the agent preserved the tests and demonstrated failure-driven reruns rather than bypassing them"
+  ]
+}
