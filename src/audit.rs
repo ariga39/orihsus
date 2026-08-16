@@ -47,6 +47,103 @@ pub enum AuditOutcome {
     UpstreamError,
     /// The client dropped the response body before the upstream finished.
     ClientCancel,
+    /// A committed SSE stream stopped producing complete events for its
+    /// model-specific liveness window. The stream was terminated, never retried.
+    EventIdleTimeout,
+}
+
+pub const MAX_AUDIT_ATTEMPTS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptTerminalReason {
+    Completed,
+    ResponseHeaderTimeout,
+    NetworkError,
+    RetryableResponse,
+    Forwarded,
+    UpstreamError,
+    ClientCancel,
+    NoFirstEvent,
+    EventIdleTimeout,
+    EndBeforeFirstEvent,
+}
+
+#[derive(Debug, Clone)]
+pub struct AttemptSummary {
+    pub attempt_number: u8,
+    pub key_fingerprint: String,
+    pub response_header_latency: Option<Duration>,
+    pub first_byte_latency: Option<Duration>,
+    pub first_event_latency: Option<Duration>,
+    pub upstream_bytes: u64,
+    pub upstream_chunks: u64,
+    pub upstream_events: u64,
+    pub last_activity_offset: Option<Duration>,
+    pub precommit: bool,
+    pub committed: bool,
+    pub terminal_reason: AttemptTerminalReason,
+    pub failover_target: Option<String>,
+}
+
+impl Serialize for AttemptSummary {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut st = serializer.serialize_struct("AttemptSummary", 13)?;
+        st.serialize_field("attempt_number", &self.attempt_number)?;
+        st.serialize_field("key_fingerprint", &self.key_fingerprint)?;
+        st.serialize_field(
+            "response_header_latency_ms",
+            &self.response_header_latency.map(|value| value.as_millis()),
+        )?;
+        st.serialize_field(
+            "first_byte_latency_ms",
+            &self.first_byte_latency.map(|value| value.as_millis()),
+        )?;
+        st.serialize_field(
+            "first_event_latency_ms",
+            &self.first_event_latency.map(|value| value.as_millis()),
+        )?;
+        st.serialize_field("upstream_bytes", &self.upstream_bytes)?;
+        st.serialize_field("upstream_chunks", &self.upstream_chunks)?;
+        st.serialize_field("upstream_events", &self.upstream_events)?;
+        st.serialize_field(
+            "last_activity_offset_ms",
+            &self.last_activity_offset.map(|value| value.as_millis()),
+        )?;
+        st.serialize_field("precommit", &self.precommit)?;
+        st.serialize_field("committed", &self.committed)?;
+        st.serialize_field("terminal_reason", &self.terminal_reason)?;
+        st.serialize_field("failover_target", &self.failover_target)?;
+        st.end()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(transparent)]
+pub struct AttemptSummaries(Vec<AttemptSummary>);
+
+impl AttemptSummaries {
+    pub fn push(&mut self, summary: AttemptSummary) {
+        if self.0.len() < MAX_AUDIT_ATTEMPTS {
+            self.0.push(summary);
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &AttemptSummary> {
+        self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn last_mut(&mut self) -> Option<&mut AttemptSummary> {
+        self.0.last_mut()
+    }
 }
 
 /// One audit line. All fields are public; the caller supplies the timestamp.
@@ -64,11 +161,15 @@ pub struct AuditRecord {
     pub status: u16,
     pub outcome: Option<AuditOutcome>,
     pub latency: Duration,
+    pub opencode_session_id: Option<String>,
+    pub opencode_project_id: Option<String>,
+    pub opencode_request_id: Option<String>,
+    pub attempts: AttemptSummaries,
 }
 
 impl Serialize for AuditRecord {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut st = serializer.serialize_struct("AuditRecord", 9)?;
+        let mut st = serializer.serialize_struct("AuditRecord", 13)?;
         st.serialize_field(
             "timestamp",
             &self
@@ -83,6 +184,10 @@ impl Serialize for AuditRecord {
         st.serialize_field("status", &self.status)?;
         st.serialize_field("outcome", &self.outcome)?;
         st.serialize_field("latency_ms", &self.latency.as_millis())?;
+        st.serialize_field("opencode_session_id", &self.opencode_session_id)?;
+        st.serialize_field("opencode_project_id", &self.opencode_project_id)?;
+        st.serialize_field("opencode_request_id", &self.opencode_request_id)?;
+        st.serialize_field("attempts", &self.attempts)?;
         st.end()
     }
 }

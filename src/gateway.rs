@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -15,12 +16,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use chrono::{DateTime, Utc};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use subtle::ConstantTimeEq;
 use tokio_stream::wrappers::ReceiverStream;
 use url::Url;
 
-use crate::audit::{AuditError, AuditOutcome, AuditRecord, Outcome};
+use crate::audit::{
+    AttemptSummaries, AttemptSummary, AttemptTerminalReason, AuditError, AuditOutcome, AuditRecord,
+    Outcome,
+};
 use crate::config::{upstream_api_url, Secret, UpstreamApi, MAX_MODEL_BYTES};
 use crate::pool::{AttemptResult, Failure, KeyPool, UsageDimension};
 use crate::queue::{AdmissionError, AdmissionQueue, Permit};
@@ -149,6 +153,13 @@ pub struct IoTimeouts {
     pub body_read: Duration,
     /// Bound on waiting for upstream response headers after sending.
     pub upstream_header: Duration,
+    /// Bound from upstream response headers to the first complete SSE data
+    /// event. The response remains uncommitted during this phase so another
+    /// key may be attempted safely.
+    pub first_event: Duration,
+    /// Per-event idle bound after the first SSE event has been committed.
+    /// Expiry terminates the stream but never splices in another attempt.
+    pub inter_event: Duration,
     /// Independent bound on reading a retryable/final error body for
     /// classification. The classification prefix must reach the cap or EOF
     /// within this bound; a prefix that stalls is a network failure, never
@@ -157,8 +168,7 @@ pub struct IoTimeouts {
     /// prefix plus the live remainder stream. Also reused as the per-read idle
     /// bound on a committed non-SSE success body: a stalled partial JSON body
     /// is a network failure that ends the response and releases its permit.
-    /// Never applied to SSE reads, so a quiet long-lived SSE connection
-    /// survives indefinitely.
+    /// Never applied to SSE reads; SSE uses the first/inter-event deadlines.
     pub upstream_error_body: Duration,
     /// Per-chunk bound on forwarding a response chunk to a client that has
     /// stopped consuming it. The bounded 16-slot channel lets a slow (or
@@ -166,9 +176,8 @@ pub struct IoTimeouts {
     /// after this budget the send is abandoned: the stream ends, the upstream
     /// is cancelled and the admission permit released. A client that consumes
     /// at least once per budget keeps the stream alive — each completed send
-    /// arms a fresh budget. Never applied to an SSE `upstream.next()` — a quiet
-    /// long-lived SSE connection (upstream silent, client idle) survives
-    /// indefinitely; non-SSE success reads are idle-bounded instead by
+    /// arms a fresh budget. Never applied to an SSE `upstream.next()`; non-SSE
+    /// success reads are idle-bounded instead by
     /// [`IoTimeouts::upstream_error_body`].
     pub response_write: Duration,
 }
@@ -178,6 +187,8 @@ impl Default for IoTimeouts {
         IoTimeouts {
             body_read: Duration::from_secs(30),
             upstream_header: Duration::from_secs(60),
+            first_event: Duration::from_secs(60),
+            inter_event: Duration::from_secs(90),
             upstream_error_body: Duration::from_secs(5),
             response_write: Duration::from_secs(30),
         }
@@ -846,6 +857,34 @@ fn extract_usage(body: &[u8]) -> (Option<u64>, Option<u64>) {
     )
 }
 
+const MAX_AUDIT_ID_BYTES: usize = 256;
+
+#[derive(Debug, Clone, Default)]
+struct RequestAudit {
+    opencode_session_id: Option<String>,
+    opencode_project_id: Option<String>,
+    opencode_request_id: Option<String>,
+    attempts: AttemptSummaries,
+}
+
+impl RequestAudit {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        fn bounded(headers: &HeaderMap, name: &str) -> Option<String> {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| value.len() <= MAX_AUDIT_ID_BYTES)
+                .map(str::to_owned)
+        }
+        Self {
+            opencode_session_id: bounded(headers, "x-opencode-session"),
+            opencode_project_id: bounded(headers, "x-opencode-project"),
+            opencode_request_id: bounded(headers, "x-opencode-request"),
+            attempts: AttemptSummaries::default(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_audit(
     state: &GatewayState,
@@ -857,6 +896,7 @@ fn record_audit(
     status: u16,
     start: tokio::time::Instant,
     outcome: Option<AuditOutcome>,
+    audit: RequestAudit,
 ) {
     let record = AuditRecord {
         timestamp: Utc::now(),
@@ -868,6 +908,10 @@ fn record_audit(
         status,
         outcome,
         latency: start.elapsed(),
+        opencode_session_id: audit.opencode_session_id,
+        opencode_project_id: audit.opencode_project_id,
+        opencode_request_id: audit.opencode_request_id,
+        attempts: audit.attempts,
     };
     let _ = state.audit.record(record);
 }
@@ -882,6 +926,16 @@ fn record_audit_rejected(
     status: u16,
     start: tokio::time::Instant,
 ) {
+    record_audit_rejected_with_context(state, request_id, status, start, RequestAudit::default());
+}
+
+fn record_audit_rejected_with_context(
+    state: &GatewayState,
+    request_id: &str,
+    status: u16,
+    start: tokio::time::Instant,
+    audit: RequestAudit,
+) {
     let record = AuditRecord {
         timestamp: Utc::now(),
         request_id: request_id.to_string(),
@@ -892,6 +946,10 @@ fn record_audit_rejected(
         status,
         outcome: None,
         latency: start.elapsed(),
+        opencode_session_id: audit.opencode_session_id,
+        opencode_project_id: audit.opencode_project_id,
+        opencode_request_id: audit.opencode_request_id,
+        attempts: audit.attempts,
     };
     let _ = state.audit.record(record);
 }
@@ -910,17 +968,19 @@ async fn responses(State(state): State<Arc<GatewayState>>, req: Request<Body>) -
 
 async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: UpstreamApi) -> Response {
     let start = tokio::time::Instant::now();
+    let mut request_audit = RequestAudit::from_headers(req.headers());
     if let Err(resp) = check_proxy_auth(&state, req.headers(), api) {
         // A rejected request is still audited exactly once. Only headers are
         // inspected for auth — the request body is never read — so model, key
         // and usage are unknown and recorded as JSON `null`; no secret or body
         // content can leak into the line.
         let request_id = request_id_for(req.headers());
-        record_audit_rejected(
+        record_audit_rejected_with_context(
             &state,
             &request_id,
             StatusCode::UNAUTHORIZED.as_u16(),
             start,
+            request_audit,
         );
         return resp;
     }
@@ -931,11 +991,12 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
             // The request was rejected before any key/model was resolved
             // (e.g. admission queue full): still audit it, with model, key and
             // usage unknown (null).
-            record_audit_rejected(
+            record_audit_rejected_with_context(
                 &state,
                 &request_id,
                 StatusCode::SERVICE_UNAVAILABLE.as_u16(),
                 start,
+                request_audit,
             );
             return queue_error_response(e);
         }
@@ -944,11 +1005,12 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
     // rotation. Revalidate after admission, immediately before taking the
     // runtime/key snapshot and reading the body.
     if let Err(resp) = check_proxy_auth(&state, req.headers(), api) {
-        record_audit_rejected(
+        record_audit_rejected_with_context(
             &state,
             &request_id,
             StatusCode::UNAUTHORIZED.as_u16(),
             start,
+            request_audit,
         );
         return resp;
     }
@@ -974,11 +1036,12 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
     {
         Ok(Ok(ok)) => ok,
         Ok(Err(BodyReadError::TooLarge)) => {
-            record_audit_rejected(
+            record_audit_rejected_with_context(
                 &state,
                 &request_id,
                 StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
                 start,
+                request_audit,
             );
             return openai_error(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -988,7 +1051,13 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
             );
         }
         Ok(Err(BodyReadError::Invalid)) => {
-            record_audit_rejected(&state, &request_id, StatusCode::BAD_REQUEST.as_u16(), start);
+            record_audit_rejected_with_context(
+                &state,
+                &request_id,
+                StatusCode::BAD_REQUEST.as_u16(),
+                start,
+                request_audit,
+            );
             return openai_error(
                 StatusCode::BAD_REQUEST,
                 "Invalid request body",
@@ -999,17 +1068,24 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
         Err(_) => {
             // Stalled client upload: bound the read, release the permit (dropped
             // on return) and tell the client to retry later.
-            record_audit_rejected(
+            record_audit_rejected_with_context(
                 &state,
                 &request_id,
                 StatusCode::SERVICE_UNAVAILABLE.as_u16(),
                 start,
+                request_audit,
             );
             return service_unavailable(Some(1));
         }
     };
     let Some(model) = extract_model(&body_bytes) else {
-        record_audit_rejected(&state, &request_id, StatusCode::BAD_REQUEST.as_u16(), start);
+        record_audit_rejected_with_context(
+            &state,
+            &request_id,
+            StatusCode::BAD_REQUEST.as_u16(),
+            start,
+            request_audit,
+        );
         return openai_error(
             StatusCode::BAD_REQUEST,
             "Model must be one of the configured models",
@@ -1018,7 +1094,13 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
         );
     };
     if model.len() > MAX_MODEL_BYTES || !rt.models.iter().any(|allowed| allowed == &model) {
-        record_audit_rejected(&state, &request_id, StatusCode::BAD_REQUEST.as_u16(), start);
+        record_audit_rejected_with_context(
+            &state,
+            &request_id,
+            StatusCode::BAD_REQUEST.as_u16(),
+            start,
+            request_audit,
+        );
         return openai_error(
             StatusCode::BAD_REQUEST,
             "Model must be one of the configured models",
@@ -1026,6 +1108,7 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
             Some("invalid_model"),
         );
     }
+    attempts.set_model(model.clone());
 
     let mut last_response: Option<(ConsumedResponse, String)> = None;
     let final_outcome = loop {
@@ -1046,6 +1129,14 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
             AttemptResult::Exhausted => break FinalOutcome::LastResponse(last_response),
         };
         let fingerprint = sel.fingerprint().to_string();
+        if let Some(previous) = request_audit.attempts.last_mut() {
+            if previous.precommit && previous.failover_target.is_none() {
+                previous.failover_target = Some(fingerprint.clone());
+            }
+        }
+        let attempt_number = u8::try_from(request_audit.attempts.len() + 1)
+            .expect("the pool permits at most two attempts");
+        let attempt_start = tokio::time::Instant::now();
         // Bound only the send-to-headers phase. The timeout future is dropped
         // when it elapses, cancelling the attempt; the response body (SSE) is
         // never bounded here, so a long stream is not affected.
@@ -1065,6 +1156,12 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
         {
             Ok(res) => res,
             Err(_) => {
+                request_audit.attempts.push(new_attempt_summary(
+                    attempt_number,
+                    fingerprint.clone(),
+                    None,
+                    AttemptTerminalReason::ResponseHeaderTimeout,
+                ));
                 // The upstream accepted the connection but never produced
                 // response headers within the bound: classify as a network
                 // failure and let the pool fail over to another key.
@@ -1074,6 +1171,12 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
         };
         match resp {
             Ok(resp) => {
+                request_audit.attempts.push(new_attempt_summary(
+                    attempt_number,
+                    fingerprint.clone(),
+                    Some(attempt_start.elapsed()),
+                    AttemptTerminalReason::RetryableResponse,
+                ));
                 let status = resp.status();
                 if status == StatusCode::TOO_MANY_REQUESTS {
                     // The status is already committed, so however the error body
@@ -1084,23 +1187,29 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
                         .headers()
                         .get("retry-after")
                         .and_then(|v| parse_retry_after(v, SystemTime::now()));
-                    let consumed =
-                        match consume_classify_body(resp, state.timeouts.upstream_error_body).await
-                        {
-                            Ok(c) => c,
-                            Err(()) => {
-                                // The error body stalled or errored before
-                                // classification could complete: discard the
-                                // partial body (never passed to the client),
-                                // cool the key as RateLimited with the parsed
-                                // Retry-After (else normal backoff) and fail
-                                // over. The circuit breaker is untouched.
-                                state
-                                    .pool
-                                    .report_failure(&sel, Failure::RateLimited { retry_after });
-                                continue;
-                            }
-                        };
+                    let consumed = match consume_classify_body(
+                        resp,
+                        state.timeouts.upstream_error_body,
+                        attempt_start,
+                        start,
+                    )
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(()) => {
+                            // The error body stalled or errored before
+                            // classification could complete: discard the
+                            // partial body (never passed to the client),
+                            // cool the key as RateLimited with the parsed
+                            // Retry-After (else normal backoff) and fail
+                            // over. The circuit breaker is untouched.
+                            state
+                                .pool
+                                .report_failure(&sel, Failure::RateLimited { retry_after });
+                            continue;
+                        }
+                    };
+                    observe_consumed_error(request_audit.attempts.last_mut(), &consumed);
                     let failure = match classify_error_body(&consumed.body) {
                         RateLimitKind::UsageLimit {
                             dimension,
@@ -1125,17 +1234,23 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
                         .headers()
                         .get("retry-after")
                         .and_then(|v| parse_retry_after(v, SystemTime::now()));
-                    let consumed =
-                        match consume_classify_body(resp, state.timeouts.upstream_error_body).await
-                        {
-                            Ok(c) => c,
-                            Err(()) => {
-                                state
-                                    .pool
-                                    .report_failure(&sel, Failure::Unavailable { retry_after });
-                                continue;
-                            }
-                        };
+                    let consumed = match consume_classify_body(
+                        resp,
+                        state.timeouts.upstream_error_body,
+                        attempt_start,
+                        start,
+                    )
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(()) => {
+                            state
+                                .pool
+                                .report_failure(&sel, Failure::Unavailable { retry_after });
+                            continue;
+                        }
+                    };
+                    observe_consumed_error(request_audit.attempts.last_mut(), &consumed);
                     state
                         .pool
                         .report_failure(&sel, Failure::Unavailable { retry_after });
@@ -1143,30 +1258,80 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
                     continue;
                 }
                 if status.is_server_error() {
-                    let consumed =
-                        match consume_classify_body(resp, state.timeouts.upstream_error_body).await
-                        {
-                            Ok(c) => c,
-                            Err(()) => {
-                                // The upstream already committed a 5xx response head:
-                                // a stalled/errored error-body read is NOT a pre-status
-                                // network failure, so the key is neither cooled nor
-                                // circuit-broken (a retry may still fail over).
-                                state.pool.report_failure(&sel, Failure::Server);
-                                continue;
-                            }
-                        };
+                    let consumed = match consume_classify_body(
+                        resp,
+                        state.timeouts.upstream_error_body,
+                        attempt_start,
+                        start,
+                    )
+                    .await
+                    {
+                        Ok(c) => c,
+                        Err(()) => {
+                            // The upstream already committed a 5xx response head:
+                            // a stalled/errored error-body read is NOT a pre-status
+                            // network failure, so the key is neither cooled nor
+                            // circuit-broken (a retry may still fail over).
+                            state.pool.report_failure(&sel, Failure::Server);
+                            continue;
+                        }
+                    };
+                    observe_consumed_error(request_audit.attempts.last_mut(), &consumed);
                     state.pool.report_failure(&sel, Failure::Server);
                     last_response = Some((consumed, fingerprint));
                     continue;
                 }
-                break FinalOutcome::Forward {
+                let prepared = match prepare_response(
                     resp,
+                    state.timeouts.first_event,
+                    SSE_EVENT_CAP,
+                    attempt_start,
+                )
+                .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(failure) => {
+                        if let Some(summary) = request_audit.attempts.last_mut() {
+                            summary.first_byte_latency = failure.first_byte_latency;
+                            summary.upstream_bytes = failure.upstream_bytes;
+                            summary.upstream_chunks = failure.upstream_chunks;
+                            summary.last_activity_offset = failure.last_activity_offset;
+                            summary.terminal_reason = failure.reason;
+                        }
+                        match failure.reason {
+                            AttemptTerminalReason::NetworkError => {
+                                state.pool.report_failure(&sel, Failure::Network)
+                            }
+                            AttemptTerminalReason::NoFirstEvent
+                            | AttemptTerminalReason::EndBeforeFirstEvent => {
+                                state.pool.report_liveness_failure(&sel, &model)
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                };
+                if let Some(summary) = request_audit.attempts.last_mut() {
+                    summary.first_byte_latency = prepared.first_byte_latency;
+                    summary.first_event_latency = prepared.first_event_latency;
+                    summary.precommit = false;
+                    summary.committed = true;
+                    summary.terminal_reason = AttemptTerminalReason::Forwarded;
+                }
+                break FinalOutcome::Forward {
+                    prepared,
                     fingerprint,
                     sel,
+                    attempt_start,
                 };
             }
             Err(_) => {
+                request_audit.attempts.push(new_attempt_summary(
+                    attempt_number,
+                    fingerprint.clone(),
+                    Some(attempt_start.elapsed()),
+                    AttemptTerminalReason::NetworkError,
+                ));
                 state.pool.report_failure(&sel, Failure::Network);
                 continue;
             }
@@ -1182,21 +1347,23 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
 
     match final_outcome {
         FinalOutcome::Unavailable(retry_after) => {
-            record_audit_rejected(
+            record_audit_rejected_with_context(
                 &state,
                 &request_id,
                 StatusCode::TOO_MANY_REQUESTS.as_u16(),
                 start,
+                request_audit,
             );
             rate_limited(retry_after_secs(retry_after))
         }
         // exhausted with no upstream response at all (only network errors)
         FinalOutcome::LastResponse(None) => {
-            record_audit_rejected(
+            record_audit_rejected_with_context(
                 &state,
                 &request_id,
                 StatusCode::SERVICE_UNAVAILABLE.as_u16(),
                 start,
+                request_audit,
             );
             service_unavailable(Some(1))
         }
@@ -1209,26 +1376,53 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
                 model,
                 fingerprint,
                 start,
+                request_audit,
             )
             .await
         }
         FinalOutcome::Forward {
-            resp,
+            prepared,
             fingerprint,
             sel,
+            attempt_start,
         } => {
             finalize_response(
                 &state,
-                resp,
+                prepared,
                 Some(sel),
                 permit,
                 request_id,
                 model,
                 fingerprint,
                 start,
+                request_audit,
+                attempt_start,
             )
             .await
         }
+    }
+}
+
+fn new_attempt_summary(
+    attempt_number: u8,
+    key_fingerprint: String,
+    response_header_latency: Option<Duration>,
+    terminal_reason: AttemptTerminalReason,
+) -> AttemptSummary {
+    AttemptSummary {
+        attempt_number,
+        key_fingerprint,
+        response_header_latency,
+        first_byte_latency: None,
+        first_event_latency: None,
+        upstream_bytes: 0,
+        upstream_chunks: 0,
+        upstream_events: 0,
+        last_activity_offset: None,
+        precommit: true,
+        committed: false,
+        terminal_reason,
+        failover_target: None,
     }
 }
 
@@ -1236,9 +1430,10 @@ enum FinalOutcome {
     Unavailable(Duration),
     LastResponse(Option<(ConsumedResponse, String)>),
     Forward {
-        resp: reqwest::Response,
+        prepared: PreparedResponse,
         fingerprint: String,
         sel: crate::pool::Selection,
+        attempt_start: tokio::time::Instant,
     },
 }
 
@@ -1250,6 +1445,103 @@ fn is_streaming(resp: &reqwest::Response) -> bool {
         .unwrap_or(false)
 }
 
+type UpstreamByteStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>>;
+
+struct PreparedResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    streaming: bool,
+    upstream: UpstreamByteStream,
+    prefetched: Vec<Bytes>,
+    first_byte_latency: Option<Duration>,
+    first_event_latency: Option<Duration>,
+}
+
+struct PrefetchFailure {
+    reason: AttemptTerminalReason,
+    first_byte_latency: Option<Duration>,
+    upstream_bytes: u64,
+    upstream_chunks: u64,
+    last_activity_offset: Option<Duration>,
+}
+
+async fn prepare_response(
+    resp: reqwest::Response,
+    first_event_timeout: Duration,
+    buffer_cap: usize,
+    attempt_start: tokio::time::Instant,
+) -> Result<PreparedResponse, PrefetchFailure> {
+    let status = resp.status();
+    let headers = filter_response_headers(resp.headers());
+    let streaming = is_streaming(&resp);
+    let mut upstream: UpstreamByteStream = Box::pin(resp.bytes_stream());
+    if !streaming {
+        return Ok(PreparedResponse {
+            status,
+            headers,
+            streaming,
+            upstream,
+            prefetched: Vec::new(),
+            first_byte_latency: None,
+            first_event_latency: None,
+        });
+    }
+
+    let mut detector = SseUsageParser::new(buffer_cap);
+    let mut prefetched = Vec::new();
+    let mut total = 0usize;
+    let mut chunks = 0u64;
+    let mut first_byte_latency = None;
+    let read = async {
+        loop {
+            match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    let elapsed = attempt_start.elapsed();
+                    first_byte_latency.get_or_insert(elapsed);
+                    total = total.saturating_add(bytes.len());
+                    chunks = chunks.saturating_add(1);
+                    if total > buffer_cap {
+                        return Err(AttemptTerminalReason::EndBeforeFirstEvent);
+                    }
+                    let events = detector.push(&bytes);
+                    prefetched.push(bytes);
+                    if events > 0 {
+                        return Ok(elapsed);
+                    }
+                }
+                Some(Err(_)) => return Err(AttemptTerminalReason::NetworkError),
+                None => return Err(AttemptTerminalReason::EndBeforeFirstEvent),
+            }
+        }
+    };
+    match tokio::time::timeout(first_event_timeout, read).await {
+        Ok(Ok(first_event_latency)) => Ok(PreparedResponse {
+            status,
+            headers,
+            streaming,
+            upstream,
+            prefetched,
+            first_byte_latency,
+            first_event_latency: Some(first_event_latency),
+        }),
+        Ok(Err(reason)) => Err(PrefetchFailure {
+            reason,
+            first_byte_latency,
+            upstream_bytes: u64::try_from(total).unwrap_or(u64::MAX),
+            upstream_chunks: chunks,
+            last_activity_offset: first_byte_latency,
+        }),
+        Err(_) => Err(PrefetchFailure {
+            reason: AttemptTerminalReason::NoFirstEvent,
+            first_byte_latency,
+            upstream_bytes: u64::try_from(total).unwrap_or(u64::MAX),
+            upstream_chunks: chunks,
+            last_activity_offset: first_byte_latency,
+        }),
+    }
+}
+
 /// A retryable/final upstream error response whose body was consumed during
 /// classification. Status, headers and body are all reconstructable so the
 /// final error is passed through untouched.
@@ -1257,6 +1549,19 @@ struct ConsumedResponse {
     status: StatusCode,
     headers: HeaderMap,
     body: ErrorBody,
+    first_byte_latency: Option<Duration>,
+    upstream_bytes: u64,
+    upstream_chunks: u64,
+    last_activity_offset: Option<Duration>,
+}
+
+fn observe_consumed_error(summary: Option<&mut AttemptSummary>, consumed: &ConsumedResponse) {
+    if let Some(summary) = summary {
+        summary.first_byte_latency = consumed.first_byte_latency;
+        summary.upstream_bytes = consumed.upstream_bytes;
+        summary.upstream_chunks = consumed.upstream_chunks;
+        summary.last_activity_offset = consumed.last_activity_offset;
+    }
 }
 
 /// Result of a bounded classification read of an upstream error body.
@@ -1274,11 +1579,19 @@ enum ErrorBody {
 /// the cap is buffered whole; a body that overruns the cap keeps the unread
 /// remainder is discarded. `Err(())` means a mid-body connection failure; the
 /// partial bytes are also discarded.
-async fn consume_error_response(resp: reqwest::Response) -> Result<ConsumedResponse, ()> {
+async fn consume_error_response(
+    resp: reqwest::Response,
+    attempt_start: tokio::time::Instant,
+    request_start: tokio::time::Instant,
+) -> Result<ConsumedResponse, ()> {
     let status = resp.status();
     let headers = filter_response_headers(resp.headers());
     let mut stream = resp.bytes_stream();
     let mut prefix: Vec<u8> = Vec::with_capacity(ERROR_CLASSIFY_CAP.min(4096));
+    let mut first_byte_latency = None;
+    let mut upstream_bytes = 0u64;
+    let mut upstream_chunks = 0u64;
+    let mut last_activity_offset = None;
     loop {
         let chunk = match stream.next().await {
             Some(Ok(c)) => c,
@@ -1288,9 +1601,19 @@ async fn consume_error_response(resp: reqwest::Response) -> Result<ConsumedRespo
                     status,
                     headers,
                     body: ErrorBody::Buffered(Bytes::from(prefix)),
+                    first_byte_latency,
+                    upstream_bytes,
+                    upstream_chunks,
+                    last_activity_offset,
                 })
             }
         };
+        let now = tokio::time::Instant::now();
+        first_byte_latency.get_or_insert_with(|| now.duration_since(attempt_start));
+        upstream_bytes =
+            upstream_bytes.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        upstream_chunks = upstream_chunks.saturating_add(1);
+        last_activity_offset = Some(now.duration_since(request_start));
         let remaining = ERROR_CLASSIFY_CAP - prefix.len();
         if chunk.len() <= remaining {
             prefix.extend_from_slice(&chunk);
@@ -1300,6 +1623,10 @@ async fn consume_error_response(resp: reqwest::Response) -> Result<ConsumedRespo
                 status,
                 headers,
                 body: ErrorBody::Oversized,
+                first_byte_latency,
+                upstream_bytes,
+                upstream_chunks,
+                last_activity_offset,
             });
         }
     }
@@ -1325,8 +1652,15 @@ fn classify_error_body(body: &ErrorBody) -> RateLimitKind {
 async fn consume_classify_body(
     resp: reqwest::Response,
     timeout: Duration,
+    attempt_start: tokio::time::Instant,
+    request_start: tokio::time::Instant,
 ) -> Result<ConsumedResponse, ()> {
-    match tokio::time::timeout(timeout, consume_error_response(resp)).await {
+    match tokio::time::timeout(
+        timeout,
+        consume_error_response(resp, attempt_start, request_start),
+    )
+    .await
+    {
         Ok(Ok(consumed)) => Ok(consumed),
         Ok(Err(())) | Err(_) => Err(()),
     }
@@ -1346,6 +1680,7 @@ async fn finalize_consumed_error(
     model: String,
     fingerprint: String,
     start: tokio::time::Instant,
+    audit: RequestAudit,
 ) -> Response {
     let status = consumed.status;
     record_audit(
@@ -1358,6 +1693,7 @@ async fn finalize_consumed_error(
         status.as_u16(),
         start,
         None,
+        audit,
     );
     drop(permit);
     let (message, error_type, code) = if status == StatusCode::TOO_MANY_REQUESTS {
@@ -1400,15 +1736,17 @@ async fn finalize_consumed_error(
 #[allow(clippy::too_many_arguments)]
 async fn finalize_response(
     state: &Arc<GatewayState>,
-    resp: reqwest::Response,
+    prepared: PreparedResponse,
     sel: Option<crate::pool::Selection>,
     permit: Permit,
     request_id: String,
     model: String,
     fingerprint: String,
     start: tokio::time::Instant,
+    audit: RequestAudit,
+    attempt_start: tokio::time::Instant,
 ) -> Response {
-    let streaming = is_streaming(&resp);
+    let streaming = prepared.streaming;
     let stream_permit = if streaming {
         match state.stream_slots.clone().try_acquire_owned() {
             Ok(slot) => Some(slot),
@@ -1423,6 +1761,7 @@ async fn finalize_response(
                     StatusCode::SERVICE_UNAVAILABLE.as_u16(),
                     start,
                     None,
+                    RequestAudit::default(),
                 );
                 drop(permit);
                 return service_unavailable(Some(1));
@@ -1438,7 +1777,7 @@ async fn finalize_response(
     };
     stream_response(
         state.clone(),
-        resp,
+        prepared,
         sel,
         permit,
         request_id,
@@ -1447,6 +1786,8 @@ async fn finalize_response(
         start,
         parser,
         stream_permit,
+        audit,
+        attempt_start,
     )
     .await
 }
@@ -1468,7 +1809,7 @@ fn queue_error_response(e: AdmissionError) -> Response {
 #[allow(clippy::too_many_arguments)]
 async fn stream_response(
     state: Arc<GatewayState>,
-    resp: reqwest::Response,
+    prepared: PreparedResponse,
     sel: Option<crate::pool::Selection>,
     permit: Permit,
     request_id: String,
@@ -1477,11 +1818,16 @@ async fn stream_response(
     start: tokio::time::Instant,
     mut parser: StreamUsageParser,
     stream_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    mut audit: RequestAudit,
+    attempt_start: tokio::time::Instant,
 ) -> Response {
-    let status = resp.status();
-    let filtered = filter_response_headers(resp.headers());
-    let streaming = is_streaming(&resp);
-    let upstream = resp.bytes_stream();
+    let status = prepared.status;
+    let filtered = prepared.headers;
+    let streaming = prepared.streaming;
+    let upstream = prepared.upstream;
+    let prefetched = prepared.prefetched;
+    let initial_first_byte_latency = prepared.first_byte_latency;
+    let initial_first_event_latency = prepared.first_event_latency;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let client_gone = Arc::new(tokio::sync::Notify::new());
@@ -1491,21 +1837,44 @@ async fn stream_response(
 
     tokio::spawn(async move {
         let mut upstream = upstream;
-        // A finite non-SSE success body is idle-bounded (reusing
-        // `upstream_error_body`): a stalled partial JSON body cannot hold the
-        // permit and connection forever. SSE stays unbounded so a quiet
-        // long-lived stream keeps working.
-        let idle = (!streaming).then_some(state.timeouts.upstream_error_body);
-        let outcome = tokio::select! {
-            _ = task_gone.notified() => PumpOutcome::ClientCancel,
-            outcome = pump_upstream(
-                idle,
-                state.timeouts.response_write,
+        let idle = if streaming {
+            Some(state.timeouts.inter_event)
+        } else {
+            Some(state.timeouts.upstream_error_body)
+        };
+        let result = tokio::select! {
+            _ = task_gone.notified() => PumpResult::cancelled(),
+            result = pump_upstream(
                 &mut upstream,
                 &tx,
                 &mut parser,
-            ) => outcome,
+                PumpPlan {
+                    idle,
+                    write_budget: state.timeouts.response_write,
+                    attempt_start,
+                    request_start: start,
+                    prefetched,
+                    initial_first_byte_latency,
+                    initial_first_event_latency,
+                    streaming,
+                },
+            ) => result,
         };
+        let outcome = result.outcome;
+        if let Some(summary) = audit.attempts.last_mut() {
+            summary.first_byte_latency = result.metrics.first_byte_latency;
+            summary.first_event_latency = result.metrics.first_event_latency;
+            summary.upstream_bytes = result.metrics.upstream_bytes;
+            summary.upstream_chunks = result.metrics.upstream_chunks;
+            summary.upstream_events = result.metrics.upstream_events;
+            summary.last_activity_offset = result.metrics.last_activity_offset;
+            summary.terminal_reason = match outcome {
+                PumpOutcome::Completed => AttemptTerminalReason::Completed,
+                PumpOutcome::UpstreamError => AttemptTerminalReason::UpstreamError,
+                PumpOutcome::ClientCancel => AttemptTerminalReason::ClientCancel,
+                PumpOutcome::EventIdleTimeout => AttemptTerminalReason::EventIdleTimeout,
+            };
+        }
         // One-time pool feedback decided by the terminal state of the stream:
         // a mid-stream upstream error is a network failure (never a success —
         // the headers are already committed, so there is no retry); a client
@@ -1515,11 +1884,14 @@ async fn stream_response(
                 PumpOutcome::Completed => state.pool.report_success(sel),
                 PumpOutcome::UpstreamError => state.pool.report_failure(sel, Failure::Network),
                 PumpOutcome::ClientCancel => {}
+                PumpOutcome::EventIdleTimeout => state.pool.report_liveness_failure(sel, &model),
             }
         }
         let usage = match outcome {
             PumpOutcome::Completed => parser.usage(),
-            PumpOutcome::UpstreamError | PumpOutcome::ClientCancel => None,
+            PumpOutcome::UpstreamError
+            | PumpOutcome::ClientCancel
+            | PumpOutcome::EventIdleTimeout => None,
         };
         let (input, output) = match usage {
             Some((p, c)) => (Some(p), Some(c)),
@@ -1529,6 +1901,7 @@ async fn stream_response(
             PumpOutcome::Completed => Some(AuditOutcome::Completed),
             PumpOutcome::UpstreamError => Some(AuditOutcome::UpstreamError),
             PumpOutcome::ClientCancel => Some(AuditOutcome::ClientCancel),
+            PumpOutcome::EventIdleTimeout => Some(AuditOutcome::EventIdleTimeout),
         };
         record_audit(
             &state,
@@ -1540,6 +1913,7 @@ async fn stream_response(
             status_u16,
             start,
             audit_outcome,
+            audit,
         );
         drop(stream_permit);
         drop(permit);
@@ -1581,6 +1955,34 @@ enum PumpOutcome {
     /// the audit schema's perspective, so the same `client_cancel` terminal
     /// state is reused): no pool feedback either way.
     ClientCancel,
+    /// A complete event was already committed, then no next event arrived in
+    /// the configured window. The stream ends without failover.
+    EventIdleTimeout,
+}
+
+#[derive(Debug, Default)]
+struct PumpMetrics {
+    first_byte_latency: Option<Duration>,
+    first_event_latency: Option<Duration>,
+    upstream_bytes: u64,
+    upstream_chunks: u64,
+    upstream_events: u64,
+    last_activity_offset: Option<Duration>,
+}
+
+#[derive(Debug)]
+struct PumpResult {
+    outcome: PumpOutcome,
+    metrics: PumpMetrics,
+}
+
+impl PumpResult {
+    fn cancelled() -> Self {
+        Self {
+            outcome: PumpOutcome::ClientCancel,
+            metrics: PumpMetrics::default(),
+        }
+    }
 }
 
 /// Offer one response chunk to the client channel under [`IoTimeouts::response_write`].
@@ -1599,36 +2001,108 @@ async fn send_with_timeout(
     )
 }
 
-async fn pump_upstream(
+struct PumpPlan {
     idle: Option<Duration>,
     write_budget: Duration,
+    attempt_start: tokio::time::Instant,
+    request_start: tokio::time::Instant,
+    prefetched: Vec<Bytes>,
+    initial_first_byte_latency: Option<Duration>,
+    initial_first_event_latency: Option<Duration>,
+    streaming: bool,
+}
+
+async fn pump_upstream(
     upstream: &mut (impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin),
     tx: &tokio::sync::mpsc::Sender<Bytes>,
     parser: &mut StreamUsageParser,
-) -> PumpOutcome {
+    plan: PumpPlan,
+) -> PumpResult {
+    let PumpPlan {
+        idle,
+        write_budget,
+        attempt_start,
+        request_start,
+        prefetched,
+        initial_first_byte_latency,
+        initial_first_event_latency,
+        streaming,
+    } = plan;
+    let mut metrics = PumpMetrics {
+        first_byte_latency: initial_first_byte_latency,
+        first_event_latency: initial_first_event_latency,
+        ..PumpMetrics::default()
+    };
+    for bytes in prefetched {
+        metrics.upstream_bytes = metrics
+            .upstream_bytes
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        metrics.upstream_chunks = metrics.upstream_chunks.saturating_add(1);
+        metrics.last_activity_offset = Some(request_start.elapsed());
+        metrics.upstream_events = metrics.upstream_events.saturating_add(parser.push(&bytes));
+        if !send_with_timeout(tx, bytes, write_budget).await {
+            return PumpResult {
+                outcome: PumpOutcome::ClientCancel,
+                metrics,
+            };
+        }
+    }
     loop {
         let next = match idle {
             Some(idle) => match tokio::time::timeout(idle, upstream.next()).await {
                 // A finite, content-length-delimited non-SSE body that stalls
                 // mid-body is a network failure, never a success: the body can
                 // never complete, so the key is failed and the stream ends.
-                Err(_) => return PumpOutcome::UpstreamError,
+                Err(_) => {
+                    return PumpResult {
+                        outcome: if streaming {
+                            PumpOutcome::EventIdleTimeout
+                        } else {
+                            PumpOutcome::UpstreamError
+                        },
+                        metrics,
+                    }
+                }
                 Ok(r) => r,
             },
             None => upstream.next().await,
         };
         match next {
             Some(Ok(bytes)) => {
-                parser.push(&bytes);
+                let now = tokio::time::Instant::now();
+                metrics
+                    .first_byte_latency
+                    .get_or_insert_with(|| now.duration_since(attempt_start));
+                metrics.upstream_bytes = metrics
+                    .upstream_bytes
+                    .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                metrics.upstream_chunks = metrics.upstream_chunks.saturating_add(1);
+                metrics.last_activity_offset = Some(now.duration_since(request_start));
+                let events = parser.push(&bytes);
+                metrics.upstream_events = metrics.upstream_events.saturating_add(events);
+                if events > 0 && metrics.first_event_latency.is_none() {
+                    metrics.first_event_latency = Some(now.duration_since(attempt_start));
+                }
                 if !send_with_timeout(tx, bytes, write_budget).await {
-                    return PumpOutcome::ClientCancel;
+                    return PumpResult {
+                        outcome: PumpOutcome::ClientCancel,
+                        metrics,
+                    };
                 }
             }
-            Some(Err(_)) => return PumpOutcome::UpstreamError,
+            Some(Err(_)) => {
+                return PumpResult {
+                    outcome: PumpOutcome::UpstreamError,
+                    metrics,
+                }
+            }
             None => break,
         }
     }
-    PumpOutcome::Completed
+    PumpResult {
+        outcome: PumpOutcome::Completed,
+        metrics,
+    }
 }
 
 /// Maximum bytes of one SSE event buffered for usage extraction. An event
@@ -1653,10 +2127,13 @@ enum StreamUsageParser {
 }
 
 impl StreamUsageParser {
-    fn push(&mut self, chunk: &[u8]) {
+    fn push(&mut self, chunk: &[u8]) -> u64 {
         match self {
             StreamUsageParser::Sse(p) => p.push(chunk),
-            StreamUsageParser::Json(p) => p.push(chunk),
+            StreamUsageParser::Json(p) => {
+                p.push(chunk);
+                0
+            }
         }
     }
 
@@ -1726,6 +2203,7 @@ struct SseUsageParser {
     tail_len: usize,
     discarding: bool,
     usage: Option<(u64, u64)>,
+    event_count: u64,
 }
 
 impl SseUsageParser {
@@ -1737,10 +2215,12 @@ impl SseUsageParser {
             tail_len: 0,
             discarding: false,
             usage: None,
+            event_count: 0,
         }
     }
 
-    fn push(&mut self, chunk: &[u8]) {
+    fn push(&mut self, chunk: &[u8]) -> u64 {
+        let before = self.event_count;
         for &b in chunk {
             if self.tail_len == 4 {
                 self.tail.copy_within(1..4, 0);
@@ -1752,8 +2232,8 @@ impl SseUsageParser {
             let tail = &self.tail[..self.tail_len];
             if tail.ends_with(b"\n\n") || tail.ends_with(b"\r\n\r\n") {
                 let event = std::mem::take(&mut self.event_buf);
-                if !self.discarding {
-                    self.consume_event(&event);
+                if !self.discarding && self.consume_event(&event) {
+                    self.event_count = self.event_count.saturating_add(1);
                 }
                 self.discarding = false;
                 self.tail_len = 0;
@@ -1765,9 +2245,10 @@ impl SseUsageParser {
                 }
             }
         }
+        self.event_count - before
     }
 
-    fn consume_event(&mut self, event: &[u8]) {
+    fn consume_event(&mut self, event: &[u8]) -> bool {
         let text = String::from_utf8_lossy(event);
         let data: Vec<&str> = text
             .lines()
@@ -1775,11 +2256,11 @@ impl SseUsageParser {
             .map(str::trim)
             .collect();
         if data.is_empty() {
-            return;
+            return false;
         }
         let payload = data.join("\n");
         if payload == "[DONE]" {
-            return;
+            return true;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
             if let (Some(p), Some(c)) = (
@@ -1789,6 +2270,7 @@ impl SseUsageParser {
                 self.usage = Some((p, c));
             }
         }
+        true
     }
 
     fn usage(&self) -> Option<(u64, u64)> {

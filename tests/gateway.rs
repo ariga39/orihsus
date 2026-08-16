@@ -153,6 +153,181 @@ async fn start_mock(control: Arc<MockControl>) -> std::net::SocketAddr {
     addr
 }
 
+#[tokio::test(start_paused = true)]
+async fn silent_first_sse_attempt_fails_over_before_client_commit() {
+    let control = Arc::new(MockControl::default());
+    let (gate_tx, gate_rx) = tokio::sync::mpsc::channel(1);
+    control.sse.lock().unwrap().replace(SseControl {
+        event1: Vec::new(),
+        event2: b"data: {\"never\":true}\n\n".to_vec(),
+        event2b: None,
+        gate2: gate_rx,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        cancel_notify: Arc::new(tokio::sync::Notify::new()),
+    });
+    control.responses.lock().unwrap().push_back(MockResponse {
+        status: 200,
+        content_type: "text/event-stream",
+        body: b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+            .to_vec(),
+        extra_headers: vec![("x-attempt".to_string(), "second".to_string())],
+    });
+    let addr = start_mock(control.clone()).await;
+    let p = pool(&["key-1", "key-2"]);
+    let q = queue(2, 2, Duration::from_secs(30));
+    let sink = TestSink::default();
+    let app = build_router(state_with_timeouts(
+        &p,
+        &q,
+        &format!("http://{addr}"),
+        sink.clone(),
+        IoTimeouts {
+            first_event: Duration::from_secs(5),
+            ..IoTimeouts::default()
+        },
+    ));
+
+    let task = tokio::spawn(async move { send(&app, chat_req()).await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+    let resp = task.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("x-attempt").unwrap(), "second");
+    let body = body_string(resp).await;
+    assert!(body.contains("\"content\":\"ok\""));
+    assert!(!body.contains("never"));
+
+    let requests = control.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].headers.get("authorization").unwrap(),
+        "Bearer key-1"
+    );
+    assert_eq!(
+        requests[1].headers.get("authorization").unwrap(),
+        "Bearer key-2"
+    );
+    drop(requests);
+    drop(gate_tx);
+
+    let records = sink.0.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    let attempts: Vec<_> = records[0].attempts.iter().collect();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].terminal_reason,
+        orihsus::audit::AttemptTerminalReason::NoFirstEvent
+    );
+    assert_eq!(
+        attempts[0].failover_target.as_deref(),
+        Some(fingerprint("key-2").as_str())
+    );
+    assert_eq!(
+        attempts[1].terminal_reason,
+        orihsus::audit::AttemptTerminalReason::Completed
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn active_reasoning_events_reset_the_inter_event_watchdog() {
+    let control = Arc::new(MockControl::default());
+    let (gate_tx, gate_rx) = tokio::sync::mpsc::channel(1);
+    control.sse.lock().unwrap().replace(SseControl {
+        event1: b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n"
+            .to_vec(),
+        event2: b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"still thinking\"}}]}\n\ndata: [DONE]\n\n"
+            .to_vec(),
+        event2b: None,
+        gate2: gate_rx,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        cancel_notify: Arc::new(tokio::sync::Notify::new()),
+    });
+    let addr = start_mock(control).await;
+    let q = queue(2, 2, Duration::from_secs(30));
+    let app = build_router(state_with_timeouts(
+        &pool(&["key-1"]),
+        &q,
+        &format!("http://{addr}"),
+        TestSink::default(),
+        IoTimeouts {
+            first_event: Duration::from_secs(5),
+            inter_event: Duration::from_secs(5),
+            ..IoTimeouts::default()
+        },
+    ));
+
+    let task = tokio::spawn(async move { send(&app, chat_req()).await });
+    while !task.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let resp = task.await.unwrap();
+    let mut body = resp.into_body();
+    let first = next_data_frame(&mut body).await.unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("thinking"));
+    tokio::time::advance(Duration::from_secs(4)).await;
+    gate_tx.send(()).await.unwrap();
+    let mut rest = Vec::new();
+    while let Some(frame) = next_data_frame(&mut body).await {
+        rest.extend_from_slice(&frame);
+    }
+    assert!(String::from_utf8_lossy(&rest).contains("still thinking"));
+    assert_eq!(q.snapshot().active, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_before_first_event_deadline_does_not_cool_the_key_model_pair() {
+    let control = Arc::new(MockControl::default());
+    let (gate_tx, gate_rx) = tokio::sync::mpsc::channel(1);
+    control.sse.lock().unwrap().replace(SseControl {
+        event1: Vec::new(),
+        event2: b"data: [DONE]\n\n".to_vec(),
+        event2b: None,
+        gate2: gate_rx,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        cancel_notify: Arc::new(tokio::sync::Notify::new()),
+    });
+    control
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(MockResponse::json(
+            200,
+            br#"{"id":"after-cancel","choices":[]}"#,
+        ));
+    let addr = start_mock(control.clone()).await;
+    let p = pool(&["key-1", "key-2"]);
+    let q = queue(2, 2, Duration::from_secs(30));
+    let app = build_router(state_with_timeouts(
+        &p,
+        &q,
+        &format!("http://{addr}"),
+        TestSink::default(),
+        IoTimeouts {
+            first_event: Duration::from_secs(5),
+            ..IoTimeouts::default()
+        },
+    ));
+
+    let app_first = app.clone();
+    let first = tokio::spawn(async move { send(&app_first, chat_req()).await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(4)).await;
+    first.abort();
+    let _ = first.await;
+    drop(gate_tx);
+
+    let resp = send_io(&app, chat_req()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let requests = control.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].headers.get("authorization").unwrap(),
+        "Bearer key-1",
+        "a pre-deadline user cancel must not add liveness cooldown"
+    );
+}
+
 #[derive(Clone, Default)]
 struct TestSink(Arc<Mutex<Vec<AuditRecord>>>);
 
@@ -468,8 +643,9 @@ async fn send(app: &axum::Router, req: Request<Body>) -> axum::response::Respons
 async fn send_io(app: &axum::Router, req: Request<Body>) -> axum::response::Response {
     let app2 = app.clone();
     let handle = tokio::spawn(async move { send(&app2, req).await });
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
+    while !handle.is_finished() {
+        tokio::task::yield_now().await;
+    }
     handle.await.unwrap()
 }
 
@@ -907,6 +1083,27 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
     assert_eq!(r.input_tokens, Some(10));
     assert_eq!(r.output_tokens, Some(20));
     assert_eq!(r.status, 200);
+    assert_eq!(r.opencode_session_id.as_deref(), Some("session-7"));
+    assert_eq!(r.opencode_project_id.as_deref(), Some("project-42"));
+    assert_eq!(r.opencode_request_id.as_deref(), Some("request-9"));
+    let attempts: Vec<_> = r.attempts.iter().collect();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].attempt_number, 1);
+    assert_eq!(attempts[0].key_fingerprint, fingerprint("key-1"));
+    assert!(attempts[0].response_header_latency.is_some());
+    assert!(attempts[0].first_byte_latency.is_some());
+    assert!(attempts[0].first_event_latency.is_none());
+    assert!(attempts[0].upstream_bytes > 0);
+    assert!(attempts[0].upstream_chunks > 0);
+    assert_eq!(attempts[0].upstream_events, 0);
+    assert!(attempts[0].last_activity_offset.is_some());
+    assert!(!attempts[0].precommit);
+    assert!(attempts[0].committed);
+    assert_eq!(
+        attempts[0].terminal_reason,
+        orihsus::audit::AttemptTerminalReason::Completed
+    );
+    assert!(attempts[0].failover_target.is_none());
     drop(records);
 
     let captured = control.requests.lock().unwrap();
@@ -2899,7 +3096,14 @@ async fn start_backpressure_mock(
             "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\n\r\n"
         );
         socket.write_all(head.as_bytes()).await.ok();
-        let chunk = vec![b'x'; 8192];
+        let chunk = if content_type == "text/event-stream" {
+            let mut event = b"data: ".to_vec();
+            event.extend(std::iter::repeat_n(b'x', 8192 - event.len() - 2));
+            event.extend_from_slice(b"\n\n");
+            event
+        } else {
+            vec![b'x'; 8192]
+        };
         for _ in 0..n_chunks {
             let mut piece = format!("{:x}\r\n", chunk.len()).into_bytes();
             piece.extend_from_slice(&chunk);
@@ -5355,16 +5559,16 @@ async fn slow_client_consuming_within_response_write_resets_the_budget() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn quiet_sse_outlives_the_response_write_budget() {
-    // A quiet upstream: one SSE event, then total silence (no EOF) for over a
-    // minute. The write budget wraps only tx.send, never upstream.next(), so the
-    // pump parks on an unbounded upstream read and the long-lived SSE connection
-    // must survive well past response_write — only a client drop ends it.
+async fn quiet_sse_ends_at_the_inter_event_deadline_without_failover() {
+    // A quiet upstream: one SSE event, then total silence. Once response bytes
+    // are committed the gateway may only terminate this stream; it must never
+    // splice in another key's generation.
     let (addr, control) = start_backpressure_mock(1, "text/event-stream").await;
     let q = queue(2, 2, Duration::from_secs(30));
     let sink = TestSink::default();
     let timeouts = IoTimeouts {
         response_write: Duration::from_secs(30),
+        inter_event: Duration::from_secs(60),
         ..IoTimeouts::default()
     };
     let app = build_router(state_with_timeouts(
@@ -5390,26 +5594,23 @@ async fn quiet_sse_outlives_the_response_write_budget() {
         .expect("the single SSE event streams");
     assert_eq!(q.snapshot().active, 1);
 
-    // Silent SSE: no traffic for well past response_write, client stays open.
+    // Silent SSE: the write budget is irrelevant, but the event-idle deadline
+    // terminates the committed stream.
     for _ in 0..7 {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(10)).await;
     }
-    assert_eq!(
-        q.snapshot().active,
-        1,
-        "a quiet SSE stream must survive past the write budget"
-    );
-    assert_eq!(
-        control.closed.load(Ordering::SeqCst),
-        0,
-        "the quiet upstream must not be cancelled"
-    );
-
-    // A client drop still ends it normally.
-    drop(body);
     wait_until_closed(&control, 1).await;
-    assert_eq!(q.snapshot().active, 0, "permit released on client drop");
+    assert_eq!(q.snapshot().active, 0, "permit released on event idle");
+    while next_data_frame(&mut body).await.is_some() {}
+    let records = sink.0.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].outcome, Some(AuditOutcome::EventIdleTimeout));
+    assert_eq!(
+        records[0].attempts.iter().count(),
+        1,
+        "no post-commit retry"
+    );
 }
 
 #[tokio::test(start_paused = true)]

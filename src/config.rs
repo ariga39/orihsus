@@ -71,6 +71,8 @@ const MAX_CONNECTIONS_CEILING: usize = 65_536;
 const DEFAULT_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the upstream may take to produce response headers.
 const DEFAULT_UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_INTER_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
 /// Independent bound on reading a retryable error body for classification.
 const DEFAULT_UPSTREAM_ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-chunk bound on delivering a response to a slow/non-reading client.
@@ -227,9 +229,12 @@ pub struct Server {
     /// many seconds is rejected.
     pub body_read_timeout: Duration,
     /// Bound on waiting for upstream response headers after the request is
-    /// sent; once headers arrive no overall timeout is applied (SSE streams
-    /// run as long as the upstream keeps them open).
+    /// sent. SSE liveness uses the separate first/inter-event deadlines below.
     pub upstream_response_header_timeout: Duration,
+    /// Bound from upstream response headers to the first complete SSE event.
+    pub first_event_timeout: Duration,
+    /// Maximum silence between complete SSE events after downstream commit.
+    pub inter_event_timeout: Duration,
     /// Independent bound on reading a retryable error body (up to the 64KiB
     /// classification cap) so a stalled upstream error cannot hang a request.
     pub upstream_error_body_timeout: Duration,
@@ -596,6 +601,24 @@ impl Config {
                 "server.upstream_response_header_timeout_seconds must be greater than zero".into(),
             ));
         }
+        let first_event_timeout = match server.first_event_timeout_seconds {
+            Some(seconds) => Duration::from_secs(seconds),
+            None => DEFAULT_FIRST_EVENT_TIMEOUT,
+        };
+        if first_event_timeout.is_zero() {
+            return Err(validation(
+                "server.first_event_timeout_seconds must be greater than zero".into(),
+            ));
+        }
+        let inter_event_timeout = match server.inter_event_timeout_seconds {
+            Some(seconds) => Duration::from_secs(seconds),
+            None => DEFAULT_INTER_EVENT_TIMEOUT,
+        };
+        if inter_event_timeout.is_zero() {
+            return Err(validation(
+                "server.inter_event_timeout_seconds must be greater than zero".into(),
+            ));
+        }
         let upstream_error_body_timeout = match server.upstream_error_body_timeout_seconds {
             Some(seconds) => Duration::from_secs(seconds),
             None => DEFAULT_UPSTREAM_ERROR_BODY_TIMEOUT,
@@ -664,6 +687,8 @@ impl Config {
                 max_header_bytes,
                 body_read_timeout,
                 upstream_response_header_timeout,
+                first_event_timeout,
+                inter_event_timeout,
                 upstream_error_body_timeout,
                 response_write_timeout,
                 max_connections,
@@ -751,6 +776,8 @@ struct RawServer {
     max_header_bytes: Option<usize>,
     body_read_timeout_seconds: Option<u64>,
     upstream_response_header_timeout_seconds: Option<u64>,
+    first_event_timeout_seconds: Option<u64>,
+    inter_event_timeout_seconds: Option<u64>,
     upstream_error_body_timeout_seconds: Option<u64>,
     response_write_timeout_seconds: Option<u64>,
     max_connections: Option<usize>,

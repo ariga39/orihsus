@@ -144,9 +144,9 @@ Point OpenAI-compatible clients at `https://api.example.com/v1` and send `Author
 
 ## 6. Logs and rotation
 
-Use `journalctl -u orihsus -f` for process diagnostics and nginx logs for public connection/authentication policy. orihsus audit records are JSONL at the configured path and contain metadata and key fingerprints, never raw credentials or bodies.
+Use `journalctl -u orihsus -f` for process diagnostics and nginx logs for public connection/authentication policy. orihsus audit records are JSONL at the configured path and contain bounded OpenCode session/project/request IDs, final downstream outcome, and up to two per-attempt activity summaries and key fingerprints, never raw credentials or bodies. Correlation fields longer than 256 bytes are omitted.
 
-The installed `deploy/orihsus.logrotate` policy rotates daily or at 100 MiB, retains 14 compressed generations, creates mode-`0600` files, and signals orihsus to reopen the path. Health and readiness probes are intentionally excluded from audit records. For a manual rotation, signal orihsus after moving the file:
+The installed `deploy/orihsus.logrotate` policy is the audit capacity and retention boundary: it rotates daily or at 100 MiB, retains 14 compressed generations, creates mode-`0600` files, and signals orihsus to reopen the path. Health and readiness probes are intentionally excluded from audit records. For a manual rotation, signal orihsus after moving the file:
 
 ```bash
 sudo systemctl kill -s HUP orihsus

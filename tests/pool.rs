@@ -102,6 +102,29 @@ async fn fill_first_selects_the_current_key_for_each_request() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn liveness_failure_is_scoped_to_key_and_model() {
+    let pool = pool(&["key-a", "key-b"]);
+    let mut first = pool.request_for_model("model-a");
+    let selected = expect_selected(first.next().await);
+    assert_eq!(selected.fingerprint(), fingerprint("key-a"));
+    pool.report_liveness_failure(&selected, "model-a");
+
+    let mut same_model = pool.request_for_model("model-a");
+    assert_eq!(
+        expect_selected(same_model.next().await).fingerprint(),
+        fingerprint("key-b"),
+        "the failed key/model pair must be skipped"
+    );
+
+    let mut other_model = pool.request_for_model("model-b");
+    assert_eq!(
+        expect_selected(other_model.next().await).fingerprint(),
+        fingerprint("key-a"),
+        "model-a liveness must not cool model-b on the same key"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 // Superseded 2026-08-13: quota/soft-threshold strategy removed. Success never
 // switches the fill-first key; only failures do.
 async fn success_never_switches_the_fill_first_key() {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
@@ -207,6 +208,7 @@ struct KeyEntry {
     /// lets the claim deadline elapse and the key become eligible again — it
     /// can never wedge forever.
     half_open: bool,
+    liveness_cooling: HashMap<String, tokio::time::Instant>,
 }
 
 impl KeyPool {
@@ -237,6 +239,7 @@ impl KeyPool {
                 backoff_step: 0,
                 last_failure_by: None,
                 half_open: false,
+                liveness_cooling: HashMap::new(),
             })
             .collect();
         Ok(KeyPool {
@@ -272,6 +275,7 @@ impl KeyPool {
                     backoff_step: prev.map_or(0, |e| e.backoff_step),
                     last_failure_by: prev.and_then(|e| e.last_failure_by),
                     half_open: prev.is_some_and(|e| e.half_open),
+                    liveness_cooling: prev.map(|e| e.liveness_cooling.clone()).unwrap_or_default(),
                 }
             })
             .collect();
@@ -400,6 +404,7 @@ pub struct RequestAttempts {
     used: Vec<String>,
     max: usize,
     deadline: tokio::time::Instant,
+    model: Option<String>,
 }
 
 impl KeyPool {
@@ -408,6 +413,14 @@ impl KeyPool {
     /// a request is pinned to the generation that existed when it started, so a
     /// concurrent `replace_keys` can never leak a newly-added key into it.
     pub fn request(&self) -> RequestAttempts {
+        self.request_with_model(None)
+    }
+
+    pub fn request_for_model(&self, model: impl Into<String>) -> RequestAttempts {
+        self.request_with_model(Some(model.into()))
+    }
+
+    fn request_with_model(&self, model: Option<String>) -> RequestAttempts {
         let state = read_state(&self.inner);
         let n = state.entries.len();
         let mut candidates = Vec::with_capacity(n);
@@ -425,7 +438,26 @@ impl KeyPool {
             used: Vec::new(),
             max: self.inner.policy.max_attempts,
             deadline: deadline_after(tokio::time::Instant::now(), self.inner.policy.wait_timeout),
+            model,
         }
+    }
+
+    pub fn report_liveness_failure(&self, selection: &Selection, model: &str) {
+        let mut state = write_state(&self.inner);
+        let Some(entry) = state
+            .entries
+            .iter_mut()
+            .find(|entry| entry.fingerprint == selection.fingerprint)
+        else {
+            return;
+        };
+        entry.liveness_cooling.insert(
+            model.to_string(),
+            deadline_after(
+                tokio::time::Instant::now(),
+                self.inner.policy.backoff_initial,
+            ),
+        );
     }
 
     /// True if at least one key is currently selectable (not cooling).
@@ -605,6 +637,10 @@ fn backoff_at(policy: &PoolPolicy, step: u32) -> Duration {
 }
 
 impl RequestAttempts {
+    pub(crate) fn set_model(&mut self, model: impl Into<String>) {
+        self.model = Some(model.into());
+    }
+
     /// Select another distinct key only if one is available now. Once the
     /// gateway has a committed upstream response, an unrelated key cooldown
     /// must not delay or replace that response.
@@ -680,7 +716,14 @@ impl RequestAttempts {
                 .iter()
                 .find(|e| e.fingerprint == c.fingerprint)
             {
-                Some(e) => !e.cooling_until.is_some_and(|d| d > now),
+                Some(e) => {
+                    !e.cooling_until.is_some_and(|d| d > now)
+                        && !self.model.as_ref().is_some_and(|model| {
+                            e.liveness_cooling
+                                .get(model)
+                                .is_some_and(|deadline| *deadline > now)
+                        })
+                }
                 None => false,
             }
         })?;
@@ -722,11 +765,20 @@ impl RequestAttempts {
         self.candidates
             .iter()
             .filter_map(|c| {
-                state
+                let entry = state
                     .entries
                     .iter()
-                    .find(|e| e.fingerprint == c.fingerprint)?
-                    .cooling_until
+                    .find(|e| e.fingerprint == c.fingerprint)?;
+                let model_deadline = self
+                    .model
+                    .as_ref()
+                    .and_then(|model| entry.liveness_cooling.get(model).copied());
+                match (entry.cooling_until, model_deadline) {
+                    (Some(global), Some(model)) => Some(global.max(model)),
+                    (Some(global), None) => Some(global),
+                    (None, Some(model)) => Some(model),
+                    (None, None) => None,
+                }
             })
             .filter(|d| *d > now)
             .min()

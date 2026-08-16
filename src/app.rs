@@ -79,6 +79,8 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
     let timeouts = crate::gateway::IoTimeouts {
         body_read: cfg.server.body_read_timeout,
         upstream_header: cfg.server.upstream_response_header_timeout,
+        first_event: cfg.server.first_event_timeout,
+        inter_event: cfg.server.inter_event_timeout,
         upstream_error_body: cfg.server.upstream_error_body_timeout,
         response_write: cfg.server.response_write_timeout,
     };

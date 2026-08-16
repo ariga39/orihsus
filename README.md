@@ -8,7 +8,7 @@ A lightweight OpenAI-compatible gateway for OpenCode Go that rotates multiple su
 - Uses a fill-first key pool. `GoUsageLimitError` cools a key by quota dimension, while ordinary 429 responses use `Retry-After` or exponential backoff.
 - Tries at most two keys per request. Retryable upstream errors become sanitized OpenAI-compatible JSON; upstream bodies and metadata are never exposed.
 - Enforces gateway bearer authentication, header-read timeouts, and a maximum header size; nginx terminates public TLS and HTTP/2.
-- Writes JSONL audit records with token counts. Keys are represented only by the first 12 hexadecimal characters of a SHA-256 fingerprint.
+- Writes JSONL audit records with OpenCode session/project/request IDs, token counts, and bounded per-attempt streaming telemetry. Keys are represented only by the first 12 hexadecimal characters of a SHA-256 fingerprint.
 - Hot-reloads tokens, keys, and models. When no manual model list is configured, the allowlist is refreshed from OpenCode Go at startup and hourly thereafter.
 - Bounds concurrency, queued requests, request bodies, model names, SSE streams, error classification, and the audit queue.
 
@@ -59,12 +59,16 @@ Configuration values are scalar strings or numbers. Durations are integer second
 | `server.max_connections` | integer | no | `1024` | Simultaneous accepted TCP connections; at most `65536`. |
 | `server.body_read_timeout_seconds` | integer | no | `30` | Deadline for reading an entire client request body. |
 | `server.upstream_response_header_timeout_seconds` | integer | no | `60` | Deadline from sending upstream request to receiving response headers. |
+| `server.first_event_timeout_seconds` | integer | no | `60` | Deadline from upstream headers to the first complete SSE `data:` event. Before this event the response is uncommitted and may fail over. |
+| `server.inter_event_timeout_seconds` | integer | no | `90` | Maximum silence between complete SSE events after commit; expiry terminates the stream without failover. |
 | `server.upstream_error_body_timeout_seconds` | integer | no | `5` | Deadline for reading a retryable error body for classification. |
 | `server.response_write_timeout_seconds` | integer | no | `30` | Per-chunk deadline when forwarding a response to a slow client. |
 
 `key_failure_handling` configures what happens when the currently selected upstream key fails. Ordinary failures use exponential backoff; repeated failures open that key's circuit breaker; `max_attempts` controls whether the same client request may fail over to one other key. It does not configure scheduled key replacement.
 
 Only `gateway_token` and `keys` are required. Omitted optional sections use the defaults above. Before the first successful automatic refresh, the service retains `deepseek-chat` as a fail-safe allowlist. Listener, limits, key-failure handling, usage, audit, and server changes require restart. The upstream is fixed at `https://opencode.ai/zen/go/`; any `upstream` or `base_url` configuration is rejected. Only the fixed `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and authenticated `/v1/usage` upstream paths can receive subscription keys; model synchronization uses unauthenticated `GET /v1/models`, while the gateway's own `/v1/models` remains local. Request and successful response bodies are forwarded unchanged; clients must choose the protocol endpoint matching their model.
+
+For SSE, orihsus buffers raw upstream bytes only until the first complete `data:` event (bounded by 256 KiB). A timeout, connection failure, or EOF in that precommit window may use the second configured attempt; the client sees only the winning attempt. After the first event is committed, orihsus never splices streams or changes keys. An inter-event timeout ends that stream and records a key-and-model-scoped liveness failure.
 
 ## Testing
 

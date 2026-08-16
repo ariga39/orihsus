@@ -23,7 +23,8 @@ This document records the decisions that define the gateway contract.
 ## Logging and accounting
 
 - Emit bounded, non-blocking JSONL audit records from a dedicated writer thread.
-- Record request ID, route, status, latency, token counts when available, outcome, and a truncated SHA-256 key fingerprint.
+- Record request ID, raw bounded OpenCode session/project/request IDs, status, latency, token counts when available, final downstream outcome, and a truncated SHA-256 key fingerprint.
+- Keep at most two attempt summaries per audit line: key fingerprint, header/first-byte/first-event latency, upstream byte/chunk/event activity, commit state, terminal reason, and failover target. Bound each OpenCode correlation header to 256 bytes; omit an oversized value.
 - Never log raw API keys, gateway tokens, authorization headers, or request/response bodies.
 - Allow audit records to be dropped when the bounded queue is full; expose a one-time sanitized warning and counters instead of blocking requests.
 - Reopen the audit file on demand for log rotation, with a bounded acknowledgement wait.
@@ -47,7 +48,9 @@ This document records the decisions that define the gateway contract.
 - Bound active requests, queued requests, total accepted connections, request-body memory, model values (256 bytes and configured allowlist), error-body classification, audit buffering, and SSE streams.
 - Reject a full admission queue immediately with `503` and `Retry-After: 1`; apply a finite queue wait deadline.
 - Reserve body-budget permits before buffering a request body and hold them through upstream request construction.
-- Apply deadlines independently to HTTP header reads, request bodies, upstream response headers, upstream error-body reads, and downstream writes. nginx independently bounds public TLS and client behavior.
+- Apply deadlines independently to HTTP header reads, request bodies, upstream response headers, the first complete SSE event, gaps between committed SSE events, upstream error-body reads, and downstream writes. nginx independently bounds public TLS and client behavior.
+- Treat the first complete SSE `data:` event as the downstream commit point. Preserve every prefetched byte verbatim under a 256 KiB cap; before commit a silent/broken attempt may fail over, while after commit a silent stream is terminated without changing keys or stitching streams.
+- Track no-first-event and committed event-idle failures by `(key, model)`, so one model's liveness does not cool unrelated models. A client cancellation before the first-event deadline is not a key failure.
 - Hold an admission permit until a streamed response reaches EOF, fails, or is cancelled.
 - Give SSE responses a separate cap of one quarter of `max_concurrency` (at least one); reject excess streams with 503 and `Retry-After: 1`.
 - Reap completed connection tasks continuously and bound graceful shutdown even if an audit writer is blocked.
@@ -63,5 +66,5 @@ This document records the decisions that define the gateway contract.
 
 - In-memory key state resets on process restart.
 - A bounded audit queue may lose records under sustained writer failure.
-- Streaming prevents replay after response headers have been committed.
+- Streaming prevents replay after the first complete SSE event has been committed.
 - The fixed-per-request body reservation is simple and safe but can reduce small-body concurrency when `max_body_bytes` is large.

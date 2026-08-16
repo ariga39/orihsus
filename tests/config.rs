@@ -70,6 +70,8 @@ fn minimal_valid_config_yields_defaults() {
         cfg.server.upstream_response_header_timeout,
         Duration::from_secs(60)
     );
+    assert_eq!(cfg.server.first_event_timeout, Duration::from_secs(60));
+    assert_eq!(cfg.server.inter_event_timeout, Duration::from_secs(90));
     assert_eq!(
         cfg.server.upstream_error_body_timeout,
         Duration::from_secs(5)
@@ -191,6 +193,8 @@ server:
   max_header_bytes: 8192
   body_read_timeout_seconds: 20
   upstream_response_header_timeout_seconds: 45
+  first_event_timeout_seconds: 70
+  inter_event_timeout_seconds: 110
   upstream_error_body_timeout_seconds: 7
   response_write_timeout_seconds: 45
   max_connections: 2048
@@ -207,6 +211,8 @@ server:
         cfg.server.upstream_response_header_timeout,
         Duration::from_secs(45)
     );
+    assert_eq!(cfg.server.first_event_timeout, Duration::from_secs(70));
+    assert_eq!(cfg.server.inter_event_timeout, Duration::from_secs(110));
     assert_eq!(
         cfg.server.upstream_error_body_timeout,
         Duration::from_secs(7)

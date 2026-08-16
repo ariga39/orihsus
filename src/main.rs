@@ -769,6 +769,10 @@ mod tests {
             status: 200,
             outcome: None,
             latency: Duration::from_millis(5),
+            opencode_session_id: None,
+            opencode_project_id: None,
+            opencode_request_id: None,
+            attempts: orihsus::audit::AttemptSummaries::default(),
         };
 
         // Success: rotate away the live file and reopen onto the fresh path.
@@ -898,6 +902,10 @@ mod tests {
             status: 503,
             outcome: None,
             latency: Duration::from_millis(5),
+            opencode_session_id: None,
+            opencode_project_id: None,
+            opencode_request_id: None,
+            attempts: orihsus::audit::AttemptSummaries::default(),
         };
         assert_eq!(
             writer.try_record(record()),
@@ -984,6 +992,10 @@ mod tests {
             status: 200,
             outcome: None,
             latency: Duration::from_millis(5),
+            opencode_session_id: None,
+            opencode_project_id: None,
+            opencode_request_id: None,
+            attempts: orihsus::audit::AttemptSummaries::default(),
         };
         assert_eq!(
             writer.try_record(record()),

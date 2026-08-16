@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orihsus::audit::{
-    fingerprint, AuditError, AuditRecord, AuditWriter, Outcome, AUDIT_REOPEN_TIMEOUT,
-    AUDIT_SHUTDOWN_TIMEOUT,
+    fingerprint, AttemptSummaries, AttemptSummary, AttemptTerminalReason, AuditError, AuditRecord,
+    AuditWriter, Outcome, AUDIT_REOPEN_TIMEOUT, AUDIT_SHUTDOWN_TIMEOUT,
 };
 use orihsus::gateway::AuditSink;
 use tempfile::TempDir;
@@ -29,7 +29,59 @@ fn record(id: &str, key: &str, input: Option<u64>, output: Option<u64>) -> Audit
         status: 200,
         outcome: None,
         latency: Duration::from_millis(150),
+        opencode_session_id: None,
+        opencode_project_id: None,
+        opencode_request_id: None,
+        attempts: AttemptSummaries::default(),
     }
+}
+
+#[test]
+fn audit_serializes_bounded_attempt_observations_and_opencode_ids() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("audit.jsonl");
+    let writer = AuditWriter::start(&path, 8).unwrap();
+    let mut rec = record("gateway-request", "key-1", None, None);
+    rec.opencode_session_id = Some("session-7".to_string());
+    rec.opencode_project_id = Some("project-3".to_string());
+    rec.opencode_request_id = Some("message-9".to_string());
+    for number in 1..=3 {
+        rec.attempts.push(AttemptSummary {
+            attempt_number: number,
+            key_fingerprint: format!("fingerprint-{number}"),
+            response_header_latency: Some(Duration::from_millis(10 * u64::from(number))),
+            first_byte_latency: Some(Duration::from_millis(20 * u64::from(number))),
+            first_event_latency: Some(Duration::from_millis(30 * u64::from(number))),
+            upstream_bytes: 100 * u64::from(number),
+            upstream_chunks: u64::from(number),
+            upstream_events: u64::from(number),
+            last_activity_offset: Some(Duration::from_millis(40 * u64::from(number))),
+            precommit: number == 1,
+            committed: number == 2,
+            terminal_reason: AttemptTerminalReason::Completed,
+            failover_target: (number == 1).then(|| "fingerprint-2".to_string()),
+        });
+    }
+    writer.try_record(rec);
+    writer.shutdown().unwrap();
+
+    let content = fs::read_to_string(path).unwrap();
+    let value: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+    assert_eq!(value["opencode_session_id"], "session-7");
+    assert_eq!(value["opencode_project_id"], "project-3");
+    assert_eq!(value["opencode_request_id"], "message-9");
+    assert_eq!(value["attempts"].as_array().unwrap().len(), 2);
+    assert_eq!(value["attempts"][0]["attempt_number"], 1);
+    assert_eq!(value["attempts"][0]["response_header_latency_ms"], 10);
+    assert_eq!(value["attempts"][0]["first_byte_latency_ms"], 20);
+    assert_eq!(value["attempts"][0]["first_event_latency_ms"], 30);
+    assert_eq!(value["attempts"][0]["upstream_bytes"], 100);
+    assert_eq!(value["attempts"][0]["upstream_chunks"], 1);
+    assert_eq!(value["attempts"][0]["upstream_events"], 1);
+    assert_eq!(value["attempts"][0]["last_activity_offset_ms"], 40);
+    assert_eq!(value["attempts"][0]["terminal_reason"], "completed");
+    assert_eq!(value["attempts"][0]["failover_target"], "fingerprint-2");
+    assert_eq!(value["attempts"][1]["attempt_number"], 2);
 }
 
 #[test]
@@ -113,6 +165,10 @@ fn missing_model_and_key_serialize_as_null() {
         status: 503,
         outcome: None,
         latency: Duration::from_millis(5),
+        opencode_session_id: None,
+        opencode_project_id: None,
+        opencode_request_id: None,
+        attempts: AttemptSummaries::default(),
     };
     assert_eq!(writer.try_record(rec), Outcome::Accepted);
     writer.shutdown().unwrap();
