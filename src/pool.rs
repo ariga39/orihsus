@@ -6,6 +6,11 @@ use std::time::Duration;
 use crate::audit::fingerprint;
 use crate::config::Secret;
 
+fn key_suffix(secret: &str) -> String {
+    let suffix: String = secret.chars().rev().take(6).collect();
+    suffix.chars().rev().collect()
+}
+
 /// System seam for backoff jitter. Tests inject a deterministic
 /// implementation; production uses [`UniformJitter`].
 pub trait Jitter: Send + Sync {
@@ -185,7 +190,9 @@ struct PoolState {
 struct KeyEntry {
     key: Secret,
     fingerprint: String,
+    status_id: String,
     cooling_until: Option<tokio::time::Instant>,
+    cooling_reason: Option<CoolingReason>,
     /// Selection id that applied the current `cooling_until`, if any. A success
     /// may only clear a cooldown it applied itself; a stale success from an
     /// older selection must leave a newer cooldown untouched.
@@ -211,6 +218,36 @@ struct KeyEntry {
     liveness_cooling: HashMap<String, tokio::time::Instant>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CoolingReason {
+    ProactiveUsage,
+    UsageLimit,
+    RateLimited,
+    Unavailable,
+    CircuitBreaker,
+}
+
+impl CoolingReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ProactiveUsage => "proactive_usage",
+            Self::UsageLimit => "usage_limit",
+            Self::RateLimited => "rate_limited",
+            Self::Unavailable => "unavailable",
+            Self::CircuitBreaker => "circuit_breaker",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolKeyStatus {
+    pub(crate) usage_fingerprint: String,
+    pub id: String,
+    pub health: &'static str,
+    pub cooling_reason: Option<&'static str>,
+    pub cooling_remaining: Option<Duration>,
+}
+
 impl KeyPool {
     /// Build a pool from a non-empty key list. Keys with identical contents
     /// must have been rejected upstream; they are matched by fingerprint.
@@ -232,8 +269,10 @@ impl KeyPool {
             .into_iter()
             .map(|key| KeyEntry {
                 fingerprint: fingerprint(key.as_str()),
+                status_id: key_suffix(key.as_str()),
                 key,
                 cooling_until: None,
+                cooling_reason: None,
                 cooling_by: None,
                 consecutive_failures: 0,
                 backoff_step: 0,
@@ -268,8 +307,10 @@ impl KeyPool {
                 let prev = old.iter().find(|e| e.fingerprint == fingerprint);
                 KeyEntry {
                     fingerprint,
+                    status_id: key_suffix(key.as_str()),
                     key,
                     cooling_until: prev.and_then(|e| e.cooling_until),
+                    cooling_reason: prev.and_then(|e| e.cooling_reason),
                     cooling_by: prev.and_then(|e| e.cooling_by),
                     consecutive_failures: prev.map_or(0, |e| e.consecutive_failures),
                     backoff_step: prev.map_or(0, |e| e.backoff_step),
@@ -470,6 +511,38 @@ impl KeyPool {
             .any(|e| !e.cooling_until.is_some_and(|d| d > now))
     }
 
+    /// Secret-free, stable snapshot for the authenticated status endpoint.
+    pub fn status_snapshot(&self) -> Vec<PoolKeyStatus> {
+        let state = read_state(&self.inner);
+        let now = tokio::time::Instant::now();
+        let mut keys: Vec<_> = state
+            .entries
+            .iter()
+            .map(|entry| {
+                let remaining = entry
+                    .cooling_until
+                    .filter(|deadline| *deadline > now)
+                    .map(|deadline| deadline.saturating_duration_since(now));
+                PoolKeyStatus {
+                    usage_fingerprint: entry.fingerprint.clone(),
+                    id: entry.status_id.clone(),
+                    health: if remaining.is_some() {
+                        "cooling"
+                    } else {
+                        "healthy"
+                    },
+                    cooling_reason: remaining.and(entry.cooling_reason.map(CoolingReason::as_str)),
+                    cooling_remaining: remaining,
+                }
+            })
+            .collect();
+        keys.sort_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then_with(|| a.usage_fingerprint.cmp(&b.usage_fingerprint))
+        });
+        keys
+    }
+
     /// Report a successful request for `selection`: reset failure/backoff state.
     /// Fill-first keeps the current key; only failures advance the cursor. A
     /// success from an older selection never touches state that a newer report
@@ -494,6 +567,7 @@ impl KeyPool {
         entry.backoff_step = 0;
         entry.consecutive_failures = 0;
         entry.cooling_until = None;
+        entry.cooling_reason = None;
         entry.cooling_by = None;
         entry.half_open = false;
         entry.last_failure_by = None;
@@ -525,6 +599,7 @@ impl KeyPool {
             .is_some_and(|existing| existing > deadline)
         {
             entry.cooling_until = Some(deadline);
+            entry.cooling_reason = Some(CoolingReason::ProactiveUsage);
             entry.cooling_by = Some(report_id);
             entry.last_failure_by = Some(report_id);
             advance_cursor(&mut state, now);
@@ -547,12 +622,18 @@ impl KeyPool {
                 let new_deadline = deadline_after(now, cooldown);
                 if !entry.cooling_until.is_some_and(|d| d > new_deadline) {
                     entry.cooling_until = Some(new_deadline);
+                    entry.cooling_reason = Some(CoolingReason::UsageLimit);
                     entry.cooling_by = Some(selection.id);
                     entry.last_failure_by = Some(selection.id);
                     advance_cursor(&mut state, now);
                 }
             }
             Failure::RateLimited { retry_after } | Failure::Unavailable { retry_after } => {
+                let reason = match failure {
+                    Failure::RateLimited { .. } => CoolingReason::RateLimited,
+                    Failure::Unavailable { .. } => CoolingReason::Unavailable,
+                    _ => unreachable!(),
+                };
                 let (cooldown, backed_off) = match retry_after {
                     Some(ra) if ra > Duration::ZERO => (ra, false),
                     _ => {
@@ -575,6 +656,7 @@ impl KeyPool {
                         entry.backoff_step += 1;
                     }
                     entry.cooling_until = Some(new_deadline);
+                    entry.cooling_reason = Some(reason);
                     entry.cooling_by = Some(selection.id);
                     entry.last_failure_by = Some(selection.id);
                     advance_cursor(&mut state, now);
@@ -588,6 +670,7 @@ impl KeyPool {
                     let new_deadline = deadline_after(now, self.inner.policy.breaker_cooldown);
                     if !entry.cooling_until.is_some_and(|d| d > new_deadline) {
                         entry.cooling_until = Some(new_deadline);
+                        entry.cooling_reason = Some(CoolingReason::CircuitBreaker);
                         entry.cooling_by = Some(selection.id);
                         entry.consecutive_failures = 0;
                         entry.half_open = true;
@@ -743,6 +826,7 @@ impl RequestAttempts {
         {
             if entry.half_open {
                 entry.cooling_until = Some(deadline_after(now, self.pool.policy.breaker_cooldown));
+                entry.cooling_reason = Some(CoolingReason::CircuitBreaker);
                 entry.cooling_by = Some(sel.id);
                 // The claim is a cooldown-state change owned by this selection:
                 // record it so a late success from an older probe (whose claim

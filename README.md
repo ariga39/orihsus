@@ -4,7 +4,7 @@ A lightweight OpenAI-compatible gateway for OpenCode Go that rotates multiple su
 
 ## Features
 
-- Transparently proxies `POST /v1/chat/completions`, Anthropic-format `POST /v1/messages`, and Responses-format `POST /v1/responses`, with no protocol conversion. `GET /v1/models` remains local; other routes return 404 or 405.
+- Transparently proxies `POST /v1/chat/completions`, Anthropic-format `POST /v1/messages`, and Responses-format `POST /v1/responses`, with no protocol conversion. Authenticated `GET /v1/models` and `GET /v1/status` remain local; other routes return 404 or 405.
 - Uses a fill-first key pool. `GoUsageLimitError` cools a key by quota dimension, while ordinary 429 responses use `Retry-After` or exponential backoff.
 - Tries at most two keys per request. Retryable upstream errors become sanitized OpenAI-compatible JSON; upstream bodies and metadata are never exposed.
 - Enforces gateway bearer authentication, header-read timeouts, and a maximum header size; nginx terminates public TLS and HTTP/2.
@@ -30,12 +30,12 @@ Production setup, including nginx TLS termination, the dedicated user, systemd s
 
 Run `orihsus --config <path>`; the default path is `/etc/orihsus/config.yaml`, and the file must have mode `0600`. The [example configuration](config.example.yaml) stays short: it contains required values plus the model list that operators commonly decide. The table below is the complete schema.
 
-Configuration values are scalar strings or numbers. Durations are integer seconds and use a `_seconds` suffix; byte capacities are integer bytes and use a `_bytes` suffix. URLs and filesystem paths remain strings. Unknown fields and the old composite-string schema are rejected.
+Durations are integer seconds and use a `_seconds` suffix; byte capacities are integer bytes and use a `_bytes` suffix. URLs and filesystem paths remain strings. Unknown fields and the old composite-string schema are rejected.
 
 | Name | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `gateway_token` | string | yes | — | Gateway client token: Bearer authentication on OpenAI endpoints, or `x-api-key` on `/v1/messages`; must not be blank. Hot-reloadable. |
-| `keys` | list of strings | yes | — | Non-empty, unique upstream key pool. Hot-reloadable. |
+| `keys` | list of strings or `{key, name}` objects | yes | — | Non-empty, unique upstream key pool. `name` is an optional UTF-8 display alias (at most 128 bytes) used only by `/v1/status`; legacy string entries remain supported. Hot-reloadable. |
 | `listen.host` | string (IP) | no | `127.0.0.1` | Loopback IP address. Non-loopback addresses are rejected. |
 | `listen.port` | integer | no | `8080` | Local HTTP port, from 0 through 65535. |
 | `models` | list of strings | no | synchronized | Manual non-empty, unique allowlist; each UTF-8 value is at most 256 bytes. When present it overrides and disables automatic synchronization. Hot-reloadable. |
@@ -71,6 +71,17 @@ Configuration values are scalar strings or numbers. Durations are integer second
 `key_failure_handling` configures what happens when the currently selected upstream key fails. Ordinary failures use exponential backoff; repeated failures open that key's circuit breaker; `max_attempts` controls whether the same client request may fail over to one other key. It does not configure scheduled key replacement.
 
 Only `gateway_token` and `keys` are required. Omitted optional sections use the defaults above. Before the first successful automatic refresh, the service retains `deepseek-chat` as a fail-safe allowlist. Listener, limits, key-failure handling, usage, audit, and server changes require restart. The upstream is fixed at `https://opencode.ai/zen/go/`; any `upstream` or `base_url` configuration is rejected. Only the fixed `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and authenticated `/v1/usage` upstream paths can receive subscription keys; model synchronization uses unauthenticated `GET /v1/models`, while the gateway's own `/v1/models` remains local. Request and successful response bodies are forwarded unchanged; clients must choose the protocol endpoint matching their model.
+
+Keys can be named without changing the legacy syntax:
+
+```yaml
+keys:
+  - key: "sk-..."
+    name: "主key"
+  - "sk-..."
+```
+
+`GET /v1/status` requires the same bearer gateway token as `/v1/models`. It returns each configured key's optional alias, literal last six characters, health/cooling reason and deadline, latest cached rolling/weekly/monthly usage, the sorted model allowlist, and service version/commit/uptime. Keys are sorted by their displayed suffix. The endpoint never returns a complete upstream key or the gateway token; aliases remain status-only and are not added to audit or usage-history records.
 
 Each successful per-key usage response appends one record to `<usage_history_dir>/YYYY-MM-DD.jsonl`, selected by the poll's UTC timestamp. Records contain only the key fingerprint plus `rolling`, `weekly`, and `monthly` status, percent, and reset time; raw keys and monetary estimates are never written. Missing API fields are represented as `null`. Files are not merged or rotated by orihsus. Summarize the last seven UTC days with:
 

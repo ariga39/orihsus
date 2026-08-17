@@ -28,6 +28,7 @@ fn minimal_valid_config_yields_defaults() {
 
     assert_eq!(cfg.gateway_token.as_str(), "gway-secret");
     assert_eq!(cfg.keys, vec![Secret::new("key-1")]);
+    assert!(cfg.key_aliases.is_empty());
     assert_eq!(cfg.listen.ip().to_string(), "127.0.0.1");
     assert_eq!(cfg.listen.port(), 8080);
     assert_eq!(cfg.limits.max_concurrency, 200);
@@ -86,6 +87,39 @@ fn minimal_valid_config_yields_defaults() {
         "default per-chunk response write timeout"
     );
     assert_eq!(cfg.server.max_connections, 1024);
+}
+
+#[test]
+fn keys_accept_legacy_strings_and_named_entries_with_unicode_aliases() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(
+        dir.path(),
+        "named-keys.yaml",
+        r#"
+gateway_token: "gway-secret"
+keys:
+  - key: "sk-secret-7cJPzx"
+    name: "主key"
+  - "sk-secret-AbCd12"
+"#,
+    );
+
+    let cfg = orihsus::config::load(&path).unwrap();
+
+    assert_eq!(
+        cfg.keys,
+        vec![
+            Secret::new("sk-secret-7cJPzx"),
+            Secret::new("sk-secret-AbCd12")
+        ]
+    );
+    assert_eq!(
+        cfg.key_aliases
+            .get(&orihsus::audit::fingerprint("sk-secret-7cJPzx"))
+            .map(String::as_str),
+        Some("主key")
+    );
+    assert_eq!(cfg.key_aliases.len(), 1);
 }
 
 #[test]

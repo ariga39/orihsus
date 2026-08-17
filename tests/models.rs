@@ -11,6 +11,7 @@ fn store(models: &[&str]) -> RuntimeStore {
         gateway_token: Secret::new("gateway-token"),
         base_url: "https://example.test/".parse().unwrap(),
         max_body_bytes: 1024,
+        key_aliases: Default::default(),
         models: models.iter().map(|value| (*value).to_string()).collect(),
     })
 }

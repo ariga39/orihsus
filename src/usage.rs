@@ -1,5 +1,6 @@
 //! Fail-open proactive polling of the OpenCode Go usage endpoint.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,31 +23,63 @@ const HISTORY_WARNING: &str =
     "orihsus: usage history write failed or record dropped; polling remains active";
 
 #[derive(Debug, Clone, serde::Serialize)]
-struct UsageWindowRecord {
-    status: Option<String>,
-    percent: Option<f64>,
+pub struct UsageWindowSnapshot {
+    pub status: Option<String>,
+    pub percent: Option<f64>,
     #[serde(rename = "resetsAt")]
-    resets_at: Option<String>,
+    pub resets_at: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-struct UsageHistoryRecord {
-    timestamp: String,
-    key_fingerprint: String,
-    rolling: UsageWindowRecord,
-    weekly: UsageWindowRecord,
-    monthly: UsageWindowRecord,
+pub struct UsageKeySnapshot {
+    pub timestamp: String,
+    pub key_fingerprint: String,
+    pub rolling: UsageWindowSnapshot,
+    pub weekly: UsageWindowSnapshot,
+    pub monthly: UsageWindowSnapshot,
+}
+
+#[derive(Clone, Default)]
+pub struct UsageSnapshotStore {
+    inner: Arc<std::sync::RwLock<BTreeMap<String, UsageKeySnapshot>>>,
+}
+
+impl UsageSnapshotStore {
+    fn update(&self, snapshot: UsageKeySnapshot) {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(snapshot.key_fingerprint.clone(), snapshot);
+    }
+
+    pub fn get(&self, fingerprint: &str) -> Option<UsageKeySnapshot> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(fingerprint)
+            .cloned()
+    }
+
+    /// Parse and retain a successful usage response for status reporting.
+    #[doc(hidden)]
+    pub fn record_response(&self, body: &[u8], timestamp: DateTime<Utc>, key: &Secret) -> bool {
+        let Some(snapshot) = parse_history_record(body, timestamp, key) else {
+            return false;
+        };
+        self.update(snapshot);
+        true
+    }
 }
 
 #[derive(Clone)]
 pub struct UsageHistorySink {
-    tx: SyncSender<UsageHistoryRecord>,
+    tx: SyncSender<UsageKeySnapshot>,
     dropped: Arc<AtomicU64>,
     warned: Arc<AtomicBool>,
 }
 
 impl UsageHistorySink {
-    fn try_record(&self, record: UsageHistoryRecord) {
+    fn try_record(&self, record: UsageKeySnapshot) {
         if matches!(
             self.tx.try_send(record),
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_))
@@ -130,7 +163,7 @@ impl Drop for UsageHistoryWriter {
     }
 }
 
-fn write_history_record(directory: &Path, record: &UsageHistoryRecord) -> std::io::Result<()> {
+fn write_history_record(directory: &Path, record: &UsageKeySnapshot) -> std::io::Result<()> {
     fs::create_dir_all(directory)?;
     let path = directory.join(format!("{}.jsonl", &record.timestamp[..10]));
     let mut options = OpenOptions::new();
@@ -149,12 +182,12 @@ fn parse_history_record(
     body: &[u8],
     timestamp: DateTime<Utc>,
     key: &Secret,
-) -> Option<UsageHistoryRecord> {
+) -> Option<UsageKeySnapshot> {
     let root: serde_json::Value = serde_json::from_slice(body).ok()?;
     let usage = root.get("usage").unwrap_or(&root);
     let window = |name: &str| {
         let value = usage.get(name);
-        UsageWindowRecord {
+        UsageWindowSnapshot {
             status: value
                 .and_then(|v| v.get("status"))
                 .and_then(serde_json::Value::as_str)
@@ -168,7 +201,7 @@ fn parse_history_record(
                 .map(str::to_owned),
         }
     };
-    Some(UsageHistoryRecord {
+    Some(UsageKeySnapshot {
         timestamp: timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         key_fingerprint: fingerprint(key.as_str()),
         rolling: window("rolling"),
@@ -297,14 +330,16 @@ impl UsageMonitor {
         history_dir: PathBuf,
         keys: Vec<Secret>,
         pool: Arc<KeyPool>,
+        snapshots: UsageSnapshotStore,
     ) -> Result<UsageMonitor, reqwest::Error> {
-        Ok(Self::start_with_history(
+        Ok(Self::start_with_observers(
             config,
             keys,
             pool,
             Arc::new(HttpUsageFetcher::new()?),
             Arc::new(SystemClock),
             Some(UsageHistoryWriter::start(history_dir)),
+            snapshots,
         ))
     }
 
@@ -316,7 +351,15 @@ impl UsageMonitor {
         fetcher: Arc<dyn UsageFetcher>,
         clock: Arc<dyn Clock>,
     ) -> UsageMonitor {
-        Self::start_with_history(config, keys, pool, fetcher, clock, None)
+        Self::start_with_observers(
+            config,
+            keys,
+            pool,
+            fetcher,
+            clock,
+            None,
+            UsageSnapshotStore::default(),
+        )
     }
 
     #[doc(hidden)]
@@ -328,19 +371,43 @@ impl UsageMonitor {
         clock: Arc<dyn Clock>,
         history: Option<UsageHistoryWriter>,
     ) -> UsageMonitor {
+        Self::start_with_observers(
+            config,
+            keys,
+            pool,
+            fetcher,
+            clock,
+            history,
+            UsageSnapshotStore::default(),
+        )
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_observers(
+        config: Usage,
+        keys: Vec<Secret>,
+        pool: Arc<KeyPool>,
+        fetcher: Arc<dyn UsageFetcher>,
+        clock: Arc<dyn Clock>,
+        history: Option<UsageHistoryWriter>,
+        snapshots: UsageSnapshotStore,
+    ) -> UsageMonitor {
         let (keys_tx, mut keys_rx) = tokio::sync::watch::channel(keys);
         let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let history_sink = history.as_ref().map(UsageHistoryWriter::sink);
+        let snapshot_sink = snapshots.clone();
         let worker = tokio::spawn(async move {
             loop {
                 let keys = keys_rx.borrow().clone();
-                Self::poll_once_with_history(
+                Self::poll_once_with_observers(
                     fetcher.as_ref(),
                     clock.as_ref(),
                     config.soft_threshold_percent,
                     &keys,
                     &pool,
                     history_sink.as_ref(),
+                    Some(&snapshot_sink),
                 )
                 .await;
                 tokio::select! {
@@ -387,8 +454,16 @@ impl UsageMonitor {
         keys: &[Secret],
         pool: &Arc<KeyPool>,
     ) {
-        Self::poll_once_with_history(fetcher, clock, soft_threshold_percent, keys, pool, None)
-            .await;
+        Self::poll_once_with_observers(
+            fetcher,
+            clock,
+            soft_threshold_percent,
+            keys,
+            pool,
+            None,
+            None,
+        )
+        .await;
     }
 
     #[doc(hidden)]
@@ -400,6 +475,29 @@ impl UsageMonitor {
         pool: &Arc<KeyPool>,
         history: Option<&UsageHistorySink>,
     ) {
+        Self::poll_once_with_observers(
+            fetcher,
+            clock,
+            soft_threshold_percent,
+            keys,
+            pool,
+            history,
+            None,
+        )
+        .await;
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn poll_once_with_observers(
+        fetcher: &dyn UsageFetcher,
+        clock: &dyn Clock,
+        soft_threshold_percent: f64,
+        keys: &[Secret],
+        pool: &Arc<KeyPool>,
+        history: Option<&UsageHistorySink>,
+        snapshots: Option<&UsageSnapshotStore>,
+    ) {
         let now = clock.now();
         let results = futures_util::future::join_all(
             keys.iter()
@@ -408,9 +506,13 @@ impl UsageMonitor {
         .await;
         for (key, result) in results {
             let Ok(body) = result else { continue };
-            if let (Some(history), Some(record)) = (history, parse_history_record(&body, now, key))
-            {
-                history.try_record(record);
+            if let Some(snapshot) = parse_history_record(&body, now, key) {
+                if let Some(history) = history {
+                    history.try_record(snapshot.clone());
+                }
+                if let Some(snapshots) = snapshots {
+                    snapshots.update(snapshot);
+                }
             }
             let Some(cooldown) = evaluate(&body, now, soft_threshold_percent) else {
                 continue;

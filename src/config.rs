@@ -166,6 +166,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub gateway_token: Secret,
     pub keys: Vec<Secret>,
+    /// Optional display aliases keyed internally by the audit-compatible fingerprint.
+    pub key_aliases: BTreeMap<String, String>,
     /// Current startup/fallback model list, or an explicit manual override.
     pub models: Vec<String>,
     pub model_sync: ModelSync,
@@ -356,14 +358,29 @@ impl Config {
             ));
         }
 
-        let keys = raw.keys.unwrap_or_default();
-        if keys.is_empty() {
+        let raw_keys = raw.keys.unwrap_or_default();
+        if raw_keys.is_empty() {
             return Err(validation("at least one upstream key is required".into()));
         }
-        for k in &keys {
-            if k.trim().is_empty() {
+        let mut keys = Vec::with_capacity(raw_keys.len());
+        let mut key_aliases = BTreeMap::new();
+        for raw_key in raw_keys {
+            let (key, name) = match raw_key {
+                RawKey::Plain(key) => (key, None),
+                RawKey::Named { key, name } => (key, name),
+            };
+            if key.trim().is_empty() {
                 return Err(validation("upstream keys must be non-empty".into()));
             }
+            if let Some(name) = &name {
+                if name.trim().is_empty() || name.len() > 128 {
+                    return Err(validation(
+                        "upstream key names must be non-blank and at most 128 bytes".into(),
+                    ));
+                }
+                key_aliases.insert(crate::audit::fingerprint(&key), name.clone());
+            }
+            keys.push(key);
         }
         let mut seen = std::collections::HashSet::with_capacity(keys.len());
         for k in &keys {
@@ -705,6 +722,7 @@ impl Config {
             listen,
             gateway_token,
             keys,
+            key_aliases,
             models,
             model_sync: ModelSync {
                 enabled: model_sync_enabled,
@@ -755,7 +773,7 @@ impl Config {
 struct RawConfig {
     gateway_token: Option<String>,
     listen: Option<RawListen>,
-    keys: Option<Vec<String>>,
+    keys: Option<Vec<RawKey>>,
     models: Option<Vec<String>>,
     model_sync: Option<RawModelSync>,
     limits: Option<RawLimits>,
@@ -764,6 +782,13 @@ struct RawConfig {
     usage_history_dir: Option<String>,
     audit: Option<RawAudit>,
     server: Option<RawServer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawKey {
+    Plain(String),
+    Named { key: String, name: Option<String> },
 }
 
 #[derive(Debug, Default, Deserialize)]

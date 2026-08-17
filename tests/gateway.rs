@@ -13,8 +13,9 @@ use orihsus::config::{EventTimeouts, Secret};
 use orihsus::gateway::{
     build_router, AuditSink, BodyBudget, GatewayState, IoTimeouts, RuntimeState, RuntimeStore,
 };
-use orihsus::pool::{KeyPool, NoJitter, PoolPolicy};
+use orihsus::pool::{AttemptResult, Failure, KeyPool, NoJitter, PoolPolicy};
 use orihsus::queue::AdmissionQueue;
+use orihsus::usage::UsageSnapshotStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use url::Url;
@@ -714,7 +715,7 @@ async fn health_checks_never_enter_the_audit_queue() {
 #[tokio::test]
 async fn every_client_route_writes_exactly_one_redacted_audit_record() {
     // The per-request audit contract covers non-health client-facing routes:
-    // /v1/models (authed + auth failure), wrong-method fallbacks and unknown paths write
+    // /v1/models and /v1/status (authed + auth failure), wrong-method fallbacks and unknown paths write
     // exactly one redacted record echoing the validated request id and the
     // final status, with model/key/usage null.
     let sink = TestSink::default();
@@ -737,6 +738,9 @@ async fn every_client_route_writes_exactly_one_redacted_audit_record() {
         ("GET", "/v1/models", "rid-models-ok", 200, true),
         ("GET", "/v1/models", "rid-models-401", 401, false),
         ("POST", "/v1/models", "rid-models-405", 405, false),
+        ("GET", "/v1/status", "rid-status-ok", 200, true),
+        ("GET", "/v1/status", "rid-status-401", 401, false),
+        ("POST", "/v1/status", "rid-status-405", 405, false),
         ("GET", "/v1/chat/completions", "rid-chat-405", 405, false),
         ("GET", "/v1/messages", "rid-messages-405", 405, false),
         ("GET", "/v1/responses", "rid-responses-405", 405, false),
@@ -779,6 +783,103 @@ async fn every_client_route_writes_exactly_one_redacted_audit_record() {
         assert_eq!(rec.input_tokens, None, "{rid}: usage must be null");
         assert_eq!(rec.output_tokens, None, "{rid}: usage must be null");
     }
+}
+
+#[tokio::test]
+async fn status_is_authenticated_and_reports_named_key_health_usage_and_metadata() {
+    let named_key = Secret::new("sk-secret-7cJPzx");
+    let plain_key = Secret::new("sk-secret-AbCd12");
+    let p = pool(&[named_key.as_str(), plain_key.as_str()]);
+    let mut attempts = p.request();
+    let selected = match attempts.next().await {
+        AttemptResult::Selected(selected) => selected,
+        other => panic!("expected a selected key, got {other:?}"),
+    };
+    p.report_failure(
+        &selected,
+        Failure::RateLimited {
+            retry_after: Some(Duration::from_secs(60)),
+        },
+    );
+
+    let snapshots = UsageSnapshotStore::default();
+    assert!(snapshots.record_response(
+        br#"{"usage":{"rolling":{"status":"ok","percent":12.5,"resetsAt":"2026-08-17T12:00:00Z"},"weekly":{"status":"ok","percent":34,"resetsAt":"2026-08-18T12:00:00Z"},"monthly":{"status":"ok","percent":56,"resetsAt":"2026-09-01T00:00:00Z"}}}"#,
+        chrono::DateTime::parse_from_rfc3339("2026-08-17T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+        &named_key,
+    ));
+    let runtime = RuntimeStore::new(RuntimeState {
+        gateway_token: Secret::new("gateway-private-token"),
+        base_url: Url::parse("http://127.0.0.1:1").unwrap(),
+        max_body_bytes: 1 << 20,
+        key_aliases: BTreeMap::from([(fingerprint(named_key.as_str()), "主key".to_string())]),
+        models: vec!["z-model".to_string(), "a-model".to_string()],
+    });
+    let state = GatewayState::with_runtime(
+        upstream_client(),
+        runtime,
+        p,
+        queue(2, 2, Duration::from_secs(30)),
+        Arc::new(TestSink::default()),
+        budget_for(1 << 20),
+        IoTimeouts::default(),
+    )
+    .with_usage_snapshots(snapshots);
+    let app = build_router(state);
+
+    let unauthorized = send(
+        &app,
+        Request::builder()
+            .uri("/v1/status")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let response = send(
+        &app,
+        Request::builder()
+            .uri("/v1/status")
+            .header("authorization", "Bearer gateway-private-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let raw = body_string(response).await;
+    assert!(!raw.contains(named_key.as_str()));
+    assert!(!raw.contains(plain_key.as_str()));
+    assert!(!raw.contains("gateway-private-token"));
+    assert!(!raw.contains(&fingerprint(named_key.as_str())));
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(value["keys"]["count"], 2);
+    let items = value["keys"]["items"].as_array().unwrap();
+    assert_eq!(items[0]["id"], "7cJPzx");
+    assert_eq!(items[0]["name"], "主key");
+    assert_eq!(items[0]["health"], "cooling");
+    assert_eq!(items[0]["cooling_reason"], "rate_limited");
+    assert!(items[0]["cooling_until"].is_string());
+    assert_eq!(items[0]["usage"]["rolling"]["percent"], 12.5);
+    assert_eq!(items[0]["usage"]["weekly"]["percent"], 34.0);
+    assert_eq!(
+        items[0]["usage"]["monthly"]["resetsAt"],
+        "2026-09-01T00:00:00Z"
+    );
+    assert_eq!(items[1]["id"], "AbCd12");
+    assert!(items[1]["name"].is_null());
+    assert_eq!(items[1]["health"], "healthy");
+    assert!(items[1]["usage"].is_null());
+    assert_eq!(value["models"]["count"], 2);
+    assert_eq!(
+        value["models"]["allowlist"],
+        serde_json::json!(["a-model", "z-model"])
+    );
+    assert!(value["service"]["version"].is_string());
+    assert!(value["service"]["commit"].is_string());
+    assert!(value["service"]["uptime_seconds"].is_number());
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> axum::response::Response {
@@ -2381,6 +2482,7 @@ async fn queued_request_must_reauthenticate_after_token_rotation() {
         gateway_token: Secret::new("token-old"),
         base_url: Url::parse("http://127.0.0.1:1").unwrap(),
         max_body_bytes: 1 << 20,
+        key_aliases: Default::default(),
         models: vec!["deepseek-chat".to_string()],
     });
     let app = build_router(GatewayState::with_runtime(
@@ -2407,6 +2509,7 @@ async fn queued_request_must_reauthenticate_after_token_rotation() {
         gateway_token: Secret::new("token-new"),
         base_url: Url::parse("http://127.0.0.1:1").unwrap(),
         max_body_bytes: 1 << 20,
+        key_aliases: Default::default(),
         models: vec!["deepseek-chat".to_string()],
     });
     drop(hold);
@@ -4977,6 +5080,7 @@ async fn models_endpoint_reflects_the_hot_reloaded_list() {
         gateway_token: Secret::new("gway-token"),
         base_url: Url::parse("http://127.0.0.1:1").unwrap(),
         max_body_bytes: 1 << 20,
+        key_aliases: Default::default(),
         models: vec!["deepseek-chat".to_string()],
     });
     let queue = queue(2, 2, Duration::from_secs(30));
@@ -5013,6 +5117,7 @@ async fn models_endpoint_reflects_the_hot_reloaded_list() {
         gateway_token: Secret::new("gway-token"),
         base_url: Url::parse("http://127.0.0.1:1").unwrap(),
         max_body_bytes: 1 << 20,
+        key_aliases: Default::default(),
         models: vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
     });
 
@@ -5051,6 +5156,7 @@ async fn hot_reload_updates_new_requests_but_inflight_keeps_old_snapshot() {
         gateway_token: Secret::new("token-old"),
         base_url: Url::parse(&format!("http://{addr_old}")).unwrap(),
         max_body_bytes: 1 << 20,
+        key_aliases: Default::default(),
         models: vec!["deepseek-chat".to_string()],
     });
     let queue = queue(2, 2, Duration::from_secs(30));
@@ -5118,6 +5224,7 @@ data: [DONE]
                 gateway_token: Secret::new("token-new"),
                 base_url: Url::parse(&format!("http://{addr_new}")).unwrap(),
                 max_body_bytes: 1 << 20,
+                key_aliases: Default::default(),
                 models: vec!["deepseek-chat".to_string()],
             },
         )
@@ -5200,6 +5307,7 @@ fn update_with_keys_is_atomic_with_snapshot_and_request() {
         gateway_token: Secret::new("token-A"),
         base_url: Url::parse("https://old.example").unwrap(),
         max_body_bytes: 1 << 20,
+        key_aliases: Default::default(),
         models: vec!["deepseek-chat".to_string()],
     });
 
@@ -5217,6 +5325,7 @@ fn update_with_keys_is_atomic_with_snapshot_and_request() {
                     gateway_token: Secret::new("token-B"),
                     base_url: Url::parse("https://new.example").unwrap(),
                     max_body_bytes: 1 << 20,
+                    key_aliases: Default::default(),
                     models: vec!["deepseek-chat".to_string()],
                 },
                 replaced_tx,
@@ -5263,6 +5372,7 @@ async fn update_between_snapshot_and_first_next_keeps_runtime_and_held_lease_onl
         gateway_token: Secret::new("token-A"),
         base_url: Url::parse("https://old.example").unwrap(),
         max_body_bytes: 1 << 20,
+        key_aliases: Default::default(),
         models: vec!["deepseek-chat".to_string()],
     });
 
@@ -5287,6 +5397,7 @@ async fn update_between_snapshot_and_first_next_keeps_runtime_and_held_lease_onl
                 gateway_token: Secret::new("token-B"),
                 base_url: Url::parse("https://new.example").unwrap(),
                 max_body_bytes: 1 << 20,
+                key_aliases: Default::default(),
                 models: vec!["deepseek-chat".to_string()],
             },
         )

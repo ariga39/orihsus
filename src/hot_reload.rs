@@ -45,6 +45,7 @@ const RELOAD_APPLY_SUMMARY: &str =
 pub struct RuntimeConfigSnapshot {
     pub gateway_token: Secret,
     pub keys: Vec<Secret>,
+    pub key_aliases: std::collections::BTreeMap<String, String>,
     pub models: Vec<String>,
     pub model_sync: config::ModelSync,
     pub limits: config::Limits,
@@ -56,6 +57,7 @@ impl RuntimeConfigSnapshot {
         RuntimeConfigSnapshot {
             gateway_token: cfg.gateway_token.clone(),
             keys: cfg.keys.clone(),
+            key_aliases: cfg.key_aliases.clone(),
             models: cfg.models.clone(),
             model_sync: cfg.model_sync.clone(),
             limits: cfg.limits.clone(),

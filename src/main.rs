@@ -251,6 +251,7 @@ async fn run(cfg: Config, config_path: PathBuf) -> Result<ExitCode, MainError> {
                         base_url: url::Url::parse(orihsus::config::OPENCODE_GO_BASE_URL)
                             .expect("built-in OpenCode Go base URL is valid"),
                         max_body_bytes: snap.limits.max_body_bytes,
+                        key_aliases: snap.key_aliases.clone(),
                         models,
                     },
                 )

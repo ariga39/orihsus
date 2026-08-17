@@ -28,6 +28,7 @@ use crate::audit::{
 use crate::config::{upstream_api_url, EventTimeouts, Secret, UpstreamApi, MAX_MODEL_BYTES};
 use crate::pool::{AttemptResult, Failure, KeyPool, UsageDimension};
 use crate::queue::{AdmissionError, AdmissionQueue, Permit};
+use crate::usage::UsageSnapshotStore;
 
 const HOP_BY_HOP: [&str; 8] = [
     "connection",
@@ -202,6 +203,7 @@ pub struct RuntimeState {
     pub gateway_token: Secret,
     pub base_url: Url,
     pub max_body_bytes: usize,
+    pub key_aliases: BTreeMap<String, String>,
     /// Current model list served by `GET /v1/models`, hot-reloadable.
     pub models: Vec<String>,
 }
@@ -388,6 +390,8 @@ pub struct GatewayState {
     pub(crate) stream_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) timeouts: IoTimeouts,
     pub(crate) model_event_timeouts: BTreeMap<String, EventTimeouts>,
+    pub(crate) usage_snapshots: UsageSnapshotStore,
+    pub(crate) started_at: tokio::time::Instant,
 }
 
 impl GatewayState {
@@ -410,6 +414,7 @@ impl GatewayState {
                 gateway_token,
                 base_url,
                 max_body_bytes,
+                key_aliases: BTreeMap::new(),
                 models,
             }),
             pool,
@@ -443,6 +448,8 @@ impl GatewayState {
             stream_slots: Arc::new(tokio::sync::Semaphore::new(max_streams)),
             timeouts,
             model_event_timeouts: BTreeMap::new(),
+            usage_snapshots: UsageSnapshotStore::default(),
+            started_at: tokio::time::Instant::now(),
         }
     }
 
@@ -451,6 +458,11 @@ impl GatewayState {
         model_event_timeouts: BTreeMap<String, EventTimeouts>,
     ) -> Self {
         self.model_event_timeouts = model_event_timeouts;
+        self
+    }
+
+    pub fn with_usage_snapshots(mut self, snapshots: UsageSnapshotStore) -> Self {
+        self.usage_snapshots = snapshots;
         self
     }
 
@@ -471,6 +483,7 @@ pub fn build_router(state: GatewayState) -> Router {
         .route("/healthz", get(healthz).fallback(method_not_allowed))
         .route("/readyz", get(readyz).fallback(method_not_allowed))
         .route("/v1/models", get(models).fallback(method_not_allowed))
+        .route("/v1/status", get(status).fallback(method_not_allowed))
         .route(
             "/v1/chat/completions",
             post(chat_completions).fallback(method_not_allowed),
@@ -664,6 +677,62 @@ async fn models(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> R
         })
         .collect();
     let body = serde_json::json!({ "object": "list", "data": data });
+    record_audit_rejected(&state, &request_id, StatusCode::OK.as_u16(), start);
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+async fn status(State(state): State<Arc<GatewayState>>, req: Request<Body>) -> Response {
+    let start = tokio::time::Instant::now();
+    let request_id = request_id_for(req.headers());
+    if let Err(resp) = check_auth(&state, req.headers()) {
+        record_audit_rejected(
+            &state,
+            &request_id,
+            StatusCode::UNAUTHORIZED.as_u16(),
+            start,
+        );
+        return resp;
+    }
+
+    let rt = state.runtime.snapshot();
+    let wall_now = Utc::now();
+    let keys: Vec<_> = state
+        .pool
+        .status_snapshot()
+        .into_iter()
+        .map(|key| {
+            let usage = state.usage_snapshots.get(&key.usage_fingerprint);
+            let cooling_until = key.cooling_remaining.and_then(|remaining| {
+                chrono::Duration::from_std(remaining)
+                    .ok()
+                    .map(|duration| (wall_now + duration).to_rfc3339())
+            });
+            serde_json::json!({
+                "id": key.id,
+                "name": rt.key_aliases.get(&key.usage_fingerprint),
+                "health": key.health,
+                "cooling_reason": key.cooling_reason,
+                "cooling_until": cooling_until,
+                "usage_updated_at": usage.as_ref().map(|value| &value.timestamp),
+                "usage": usage.as_ref().map(|value| serde_json::json!({
+                    "rolling": value.rolling,
+                    "weekly": value.weekly,
+                    "monthly": value.monthly,
+                })),
+            })
+        })
+        .collect();
+    let mut models = rt.models.clone();
+    models.sort();
+    let body = serde_json::json!({
+        "keys": { "count": keys.len(), "items": keys },
+        "models": { "count": models.len(), "allowlist": models },
+        "service": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": env!("ORIHSUS_COMMIT_HASH"),
+            "uptime_seconds": state.started_at.elapsed().as_secs(),
+        },
+    });
     record_audit_rejected(&state, &request_id, StatusCode::OK.as_u16(), start);
     (StatusCode::OK, axum::Json(body)).into_response()
 }

@@ -6,7 +6,7 @@ This document records the decisions that define the gateway contract.
 
 - Implement the service in stable Rust with Tokio, Axum, Reqwest, Rustls, Serde, and Tracing.
 - Ship one native binary with no database, container requirement, administrative UI, or metrics endpoint.
-- Expose `POST /v1/chat/completions`, `POST /v1/messages`, `POST /v1/responses`, `GET /v1/models`, `/healthz`, and `/readyz`. Return explicit 404 or 405 responses for everything else. Proxy each request in its native protocol without OpenAI/Anthropic/Responses conversion.
+- Expose `POST /v1/chat/completions`, `POST /v1/messages`, `POST /v1/responses`, authenticated `GET /v1/models` and `GET /v1/status`, `/healthz`, and `/readyz`. Return explicit 404 or 405 responses for everything else. Proxy each request in its native protocol without OpenAI/Anthropic/Responses conversion.
 - Stream SSE and ordinary successful bodies without buffering them completely. Sanitize final upstream 401/403/429/5xx bodies into bounded OpenAI-compatible errors; preserve only a validated `Retry-After` on 429.
 
 ## Key rotation
@@ -19,6 +19,7 @@ This document records the decisions that define the gateway contract.
 - Once an upstream error response has been committed, retry only another key that is available immediately. A different key's existing cooldown must never delay or replace a saved 5xx response with the gateway-level all-keys-cooling 429.
 - When every key is cooling down, wait within a fixed pool budget, then return 429 with a conservative `Retry-After` derived from the earliest recovery. Reserve 503 for gateway capacity, timeout, shutdown, or upstream-transport failures.
 - Poll the OpenCode usage API proactively. A key at or above the configured utilization threshold is cooled until the reported reset time; polling failures do not remove otherwise healthy keys.
+- Accept each configured key as either a legacy string or an object with `key` and an optional UTF-8 `name`. Keep aliases out of audit and usage history. The authenticated status response identifies keys by their literal last six characters plus the optional alias, sorts by that displayed identifier, and joins current pool cooling state with the latest cached usage response.
 
 ## Logging and accounting
 
@@ -35,7 +36,7 @@ This document records the decisions that define the gateway contract.
 - Fix the upstream service root to `https://opencode.ai/zen/go/`; reject every configurable `upstream` or `base_url` field. Construct credential-bearing requests only for the built-in `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and `/v1/usage` paths; serve `/v1/models` locally. This removes the configuration SSRF and key-exfiltration surface, including private, loopback, metadata, query, fragment, and custom-path targets.
 - Serve plaintext HTTP only on loopback and place nginx at the public boundary for TLS, HTTP/2, rate limiting, access logging, and fail2ban.
 - Never follow upstream redirects. Return 3xx responses unchanged so a selected key cannot escape the fixed API-path allowlist, even within the trusted origin.
-- Require bearer authentication before admission control and body buffering on OpenAI-format endpoints. Accept the same gateway token as `x-api-key` on the Anthropic-format messages endpoint, replacing it with the selected upstream key.
+- Require bearer authentication before admission control and body buffering on OpenAI-format endpoints, including `/v1/models` and `/v1/status`. Accept the same gateway token as `x-api-key` on the Anthropic-format messages endpoint, replacing it with the selected upstream key. Status exposes only a key's final six characters and optional operator alias, never a complete upstream key or gateway token.
 - Revalidate endpoint-appropriate authentication after admission so a queued request cannot survive token rotation.
 - Keep YAML as the operator format but parse it with maintained `yaml_serde`; do not depend on unmaintained `serde_yaml` or unsound `serde_yml`.
 - Reject release builds that enable `loadtest-insecure-upstream`; its debug-only client is pinned to the loopback mock and requires synthetic credentials.

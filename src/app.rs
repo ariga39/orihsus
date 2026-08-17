@@ -11,7 +11,7 @@ use crate::gateway::{build_router, BodyBudget, GatewayState, RuntimeState, Runti
 use crate::models::ModelMonitor;
 use crate::pool::{KeyPool, PoolPolicy};
 use crate::queue::AdmissionQueue;
-use crate::usage::UsageMonitor;
+use crate::usage::{UsageMonitor, UsageSnapshotStore};
 
 /// Startup errors. Never echoes keys or tokens.
 #[derive(Debug)]
@@ -70,6 +70,7 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
         base_url: url::Url::parse(crate::config::OPENCODE_GO_BASE_URL)
             .expect("built-in OpenCode Go base URL is valid"),
         max_body_bytes: cfg.limits.max_body_bytes,
+        key_aliases: cfg.key_aliases.clone(),
         models: cfg.models.clone(),
     });
     let audit = Arc::new(
@@ -89,6 +90,7 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
         u32::try_from(cfg.limits.max_body_bytes)
             .expect("config validation caps max_body_bytes at u32::MAX"),
     );
+    let usage_snapshots = UsageSnapshotStore::default();
     let state = GatewayState::with_runtime(
         http,
         runtime.clone(),
@@ -98,13 +100,15 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
         body_budget.clone(),
         timeouts,
     )
-    .with_model_event_timeouts(cfg.server.model_event_timeouts.clone());
+    .with_model_event_timeouts(cfg.server.model_event_timeouts.clone())
+    .with_usage_snapshots(usage_snapshots.clone());
     let router = build_router(state);
     let usage_monitor = UsageMonitor::start(
         cfg.usage.clone(),
         cfg.usage_history_dir.clone(),
         cfg.keys.clone(),
         pool.clone(),
+        usage_snapshots,
     )
     .map_err(BootstrapError::Client)?;
     let model_monitor = ModelMonitor::start(cfg.model_sync.clone(), runtime.clone())
