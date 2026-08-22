@@ -9,7 +9,7 @@ use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use orihsus::audit::{fingerprint, AuditError, AuditOutcome, AuditRecord, AuditWriter, Outcome};
-use orihsus::config::{EventTimeouts, Secret};
+use orihsus::config::{EventTimeouts, GatewayKey, Secret};
 use orihsus::gateway::{
     build_router, AuditSink, BodyBudget, GatewayState, IoTimeouts, RuntimeState, RuntimeStore,
 };
@@ -19,6 +19,13 @@ use orihsus::usage::UsageSnapshotStore;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use url::Url;
+
+fn gateway_keys(token: &str) -> Vec<GatewayKey> {
+    vec![GatewayKey {
+        name: "legacy".into(),
+        token: Secret::new(token),
+    }]
+}
 
 #[derive(Clone, Default)]
 struct MockControl {
@@ -811,7 +818,7 @@ async fn status_is_authenticated_and_reports_named_key_health_usage_and_metadata
         &named_key,
     ));
     let runtime = RuntimeStore::new(RuntimeState {
-        gateway_token: Secret::new("gateway-private-token"),
+        gateway_keys: gateway_keys("gateway-private-token"),
         base_url: Url::parse("http://127.0.0.1:1").unwrap(),
         max_body_bytes: 1 << 20,
         key_aliases: BTreeMap::from([(fingerprint(named_key.as_str()), "主key".to_string())]),
@@ -1207,7 +1214,7 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
 
     control.responses.lock().unwrap().push_back(MockResponse::json(
         200,
-        br#"{"id":"cmpl-1","object":"chat.completion","model":"deepseek-chat","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}"#,
+        br#"{"id":"cmpl-1","object":"chat.completion","model":"deepseek-chat","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":6,"cache_write_tokens":2},"completion_tokens_details":{"reasoning_tokens":3}}}"#,
     ));
 
     let payload = serde_json::json!({
@@ -1331,7 +1338,12 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
         Some(fingerprint("key-1").as_str())
     );
     assert_eq!(r.input_tokens, Some(10));
+    assert_eq!(r.cached_tokens, Some(6));
+    assert_eq!(r.uncached_tokens, Some(4));
+    assert_eq!(r.cache_write_tokens, Some(2));
     assert_eq!(r.output_tokens, Some(20));
+    assert_eq!(r.reasoning_tokens, Some(3));
+    assert_eq!(r.gateway_key.as_deref(), Some("legacy"));
     assert_eq!(r.status, 200);
     assert_eq!(r.opencode_session_id.as_deref(), Some("session-7"));
     assert_eq!(r.opencode_project_id.as_deref(), Some("project-42"));
@@ -1387,6 +1399,76 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
         "unknown fields forwarded byte-for-byte"
     );
     assert!(fwd["tools"].is_array(), "tools forwarded");
+}
+
+#[tokio::test]
+async fn multiple_gateway_keys_authenticate_and_audit_distinct_identities() {
+    let control = Arc::new(MockControl::default());
+    let addr = start_mock(control.clone()).await;
+    let sink = TestSink::default();
+    let upstream_pool = pool(&["key-1"]);
+    let admission = queue(2, 2, Duration::from_secs(30));
+    let runtime = RuntimeStore::new(RuntimeState {
+        gateway_keys: vec![
+            GatewayKey {
+                name: "hermes-main".into(),
+                token: Secret::new("token-main"),
+            },
+            GatewayKey {
+                name: "coding-agent".into(),
+                token: Secret::new("token-code"),
+            },
+        ],
+        base_url: Url::parse(&format!("http://{addr}")).unwrap(),
+        max_body_bytes: 1 << 20,
+        key_aliases: Default::default(),
+        models: vec!["deepseek-chat".into()],
+    });
+    let state = GatewayState::with_runtime(
+        upstream_client(),
+        runtime,
+        upstream_pool,
+        admission,
+        Arc::new(sink.clone()),
+        budget_for(1 << 20),
+        IoTimeouts::default(),
+    );
+    let app = build_router(state);
+    for (token, body) in [
+        (
+            "token-main",
+            br#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":7}}"#.as_slice(),
+        ),
+        (
+            "token-code",
+            br#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"prompt_cache_hit_tokens":3}}"#.as_slice(),
+        ),
+    ] {
+        control.responses.lock().unwrap().push_back(MockResponse::json(
+            200,
+            body,
+        ));
+        let response = send(
+            &app,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(r#"{"model":"deepseek-chat","messages":[]}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = body_string(response).await;
+    }
+    let records = sink.0.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].gateway_key.as_deref(), Some("hermes-main"));
+    assert_eq!(records[0].cached_tokens, Some(7));
+    assert_eq!(records[0].uncached_tokens, Some(3));
+    assert_eq!(records[1].gateway_key.as_deref(), Some("coding-agent"));
+    assert_eq!(records[1].cached_tokens, Some(3));
+    assert_eq!(records[1].uncached_tokens, Some(7));
 }
 
 #[tokio::test]
@@ -2479,7 +2561,7 @@ async fn queued_request_must_reauthenticate_after_token_rotation() {
     let hold = q.acquire().await.unwrap();
     let p = pool(&["key-1"]);
     let runtime = RuntimeStore::new(RuntimeState {
-        gateway_token: Secret::new("token-old"),
+        gateway_keys: gateway_keys("token-old"),
         base_url: Url::parse("http://127.0.0.1:1").unwrap(),
         max_body_bytes: 1 << 20,
         key_aliases: Default::default(),
@@ -2506,7 +2588,7 @@ async fn queued_request_must_reauthenticate_after_token_rotation() {
     }
 
     runtime.update(RuntimeState {
-        gateway_token: Secret::new("token-new"),
+        gateway_keys: gateway_keys("token-new"),
         base_url: Url::parse("http://127.0.0.1:1").unwrap(),
         max_body_bytes: 1 << 20,
         key_aliases: Default::default(),
@@ -5077,7 +5159,7 @@ async fn models_endpoint_reflects_the_hot_reloaded_list() {
     // nothing about the snapshot mutates in place.
     let pool = pool(&["a"]);
     let runtime = RuntimeStore::new(RuntimeState {
-        gateway_token: Secret::new("gway-token"),
+        gateway_keys: gateway_keys("gway-token"),
         base_url: Url::parse("http://127.0.0.1:1").unwrap(),
         max_body_bytes: 1 << 20,
         key_aliases: Default::default(),
@@ -5114,7 +5196,7 @@ async fn models_endpoint_reflects_the_hot_reloaded_list() {
     assert_eq!(models_ids(&app).await, vec!["deepseek-chat"]);
 
     runtime.update(RuntimeState {
-        gateway_token: Secret::new("gway-token"),
+        gateway_keys: gateway_keys("gway-token"),
         base_url: Url::parse("http://127.0.0.1:1").unwrap(),
         max_body_bytes: 1 << 20,
         key_aliases: Default::default(),
@@ -5153,7 +5235,7 @@ async fn hot_reload_updates_new_requests_but_inflight_keeps_old_snapshot() {
         .unwrap(),
     );
     let runtime = RuntimeStore::new(RuntimeState {
-        gateway_token: Secret::new("token-old"),
+        gateway_keys: gateway_keys("token-old"),
         base_url: Url::parse(&format!("http://{addr_old}")).unwrap(),
         max_body_bytes: 1 << 20,
         key_aliases: Default::default(),
@@ -5221,7 +5303,7 @@ data: [DONE]
             &pool,
             vec![Secret::new("key-new")],
             RuntimeState {
-                gateway_token: Secret::new("token-new"),
+                gateway_keys: gateway_keys("token-new"),
                 base_url: Url::parse(&format!("http://{addr_new}")).unwrap(),
                 max_body_bytes: 1 << 20,
                 key_aliases: Default::default(),
@@ -5304,7 +5386,7 @@ fn update_with_keys_is_atomic_with_snapshot_and_request() {
     };
     let pool = Arc::new(KeyPool::new(vec![Secret::new("key-1")], policy).unwrap());
     let store = RuntimeStore::new(RuntimeState {
-        gateway_token: Secret::new("token-A"),
+        gateway_keys: gateway_keys("token-A"),
         base_url: Url::parse("https://old.example").unwrap(),
         max_body_bytes: 1 << 20,
         key_aliases: Default::default(),
@@ -5322,7 +5404,7 @@ fn update_with_keys_is_atomic_with_snapshot_and_request() {
                 &w_pool,
                 vec![Secret::new("key-2")],
                 RuntimeState {
-                    gateway_token: Secret::new("token-B"),
+                    gateway_keys: gateway_keys("token-B"),
                     base_url: Url::parse("https://new.example").unwrap(),
                     max_body_bytes: 1 << 20,
                     key_aliases: Default::default(),
@@ -5341,7 +5423,7 @@ fn update_with_keys_is_atomic_with_snapshot_and_request() {
     let reader = std::thread::spawn(move || {
         let (rt, _attempts) = s_store.snapshot_and_request(&s_pool);
         (
-            rt.gateway_token.as_str().to_string(),
+            rt.gateway_keys[0].token.as_str().to_string(),
             rt.base_url.as_str().to_string(),
         )
     });
@@ -5369,7 +5451,7 @@ async fn update_between_snapshot_and_first_next_keeps_runtime_and_held_lease_onl
 
     let pool = pool(&["key-1", "key-2"]);
     let store = RuntimeStore::new(RuntimeState {
-        gateway_token: Secret::new("token-A"),
+        gateway_keys: gateway_keys("token-A"),
         base_url: Url::parse("https://old.example").unwrap(),
         max_body_bytes: 1 << 20,
         key_aliases: Default::default(),
@@ -5394,7 +5476,7 @@ async fn update_between_snapshot_and_first_next_keeps_runtime_and_held_lease_onl
             &pool,
             vec![Secret::new("key-new-1")],
             RuntimeState {
-                gateway_token: Secret::new("token-B"),
+                gateway_keys: gateway_keys("token-B"),
                 base_url: Url::parse("https://new.example").unwrap(),
                 max_body_bytes: 1 << 20,
                 key_aliases: Default::default(),
@@ -5407,7 +5489,7 @@ async fn update_between_snapshot_and_first_next_keeps_runtime_and_held_lease_onl
     // key that reload has since removed, and its snapshot is immutable.
     assert_eq!(held.key().as_str(), "key-1", "held lease must stay valid");
     assert_eq!(
-        rt_old.gateway_token.as_str(),
+        rt_old.gateway_keys[0].token.as_str(),
         "token-A",
         "the in-flight request's snapshot is atomic: token stays old"
     );
@@ -5420,7 +5502,7 @@ async fn update_between_snapshot_and_first_next_keeps_runtime_and_held_lease_onl
         other => panic!("expected Unavailable, got {other:?}"),
     }
     assert_eq!(
-        rt_paused.gateway_token.as_str(),
+        rt_paused.gateway_keys[0].token.as_str(),
         "token-A",
         "the paused request's snapshot is atomic: token stays old"
     );
@@ -5442,7 +5524,7 @@ async fn update_between_snapshot_and_first_next_keeps_runtime_and_held_lease_onl
         other => panic!("expected Selected, got {other:?}"),
     };
     assert_eq!(sel.key().as_str(), "key-new-1");
-    assert_eq!(rt_new.gateway_token.as_str(), "token-B");
+    assert_eq!(rt_new.gateway_keys[0].token.as_str(), "token-B");
     assert_eq!(rt_new.base_url.as_str(), "https://new.example/");
     assert_eq!(rt_new.models, vec!["deepseek-chat".to_string()]);
 }

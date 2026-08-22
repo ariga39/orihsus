@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 
 use notify::{RecursiveMode, Watcher};
 
-use crate::config::{self, Config, Secret};
+use crate::config::{self, Config, GatewayKey, Secret};
 
 /// Capacity of the bridge from the notify watcher to the async worker. Bounded
 /// so an event storm can never accumulate without limit; a dropped event only
@@ -43,7 +43,7 @@ const RELOAD_APPLY_SUMMARY: &str =
 /// guarded separately.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfigSnapshot {
-    pub gateway_token: Secret,
+    pub gateway_keys: Vec<GatewayKey>,
     pub keys: Vec<Secret>,
     pub key_aliases: std::collections::BTreeMap<String, String>,
     pub models: Vec<String>,
@@ -55,7 +55,7 @@ pub struct RuntimeConfigSnapshot {
 impl RuntimeConfigSnapshot {
     pub fn from_config(cfg: &Config) -> RuntimeConfigSnapshot {
         RuntimeConfigSnapshot {
-            gateway_token: cfg.gateway_token.clone(),
+            gateway_keys: cfg.gateway_keys.clone(),
             keys: cfg.keys.clone(),
             key_aliases: cfg.key_aliases.clone(),
             models: cfg.models.clone(),

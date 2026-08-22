@@ -66,7 +66,7 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
         cfg.limits.queue_wait_timeout,
     ));
     let runtime = RuntimeStore::new(RuntimeState {
-        gateway_token: cfg.gateway_token.clone(),
+        gateway_keys: cfg.gateway_keys.clone(),
         base_url: url::Url::parse(crate::config::OPENCODE_GO_BASE_URL)
             .expect("built-in OpenCode Go base URL is valid"),
         max_body_bytes: cfg.limits.max_body_bytes,
