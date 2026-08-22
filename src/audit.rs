@@ -156,8 +156,13 @@ pub struct AuditRecord {
     pub request_id: String,
     pub model: Option<String>,
     pub key_fingerprint: Option<String>,
+    pub gateway_key: Option<String>,
     pub input_tokens: Option<u64>,
+    pub cached_tokens: Option<u64>,
+    pub uncached_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
     pub status: u16,
     pub outcome: Option<AuditOutcome>,
     pub latency: Duration,
@@ -169,7 +174,7 @@ pub struct AuditRecord {
 
 impl Serialize for AuditRecord {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut st = serializer.serialize_struct("AuditRecord", 13)?;
+        let mut st = serializer.serialize_struct("AuditRecord", 19)?;
         st.serialize_field(
             "timestamp",
             &self
@@ -179,8 +184,13 @@ impl Serialize for AuditRecord {
         st.serialize_field("request_id", &self.request_id)?;
         st.serialize_field("model", &self.model)?;
         st.serialize_field("key_fingerprint", &self.key_fingerprint)?;
+        st.serialize_field("gateway_key", &self.gateway_key)?;
         st.serialize_field("input_tokens", &self.input_tokens)?;
+        st.serialize_field("cached_tokens", &self.cached_tokens)?;
+        st.serialize_field("uncached_tokens", &self.uncached_tokens)?;
+        st.serialize_field("cache_write_tokens", &self.cache_write_tokens)?;
         st.serialize_field("output_tokens", &self.output_tokens)?;
+        st.serialize_field("reasoning_tokens", &self.reasoning_tokens)?;
         st.serialize_field("status", &self.status)?;
         st.serialize_field("outcome", &self.outcome)?;
         st.serialize_field("latency_ms", &self.latency.as_millis())?;
@@ -263,7 +273,7 @@ impl std::error::Error for AuditError {}
 /// open a fresh file and swap to it only once the open succeeds, replying over
 /// a one-shot so the caller can await the swap.
 enum Command {
-    Record(AuditRecord),
+    Record(Box<AuditRecord>),
     Reopen {
         path: PathBuf,
         reply: tokio::sync::oneshot::Sender<Result<(), AuditError>>,
@@ -339,7 +349,7 @@ impl AuditWriter {
             warn_once(&self.drop_warned, DROP_WARNING);
             return Outcome::Dropped;
         };
-        match tx.try_send(Command::Record(record)) {
+        match tx.try_send(Command::Record(Box::new(record))) {
             Ok(()) => Outcome::Accepted,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);

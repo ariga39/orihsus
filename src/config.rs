@@ -164,7 +164,7 @@ fn open_config(path: &Path) -> Result<File, ConfigError> {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen: SocketAddr,
-    pub gateway_token: Secret,
+    pub gateway_keys: Vec<GatewayKey>,
     pub keys: Vec<Secret>,
     /// Optional display aliases keyed internally by the audit-compatible fingerprint.
     pub key_aliases: BTreeMap<String, String>,
@@ -177,6 +177,13 @@ pub struct Config {
     pub usage_history_dir: PathBuf,
     pub audit: Audit,
     pub server: Server,
+}
+
+/// A client credential and its non-secret audit identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayKey {
+    pub name: String,
+    pub token: Secret,
 }
 
 /// Public OpenCode Go model-list synchronization policy.
@@ -341,9 +348,51 @@ impl Config {
             kind: ErrorKind::Validation(msg),
         };
 
-        let gateway_token = match raw.gateway_token {
-            Some(t) if !t.trim().is_empty() => Secret::new(t),
-            _ => return Err(validation("gateway token must be set and non-empty".into())),
+        if raw.gateway_token.is_some() && raw.gateway_keys.is_some() {
+            return Err(validation(
+                "set either gateway_token or gateway_keys, not both".into(),
+            ));
+        }
+        let gateway_keys = if let Some(token) = raw.gateway_token {
+            if token.trim().is_empty() {
+                return Err(validation("gateway token must be non-empty".into()));
+            }
+            vec![GatewayKey {
+                name: "legacy".into(),
+                token: Secret::new(token),
+            }]
+        } else if let Some(entries) = raw.gateway_keys {
+            if entries.is_empty() {
+                return Err(validation("at least one gateway key is required".into()));
+            }
+            let mut names = std::collections::HashSet::with_capacity(entries.len());
+            let mut tokens = std::collections::HashSet::with_capacity(entries.len());
+            let mut keys = Vec::with_capacity(entries.len());
+            for entry in entries {
+                if entry.name.trim().is_empty() || entry.name.len() > 128 {
+                    return Err(validation(
+                        "gateway key names must be non-blank and at most 128 bytes".into(),
+                    ));
+                }
+                if entry.token.trim().is_empty() {
+                    return Err(validation("gateway key tokens must be non-empty".into()));
+                }
+                if !names.insert(entry.name.clone()) {
+                    return Err(validation("gateway key names must be unique".into()));
+                }
+                if !tokens.insert(entry.token.clone()) {
+                    return Err(validation("gateway key tokens must be unique".into()));
+                }
+                keys.push(GatewayKey {
+                    name: entry.name,
+                    token: Secret::new(entry.token),
+                });
+            }
+            keys
+        } else {
+            return Err(validation(
+                "gateway_token or gateway_keys must be set".into(),
+            ));
         };
 
         let listen = raw.listen.unwrap_or_default();
@@ -720,7 +769,7 @@ impl Config {
 
         Ok(Config {
             listen,
-            gateway_token,
+            gateway_keys,
             keys,
             key_aliases,
             models,
@@ -772,6 +821,7 @@ impl Config {
 #[serde(rename_all = "snake_case")]
 struct RawConfig {
     gateway_token: Option<String>,
+    gateway_keys: Option<Vec<RawGatewayKey>>,
     listen: Option<RawListen>,
     keys: Option<Vec<RawKey>>,
     models: Option<Vec<String>>,
@@ -782,6 +832,13 @@ struct RawConfig {
     usage_history_dir: Option<String>,
     audit: Option<RawAudit>,
     server: Option<RawServer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGatewayKey {
+    name: String,
+    token: String,
 }
 
 #[derive(Debug, Deserialize)]

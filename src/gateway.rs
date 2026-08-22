@@ -25,7 +25,9 @@ use crate::audit::{
     AttemptSummaries, AttemptSummary, AttemptTerminalReason, AuditError, AuditOutcome, AuditRecord,
     Outcome,
 };
-use crate::config::{upstream_api_url, EventTimeouts, Secret, UpstreamApi, MAX_MODEL_BYTES};
+use crate::config::{
+    upstream_api_url, EventTimeouts, GatewayKey, Secret, UpstreamApi, MAX_MODEL_BYTES,
+};
 use crate::pool::{AttemptResult, Failure, KeyPool, UsageDimension};
 use crate::queue::{AdmissionError, AdmissionQueue, Permit};
 use crate::usage::UsageSnapshotStore;
@@ -200,7 +202,7 @@ impl Default for IoTimeouts {
 /// request. Fields here can be swapped atomically while the gateway runs.
 #[derive(Debug, Clone)]
 pub struct RuntimeState {
-    pub gateway_token: Secret,
+    pub gateway_keys: Vec<GatewayKey>,
     pub base_url: Url,
     pub max_body_bytes: usize,
     pub key_aliases: BTreeMap<String, String>,
@@ -411,7 +413,10 @@ impl GatewayState {
         GatewayState::with_runtime(
             http,
             RuntimeStore::new(RuntimeState {
-                gateway_token,
+                gateway_keys: vec![GatewayKey {
+                    name: "legacy".into(),
+                    token: gateway_token,
+                }],
                 base_url,
                 max_body_bytes,
                 key_aliases: BTreeMap::new(),
@@ -604,22 +609,25 @@ async fn not_found(State(state): State<Arc<GatewayState>>, req: Request<Body>) -
 }
 
 #[allow(clippy::result_large_err)]
-fn check_auth(state: &GatewayState, headers: &HeaderMap) -> Result<(), Response> {
+fn check_auth(state: &GatewayState, headers: &HeaderMap) -> Result<String, Response> {
     let rt = state.runtime.snapshot();
-    let token = rt.gateway_token.as_str();
     let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
-    let valid = match header {
-        Some(h) => match h.strip_prefix("Bearer ") {
-            Some(given) => given.as_bytes().ct_eq(token.as_bytes()).into(),
-            None => false,
-        },
-        None => false,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(unauthorized())
+    let given = header
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    authenticate_gateway_key(&rt.gateway_keys, given).ok_or_else(unauthorized)
+}
+
+/// Compare every configured credential before returning, so key ordering does
+/// not create an early-exit timing signal between identities.
+fn authenticate_gateway_key(keys: &[GatewayKey], given: &str) -> Option<String> {
+    let mut matched = None;
+    for key in keys {
+        if bool::from(given.as_bytes().ct_eq(key.token.as_str().as_bytes())) {
+            matched = Some(key.name.clone());
+        }
     }
+    matched
 }
 
 #[allow(clippy::result_large_err)]
@@ -627,23 +635,18 @@ fn check_proxy_auth(
     state: &GatewayState,
     headers: &HeaderMap,
     api: UpstreamApi,
-) -> Result<(), Response> {
-    if check_auth(state, headers).is_ok() {
-        return Ok(());
+) -> Result<String, Response> {
+    if let Ok(name) = check_auth(state, headers) {
+        return Ok(name);
     }
     if matches!(api, UpstreamApi::Messages) {
         let rt = state.runtime.snapshot();
-        let valid = headers
+        let given = headers
             .get("x-api-key")
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|given| {
-                given
-                    .as_bytes()
-                    .ct_eq(rt.gateway_token.as_str().as_bytes())
-                    .into()
-            });
-        if valid {
-            return Ok(());
+            .unwrap_or_default();
+        if let Some(name) = authenticate_gateway_key(&rt.gateway_keys, given) {
+            return Ok(name);
         }
     }
     Err(unauthorized())
@@ -936,20 +939,56 @@ fn parse_http_date(v: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-fn extract_usage(body: &[u8]) -> (Option<u64>, Option<u64>) {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RequestUsage {
+    input_tokens: u64,
+    cached_tokens: u64,
+    uncached_tokens: u64,
+    cache_write_tokens: Option<u64>,
+    output_tokens: u64,
+    reasoning_tokens: Option<u64>,
+}
+
+fn extract_usage(body: &[u8]) -> Option<RequestUsage> {
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return (None, None);
+        return None;
     };
-    (
-        v["usage"]["prompt_tokens"].as_u64(),
-        v["usage"]["completion_tokens"].as_u64(),
-    )
+    let usage = &v["usage"];
+    let input_tokens = usage["prompt_tokens"]
+        .as_u64()
+        .or_else(|| usage["input_tokens"].as_u64())?;
+    let output_tokens = usage["completion_tokens"]
+        .as_u64()
+        .or_else(|| usage["output_tokens"].as_u64())?;
+    let cached_tokens = usage["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .or_else(|| usage["prompt_cache_hit_tokens"].as_u64())
+        .or_else(|| usage["cache_read_input_tokens"].as_u64())
+        .unwrap_or(0)
+        .min(input_tokens);
+    let cache_write_tokens = usage["prompt_tokens_details"]["cache_write_tokens"]
+        .as_u64()
+        .or_else(|| usage["cache_write_tokens"].as_u64())
+        .or_else(|| usage["cache_creation_input_tokens"].as_u64());
+    let reasoning_tokens = usage["completion_tokens_details"]["reasoning_tokens"]
+        .as_u64()
+        .or_else(|| usage["output_tokens_details"]["reasoning_tokens"].as_u64())
+        .or_else(|| usage["reasoning_tokens"].as_u64());
+    Some(RequestUsage {
+        input_tokens,
+        cached_tokens,
+        uncached_tokens: input_tokens - cached_tokens,
+        cache_write_tokens,
+        output_tokens,
+        reasoning_tokens,
+    })
 }
 
 const MAX_AUDIT_ID_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Default)]
 struct RequestAudit {
+    gateway_key: Option<String>,
     opencode_session_id: Option<String>,
     opencode_project_id: Option<String>,
     opencode_request_id: Option<String>,
@@ -966,6 +1005,7 @@ impl RequestAudit {
                 .map(str::to_owned)
         }
         Self {
+            gateway_key: None,
             opencode_session_id: bounded(headers, "x-opencode-session"),
             opencode_project_id: bounded(headers, "x-opencode-project"),
             opencode_request_id: bounded(headers, "x-opencode-request"),
@@ -980,8 +1020,7 @@ fn record_audit(
     request_id: &str,
     model: &str,
     key_fingerprint: &str,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
+    usage: Option<RequestUsage>,
     status: u16,
     start: tokio::time::Instant,
     outcome: Option<AuditOutcome>,
@@ -992,8 +1031,13 @@ fn record_audit(
         request_id: request_id.to_string(),
         model: Some(model.to_string()),
         key_fingerprint: Some(key_fingerprint.to_string()),
-        input_tokens,
-        output_tokens,
+        gateway_key: audit.gateway_key.clone(),
+        input_tokens: usage.map(|value| value.input_tokens),
+        cached_tokens: usage.map(|value| value.cached_tokens),
+        uncached_tokens: usage.map(|value| value.uncached_tokens),
+        cache_write_tokens: usage.and_then(|value| value.cache_write_tokens),
+        output_tokens: usage.map(|value| value.output_tokens),
+        reasoning_tokens: usage.and_then(|value| value.reasoning_tokens),
         status,
         outcome,
         latency: start.elapsed(),
@@ -1030,8 +1074,13 @@ fn record_audit_rejected_with_context(
         request_id: request_id.to_string(),
         model: None,
         key_fingerprint: None,
+        gateway_key: audit.gateway_key.clone(),
         input_tokens: None,
+        cached_tokens: None,
+        uncached_tokens: None,
+        cache_write_tokens: None,
         output_tokens: None,
+        reasoning_tokens: None,
         status,
         outcome: None,
         latency: start.elapsed(),
@@ -1093,15 +1142,18 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
     // A queued request may have passed the first check before a hot token
     // rotation. Revalidate after admission, immediately before taking the
     // runtime/key snapshot and reading the body.
-    if let Err(resp) = check_proxy_auth(&state, req.headers(), api) {
-        record_audit_rejected_with_context(
-            &state,
-            &request_id,
-            StatusCode::UNAUTHORIZED.as_u16(),
-            start,
-            request_audit,
-        );
-        return resp;
+    match check_proxy_auth(&state, req.headers(), api) {
+        Ok(name) => request_audit.gateway_key = Some(name),
+        Err(resp) => {
+            record_audit_rejected_with_context(
+                &state,
+                &request_id,
+                StatusCode::UNAUTHORIZED.as_u16(),
+                start,
+                request_audit,
+            );
+            return resp;
+        }
     }
     // One consistent (snapshot, key-pool) pair for this whole request, grabbed
     // atomically; in-flight SSE streams keep the pair they started with.
@@ -1781,7 +1833,6 @@ async fn finalize_consumed_error(
         &model,
         &fingerprint,
         None,
-        None,
         status.as_u16(),
         start,
         None,
@@ -1849,11 +1900,10 @@ async fn finalize_response(
                     &model,
                     &fingerprint,
                     None,
-                    None,
                     StatusCode::SERVICE_UNAVAILABLE.as_u16(),
                     start,
                     None,
-                    RequestAudit::default(),
+                    audit,
                 );
                 drop(permit);
                 return service_unavailable(Some(1));
@@ -1986,10 +2036,6 @@ async fn stream_response(
             | PumpOutcome::ClientCancel
             | PumpOutcome::EventIdleTimeout => None,
         };
-        let (input, output) = match usage {
-            Some((p, c)) => (Some(p), Some(c)),
-            None => (None, None),
-        };
         let audit_outcome = match outcome {
             PumpOutcome::Completed => Some(AuditOutcome::Completed),
             PumpOutcome::UpstreamError => Some(AuditOutcome::UpstreamError),
@@ -2001,8 +2047,7 @@ async fn stream_response(
             &task_request_id,
             &model,
             &fingerprint,
-            input,
-            output,
+            usage,
             status_u16,
             start,
             audit_outcome,
@@ -2243,7 +2288,7 @@ impl StreamUsageParser {
         }
     }
 
-    fn usage(&self) -> Option<(u64, u64)> {
+    fn usage(&self) -> Option<RequestUsage> {
         match self {
             StreamUsageParser::Sse(p) => p.usage(),
             StreamUsageParser::Json(p) => p.usage(),
@@ -2285,15 +2330,11 @@ impl JsonUsageParser {
         }
     }
 
-    fn usage(&self) -> Option<(u64, u64)> {
+    fn usage(&self) -> Option<RequestUsage> {
         if self.overflowed {
             return None;
         }
-        let (input, output) = extract_usage(&self.buf);
-        match (input, output) {
-            (Some(i), Some(o)) => Some((i, o)),
-            _ => None,
-        }
+        extract_usage(&self.buf)
     }
 }
 
@@ -2308,7 +2349,7 @@ struct SseUsageParser {
     tail: [u8; 4],
     tail_len: usize,
     discarding: bool,
-    usage: Option<(u64, u64)>,
+    usage: Option<RequestUsage>,
     event_count: u64,
 }
 
@@ -2368,18 +2409,13 @@ impl SseUsageParser {
         if payload == "[DONE]" {
             return true;
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&payload) {
-            if let (Some(p), Some(c)) = (
-                v["usage"]["prompt_tokens"].as_u64(),
-                v["usage"]["completion_tokens"].as_u64(),
-            ) {
-                self.usage = Some((p, c));
-            }
+        if serde_json::from_str::<serde_json::Value>(&payload).is_ok() {
+            self.usage = extract_usage(payload.as_bytes()).or(self.usage);
         }
         true
     }
 
-    fn usage(&self) -> Option<(u64, u64)> {
+    fn usage(&self) -> Option<RequestUsage> {
         self.usage
     }
 }
