@@ -1292,7 +1292,10 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
         upstream_headers.get("user-agent").unwrap(),
         "opencode/1.2.3"
     );
-    assert_eq!(upstream_headers.get("x-request-id").unwrap(), "my-req-1");
+    assert!(
+        !upstream_headers.contains_key("x-request-id"),
+        "the gateway request id must not be injected upstream"
+    );
     for (name, expected) in [
         ("x-opencode-project", "project-42"),
         ("x-opencode-session", "session-7"),
