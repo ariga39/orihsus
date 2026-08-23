@@ -1281,14 +1281,7 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
         // never bounded here, so a long stream is not affected.
         let resp = match tokio::time::timeout(
             state.timeouts.upstream_header,
-            forward_request(
-                &state,
-                &sel,
-                &parts.headers,
-                &body_bytes,
-                &rt.base_url,
-                api,
-            ),
+            forward_request(&state, &sel, &parts.headers, &body_bytes, &rt.base_url, api),
         )
         .await
         {
