@@ -865,7 +865,6 @@ async fn forward_request(
     headers: &HeaderMap,
     body: &Bytes,
     base_url: &Url,
-    request_id: &str,
     api: UpstreamApi,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let url = upstream_api_url(base_url, api);
@@ -884,7 +883,6 @@ async fn forward_request(
     } else {
         rb = rb.header(AUTHORIZATION, format!("Bearer {}", sel.key().as_str()));
     }
-    rb = rb.header("x-request-id", request_id);
     rb.send().await
 }
 
@@ -1283,15 +1281,7 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
         // never bounded here, so a long stream is not affected.
         let resp = match tokio::time::timeout(
             state.timeouts.upstream_header,
-            forward_request(
-                &state,
-                &sel,
-                &parts.headers,
-                &body_bytes,
-                &rt.base_url,
-                &request_id,
-                api,
-            ),
+            forward_request(&state, &sel, &parts.headers, &body_bytes, &rt.base_url, api),
         )
         .await
         {
