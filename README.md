@@ -34,7 +34,8 @@ Durations are integer seconds and use a `_seconds` suffix; byte capacities are i
 
 | Name | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `gateway_token` | string | yes | — | Gateway client token: Bearer authentication on OpenAI endpoints, or `x-api-key` on `/v1/messages`; must not be blank. Hot-reloadable. |
+| `gateway_keys` | list of `{name, token}` objects | yes* | — | Non-empty identity credentials. Names and tokens must each be unique; names are written to audit records, tokens never are. Hot-reloadable. |
+| `gateway_token` | string | yes* | — | Legacy single-token form, loaded as identity `legacy`. Mutually exclusive with `gateway_keys`; migrate by replacing it with one named entry. |
 | `keys` | list of strings or `{key, name}` objects | yes | — | Non-empty, unique upstream key pool. `name` is an optional UTF-8 display alias (at most 128 bytes) used only by `/v1/status`; legacy string entries remain supported. Hot-reloadable. |
 | `listen.host` | string (IP) | no | `127.0.0.1` | Loopback IP address. Non-loopback addresses are rejected. |
 | `listen.port` | integer | no | `8080` | Local HTTP port, from 0 through 65535. |
@@ -70,7 +71,7 @@ Durations are integer seconds and use a `_seconds` suffix; byte capacities are i
 
 `key_failure_handling` configures what happens when the currently selected upstream key fails. Ordinary failures use exponential backoff; repeated failures open that key's circuit breaker; `max_attempts` controls whether the same client request may fail over to one other key. It does not configure scheduled key replacement.
 
-Only `gateway_token` and `keys` are required. Omitted optional sections use the defaults above. Before the first successful automatic refresh, the service retains `deepseek-chat` as a fail-safe allowlist. Listener, limits, key-failure handling, usage, audit, and server changes require restart. The upstream is fixed at `https://opencode.ai/zen/go/`; any `upstream` or `base_url` configuration is rejected. Only the fixed `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and authenticated `/v1/usage` upstream paths can receive subscription keys; model synchronization uses unauthenticated `GET /v1/models`, while the gateway's own `/v1/models` remains local. Request and successful response bodies are forwarded unchanged; clients must choose the protocol endpoint matching their model.
+One of `gateway_keys` or legacy `gateway_token`, plus `keys`, is required. Omitted optional sections use the defaults below. Before the first successful automatic refresh, the service retains `deepseek-chat` as a fail-safe allowlist. Listener, limits, key-failure handling, usage, audit, and server changes require restart. The upstream is fixed at `https://opencode.ai/zen/go/`; any `upstream` or `base_url` configuration is rejected. Only the fixed `/v1/chat/completions`, `/v1/messages`, `/v1/responses`, and authenticated `/v1/usage` upstream paths can receive subscription keys; model synchronization uses unauthenticated `GET /v1/models`, while the gateway's own `/v1/models` remains local. Request and successful response bodies are forwarded unchanged; clients must choose the protocol endpoint matching their model.
 
 Keys can be named without changing the legacy syntax:
 
@@ -90,6 +91,13 @@ node tools/usage-summary.mjs --dir /var/log/orihsus/usage --days 7
 ```
 
 The summary emits one row per day and fingerprint with sample count and each window's latest, maximum, and average percentage and latest `resetsAt`.
+
+Every completed successful request also records `gateway_key`, `input_tokens`, `cached_tokens`, `uncached_tokens`, `cache_write_tokens`, `output_tokens`, and `reasoning_tokens` in the append-only audit JSONL. OpenAI token-detail fields, DeepSeek `prompt_cache_hit_tokens`, and Anthropic cache read/write fields are accepted. Aggregate a half-open time window by identity and model with:
+
+```bash
+node tools/audit-usage-summary.mjs --file /var/log/orihsus/audit.jsonl \
+  --from 2026-08-01T00:00:00Z --to 2026-09-01T00:00:00Z
+```
 
 For SSE, orihsus buffers raw upstream bytes only until the first complete `data:` event (bounded by 256 KiB). A timeout, connection failure, or EOF in that precommit window may use the second configured attempt; the client sees only the winning attempt. After the first event is committed, orihsus never splices streams or changes keys. Only a complete SSE event containing a `data:` field resets the inter-event deadline: comments, keepalives, and incomplete fragments are forwarded transparently but do not count as model activity. An inter-event timeout ends that stream and records a key-and-model-scoped liveness failure.
 

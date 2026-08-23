@@ -26,7 +26,8 @@ fn minimal_valid_config_yields_defaults() {
 
     let cfg = orihsus::config::load(&path).unwrap();
 
-    assert_eq!(cfg.gateway_token.as_str(), "gway-secret");
+    assert_eq!(cfg.gateway_keys[0].name, "legacy");
+    assert_eq!(cfg.gateway_keys[0].token.as_str(), "gway-secret");
     assert_eq!(cfg.keys, vec![Secret::new("key-1")]);
     assert!(cfg.key_aliases.is_empty());
     assert_eq!(cfg.listen.ip().to_string(), "127.0.0.1");
@@ -87,6 +88,34 @@ fn minimal_valid_config_yields_defaults() {
         "default per-chunk response write timeout"
     );
     assert_eq!(cfg.server.max_connections, 1024);
+}
+
+#[test]
+fn named_gateway_keys_are_validated_and_legacy_token_still_migrates() {
+    let dir = TempDir::new().unwrap();
+    let path = write_config(
+        dir.path(),
+        "multi.yaml",
+        r#"
+gateway_keys:
+  - name: hermes-main
+    token: token-one
+  - name: coding-agent
+    token: token-two
+keys: [upstream-one]
+"#,
+    );
+    let cfg = orihsus::config::load(&path).unwrap();
+    assert_eq!(cfg.gateway_keys.len(), 2);
+    assert_eq!(cfg.gateway_keys[0].name, "hermes-main");
+    assert_eq!(cfg.gateway_keys[1].token.as_str(), "token-two");
+
+    let ambiguous = write_config(
+        dir.path(),
+        "ambiguous.yaml",
+        "gateway_token: old\ngateway_keys:\n  - { name: new, token: new-token }\nkeys: [upstream-one]\n",
+    );
+    assert!(orihsus::config::load(&ambiguous).is_err());
 }
 
 #[test]
@@ -438,7 +467,7 @@ keys:
 }
 
 #[test]
-fn missing_gateway_token_is_rejected() {
+fn missing_gateway_credentials_are_rejected() {
     let dir = TempDir::new().unwrap();
     let path = write_config(
         dir.path(),
@@ -451,7 +480,10 @@ keys:
 
     let err = orihsus::config::load(&path).unwrap_err();
 
-    assert!(format!("{err}").contains("gateway token"), "got: {err}");
+    assert!(
+        format!("{err}").contains("gateway_token or gateway_keys"),
+        "got: {err}"
+    );
 }
 
 #[test]

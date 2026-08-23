@@ -2,13 +2,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use orihsus::config::{ModelSync, Secret};
+use orihsus::config::{GatewayKey, ModelSync, Secret};
 use orihsus::gateway::{RuntimeState, RuntimeStore};
 use orihsus::models::{ModelFetchError, ModelFetcher, ModelMonitor};
 
 fn store(models: &[&str]) -> RuntimeStore {
     RuntimeStore::new(RuntimeState {
-        gateway_token: Secret::new("gateway-token"),
+        gateway_keys: vec![GatewayKey {
+            name: "legacy".into(),
+            token: Secret::new("gateway-token"),
+        }],
         base_url: "https://example.test/".parse().unwrap(),
         max_body_bytes: 1024,
         key_aliases: Default::default(),
@@ -37,7 +40,10 @@ async fn successful_sync_atomically_replaces_the_runtime_allowlist() {
     .await;
 
     assert_eq!(runtime.snapshot().models, vec!["new-chat", "new-reasoner"]);
-    assert_eq!(runtime.snapshot().gateway_token.as_str(), "gateway-token");
+    assert_eq!(
+        runtime.snapshot().gateway_keys[0].token.as_str(),
+        "gateway-token"
+    );
 }
 
 #[tokio::test]

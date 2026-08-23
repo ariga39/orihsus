@@ -14,8 +14,10 @@ sudo install -d -o orihsus -g orihsus -m 0750 /var/lib/orihsus
 ## 2. Install the binary and configuration
 
 ```bash
-cargo build --release
-sudo install -o root -g root -m 0755 target/release/orihsus /usr/local/bin/orihsus
+build_dir=$(mktemp -d /tmp/orihsus-target.XXXXXX)
+CARGO_TARGET_DIR="$build_dir" cargo build --release
+sudo install -o root -g root -m 0755 "$build_dir/release/orihsus" /usr/local/bin/orihsus
+rm -rf -- "$build_dir"
 sudo install -o orihsus -g orihsus -m 0600 config.example.yaml /etc/orihsus/config.yaml
 sudo install -o root -g root -m 0644 deploy/orihsus.logrotate /etc/logrotate.d/orihsus
 sudo chown orihsus:orihsus /etc/orihsus/config.yaml
@@ -140,7 +142,7 @@ Confirm the filter against the actual configured nginx log format with `fail2ban
 
 ## 5. Client configuration
 
-Point OpenAI-compatible clients at `https://api.example.com/v1` and send `Authorization: Bearer <gateway_token>`. Clients trust the public nginx certificate; orihsus has no certificate or private-key configuration.
+Point OpenAI-compatible clients at `https://api.example.com/v1` and give each identity its own configured gateway key via `Authorization: Bearer <token>` (`x-api-key` is also accepted for `/v1/messages`). Clients trust the public nginx certificate; orihsus has no certificate or private-key configuration.
 
 ## 6. Logs and rotation
 
@@ -162,7 +164,7 @@ node tools/usage-summary.mjs --dir /var/log/orihsus/usage --days 30
 
 ## 7. Reload and restart boundaries
 
-The gateway token, key set, and model list are hot-reloadable. Listener/server settings, capacity, key-failure handling, audit, usage-poll scheduling, and `usage_history_dir` require an orihsus restart. The upstream origin and API-path allowlist are compiled in. nginx certificates and edge policy are reloaded independently with `nginx -t && systemctl reload nginx`.
+The gateway key set, upstream key set, and model list are hot-reloadable. Listener/server settings, capacity, key-failure handling, audit, usage-poll scheduling, and `usage_history_dir` require an orihsus restart. The upstream origin and API-path allowlist are compiled in. nginx certificates and edge policy are reloaded independently with `nginx -t && systemctl reload nginx`.
 
 ## 8. Resource discipline
 

@@ -8,7 +8,11 @@
 # schema, types, required status, and defaults.
 
 # Required: bearer token accepted from gateway clients.
-gateway_token: "CHANGE-ME-use-a-long-random-token"
+gateway_keys:
+  - name: "hermes-main"
+    token: "CHANGE-ME-use-a-long-random-token"
+  - name: "coding-agent"
+    token: "CHANGE-ME-use-a-different-long-random-token"
 
 # Required: non-empty pool of unique OpenCode Go subscription keys.
 keys:
