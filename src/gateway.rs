@@ -22,8 +22,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use url::Url;
 
 use crate::audit::{
-    AttemptSummaries, AttemptSummary, AttemptTerminalReason, AuditError, AuditOutcome, AuditRecord,
-    Outcome,
+    fingerprint, AttemptSummaries, AttemptSummary, AttemptTerminalReason, AuditError, AuditOutcome,
+    AuditRecord, Outcome,
 };
 use crate::config::{
     upstream_api_url, EventTimeouts, GatewayKey, Secret, UpstreamApi, MAX_MODEL_BYTES,
@@ -42,6 +42,8 @@ const HOP_BY_HOP: [&str; 8] = [
     "transfer-encoding",
     "upgrade",
 ];
+
+const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
 /// Maximum bytes of an error body read for 429 classification. A body whose
 /// EOF lands at or before this cap is buffered whole and passed through
@@ -609,7 +611,7 @@ async fn not_found(State(state): State<Arc<GatewayState>>, req: Request<Body>) -
 }
 
 #[allow(clippy::result_large_err)]
-fn check_auth(state: &GatewayState, headers: &HeaderMap) -> Result<String, Response> {
+fn check_auth(state: &GatewayState, headers: &HeaderMap) -> Result<GatewayIdentity, Response> {
     let rt = state.runtime.snapshot();
     let header = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok());
     let given = header
@@ -618,13 +620,21 @@ fn check_auth(state: &GatewayState, headers: &HeaderMap) -> Result<String, Respo
     authenticate_gateway_key(&rt.gateway_keys, given).ok_or_else(unauthorized)
 }
 
+struct GatewayIdentity {
+    name: String,
+    fallback_session_id: String,
+}
+
 /// Compare every configured credential before returning, so key ordering does
 /// not create an early-exit timing signal between identities.
-fn authenticate_gateway_key(keys: &[GatewayKey], given: &str) -> Option<String> {
+fn authenticate_gateway_key(keys: &[GatewayKey], given: &str) -> Option<GatewayIdentity> {
     let mut matched = None;
     for key in keys {
         if bool::from(given.as_bytes().ct_eq(key.token.as_str().as_bytes())) {
-            matched = Some(key.name.clone());
+            matched = Some(GatewayIdentity {
+                name: key.name.clone(),
+                fallback_session_id: format!("orihsus-{}", fingerprint(given)),
+            });
         }
     }
     matched
@@ -635,9 +645,9 @@ fn check_proxy_auth(
     state: &GatewayState,
     headers: &HeaderMap,
     api: UpstreamApi,
-) -> Result<String, Response> {
-    if let Ok(name) = check_auth(state, headers) {
-        return Ok(name);
+) -> Result<GatewayIdentity, Response> {
+    if let Ok(identity) = check_auth(state, headers) {
+        return Ok(identity);
     }
     if matches!(api, UpstreamApi::Messages) {
         let rt = state.runtime.snapshot();
@@ -645,8 +655,8 @@ fn check_proxy_auth(
             .get("x-api-key")
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-        if let Some(name) = authenticate_gateway_key(&rt.gateway_keys, given) {
-            return Ok(name);
+        if let Some(identity) = authenticate_gateway_key(&rt.gateway_keys, given) {
+            return Ok(identity);
         }
     }
     Err(unauthorized())
@@ -863,6 +873,7 @@ async fn forward_request(
     state: &GatewayState,
     sel: &crate::pool::Selection,
     headers: &HeaderMap,
+    fallback_session_id: &str,
     body: &Bytes,
     base_url: &Url,
     api: UpstreamApi,
@@ -877,6 +888,9 @@ async fn forward_request(
         if should_forward_request_header(&lowercased, &connection, api) {
             rb = rb.header(name, value);
         }
+    }
+    if !headers.contains_key(OPENCODE_SESSION_HEADER) {
+        rb = rb.header(OPENCODE_SESSION_HEADER, fallback_session_id);
     }
     if matches!(api, UpstreamApi::Messages) {
         rb = rb.header("x-api-key", sel.key().as_str());
@@ -1140,8 +1154,11 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
     // A queued request may have passed the first check before a hot token
     // rotation. Revalidate after admission, immediately before taking the
     // runtime/key snapshot and reading the body.
-    match check_proxy_auth(&state, req.headers(), api) {
-        Ok(name) => request_audit.gateway_key = Some(name),
+    let fallback_session_id = match check_proxy_auth(&state, req.headers(), api) {
+        Ok(identity) => {
+            request_audit.gateway_key = Some(identity.name);
+            identity.fallback_session_id
+        }
         Err(resp) => {
             record_audit_rejected_with_context(
                 &state,
@@ -1152,7 +1169,7 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
             );
             return resp;
         }
-    }
+    };
     // One consistent (snapshot, key-pool) pair for this whole request, grabbed
     // atomically; in-flight SSE streams keep the pair they started with.
     let (rt, mut attempts) = state.runtime.snapshot_and_request(&state.pool);
@@ -1248,6 +1265,9 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
         );
     }
     attempts.set_model(model.clone());
+    if !parts.headers.contains_key(OPENCODE_SESSION_HEADER) {
+        request_audit.opencode_session_id = Some(fallback_session_id.clone());
+    }
 
     let mut last_response: Option<(ConsumedResponse, String)> = None;
     let final_outcome = loop {
@@ -1281,7 +1301,15 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
         // never bounded here, so a long stream is not affected.
         let resp = match tokio::time::timeout(
             state.timeouts.upstream_header,
-            forward_request(&state, &sel, &parts.headers, &body_bytes, &rt.base_url, api),
+            forward_request(
+                &state,
+                &sel,
+                &parts.headers,
+                &fallback_session_id,
+                &body_bytes,
+                &rt.base_url,
+                api,
+            ),
         )
         .await
         {
