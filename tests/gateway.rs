@@ -1405,6 +1405,89 @@ async fn chat_non_streaming_passthrough_headers_and_audit() {
 }
 
 #[tokio::test]
+async fn missing_opencode_session_uses_stable_gateway_identity_upstream() {
+    let control = Arc::new(MockControl::default());
+    let addr = start_mock(control.clone()).await;
+    let sink = TestSink::default();
+    let app = build_router(state(
+        &format!("http://{addr}"),
+        &["key-1"],
+        queue(2, 2, Duration::from_secs(30)),
+        sink.clone(),
+    ));
+
+    control
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(MockResponse::json(200, br#"{}"#));
+    control
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(MockResponse::json(200, br#"{}"#));
+
+    let payload = serde_json::json!({
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let body = serde_json::to_vec(&payload).unwrap();
+    let resp = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer gway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    drop(resp);
+    let resp = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer gway-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    drop(resp);
+
+    let expected_session_id = format!("orihsus-{}", fingerprint("gway-token"));
+
+    let requests = control.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        assert_eq!(
+            request
+                .headers
+                .get("x-opencode-session")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            expected_session_id
+        );
+    }
+    drop(requests);
+
+    let records = sink.0.lock().unwrap();
+    assert_eq!(records.len(), 2);
+    for record in records.iter() {
+        assert_eq!(
+            record.opencode_session_id.as_deref(),
+            Some(expected_session_id.as_str())
+        );
+    }
+}
+
+#[tokio::test]
 async fn multiple_gateway_keys_authenticate_and_audit_distinct_identities() {
     let control = Arc::new(MockControl::default());
     let addr = start_mock(control.clone()).await;
