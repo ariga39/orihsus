@@ -1445,7 +1445,7 @@ async fn missing_opencode_session_uses_stable_gateway_identity_upstream() {
     .await;
 
     assert_eq!(resp.status(), StatusCode::OK);
-    drop(resp);
+    assert_eq!(body_string(resp).await, "{}");
     let resp = send(
         &app,
         Request::builder()
@@ -1458,7 +1458,7 @@ async fn missing_opencode_session_uses_stable_gateway_identity_upstream() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    drop(resp);
+    assert_eq!(body_string(resp).await, "{}");
 
     let expected_session_id = format!("orihsus-{}", fingerprint("gway-token"));
 
