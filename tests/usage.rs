@@ -577,3 +577,70 @@ async fn rounds_never_overlap_and_shutdown_joins_the_worker() {
         "joined worker cannot poll after shutdown"
     );
 }
+#[tokio::test(start_paused = true)]
+async fn only_complete_quota_samples_can_shorten_an_existing_deadline() {
+    let p = pool();
+    let keys = [Secret::new("key-a")];
+    let clock = FixedClock("2026-08-14T12:00:00Z".parse().unwrap());
+    let old = Duration::from_secs(86400);
+    p.report_proactive_cooldown(&fingerprint("key-a"), old);
+    let partial = StaticFetcher(br#"{"rolling":{"percent":95,"resetsAt":"2026-08-14T12:01:00Z"}}"#);
+    let malformed = StaticFetcher(br#"{"rolling":{"percent":0,"resetsAt":"invalid"},"weekly":{"percent":0,"resetsAt":"2026-08-15T00:00:00Z"},"monthly":{"percent":0,"resetsAt":"2026-09-01T00:00:00Z"}}"#);
+    let remaining = || {
+        p.status_snapshot()
+            .into_iter()
+            .find(|key| key.cooling_reason.is_some())
+            .unwrap()
+            .cooling_remaining
+    };
+    for fetcher in [
+        &ErrorFetcher as &dyn UsageFetcher,
+        &StaticFetcher(b"{"),
+        &partial,
+        &malformed,
+    ] {
+        UsageMonitor::poll_once(fetcher, &clock, 95.0, &keys, &p).await;
+        assert_eq!(remaining(), Some(old));
+    }
+    let shorter = StaticFetcher(br#"{"rolling":{"percent":95,"resetsAt":"2026-08-14T12:01:00Z"},"weekly":{"percent":0,"resetsAt":"2026-08-15T00:00:00Z"},"monthly":{"percent":0,"resetsAt":"2026-09-01T00:00:00Z"}}"#);
+    UsageMonitor::poll_once(&shorter, &clock, 95.0, &keys, &p).await;
+    assert_eq!(remaining(), Some(Duration::from_secs(60)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn healthy_poll_preserves_overlapping_request_backoff_and_breaker() {
+    use orihsus::pool::Failure;
+    for reason in ["rate_limited", "circuit_breaker"] {
+        let p = pool();
+        let AttemptResult::Selected(selected) = p.request().next().await else {
+            panic!("expected first key")
+        };
+        p.report_proactive_cooldown(selected.fingerprint(), Duration::from_secs(3600));
+        if reason == "rate_limited" {
+            p.report_failure(
+                &selected,
+                Failure::RateLimited {
+                    retry_after: Some(Duration::from_secs(60)),
+                },
+            );
+        } else {
+            for _ in 0..5 {
+                p.report_failure(&selected, Failure::Network);
+            }
+        }
+        let healthy = StaticFetcher(br#"{"rolling":{"percent":0,"resetsAt":"2026-08-14T12:01:00Z"},"weekly":{"percent":0,"resetsAt":"2026-08-15T00:00:00Z"},"monthly":{"percent":0,"resetsAt":"2026-09-01T00:00:00Z"}}"#);
+        UsageMonitor::poll_once(
+            &healthy,
+            &FixedClock("2026-08-14T12:00:00Z".parse().unwrap()),
+            95.0,
+            &[Secret::new("key-a")],
+            &p,
+        )
+        .await;
+        assert!(p
+            .status_snapshot()
+            .iter()
+            .any(|key| key.cooling_reason == Some(reason)
+                && key.cooling_remaining == Some(Duration::from_secs(60))));
+    }
+}

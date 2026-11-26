@@ -191,6 +191,7 @@ struct KeyEntry {
     key: Secret,
     fingerprint: String,
     status_id: String,
+    proactive_until: Option<tokio::time::Instant>,
     cooling_until: Option<tokio::time::Instant>,
     cooling_reason: Option<CoolingReason>,
     /// Selection id that applied the current `cooling_until`, if any. A success
@@ -216,6 +217,25 @@ struct KeyEntry {
     /// can never wedge forever.
     half_open: bool,
     liveness_cooling: HashMap<String, tokio::time::Instant>,
+}
+
+pub(crate) enum QuotaUpdate {
+    Replace(Option<Duration>),
+    Extend(Duration),
+}
+
+impl KeyEntry {
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.proactive_until.max(self.cooling_until)
+    }
+
+    fn reason(&self) -> Option<CoolingReason> {
+        if self.proactive_until > self.cooling_until {
+            Some(CoolingReason::ProactiveUsage)
+        } else {
+            self.cooling_reason
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -271,6 +291,7 @@ impl KeyPool {
                 fingerprint: fingerprint(key.as_str()),
                 status_id: key_suffix(key.as_str()),
                 key,
+                proactive_until: None,
                 cooling_until: None,
                 cooling_reason: None,
                 cooling_by: None,
@@ -309,6 +330,7 @@ impl KeyPool {
                     fingerprint,
                     status_id: key_suffix(key.as_str()),
                     key,
+                    proactive_until: prev.and_then(|e| e.proactive_until),
                     cooling_until: prev.and_then(|e| e.cooling_until),
                     cooling_reason: prev.and_then(|e| e.cooling_reason),
                     cooling_by: prev.and_then(|e| e.cooling_by),
@@ -508,7 +530,7 @@ impl KeyPool {
         state
             .entries
             .iter()
-            .any(|e| !e.cooling_until.is_some_and(|d| d > now))
+            .any(|e| !e.deadline().is_some_and(|d| d > now))
     }
 
     /// Secret-free, stable snapshot for the authenticated status endpoint.
@@ -520,7 +542,7 @@ impl KeyPool {
             .iter()
             .map(|entry| {
                 let remaining = entry
-                    .cooling_until
+                    .deadline()
                     .filter(|deadline| *deadline > now)
                     .map(|deadline| deadline.saturating_duration_since(now));
                 PoolKeyStatus {
@@ -531,7 +553,7 @@ impl KeyPool {
                     } else {
                         "healthy"
                     },
-                    cooling_reason: remaining.and(entry.cooling_reason.map(CoolingReason::as_str)),
+                    cooling_reason: remaining.and(entry.reason().map(CoolingReason::as_str)),
                     cooling_remaining: remaining,
                 }
             })
@@ -573,12 +595,14 @@ impl KeyPool {
         entry.last_failure_by = None;
     }
 
-    /// Cool a live key based on a proactive usage observation. The report
-    /// participates in the same monotonic report ordering as request results.
+    /// A limiting window in a partial sample can only extend the known restriction.
     pub fn report_proactive_cooldown(&self, fingerprint: &str, cooldown: Duration) {
-        let now = tokio::time::Instant::now();
-        let deadline = deadline_after(now, cooldown);
+        self.update_proactive(fingerprint, QuotaUpdate::Extend(cooldown));
+    }
+
+    pub(crate) fn update_proactive(&self, fingerprint: &str, update: QuotaUpdate) {
         let mut state = write_state(&self.inner);
+        let now = tokio::time::Instant::now();
         let Some(entry) = state
             .entries
             .iter_mut()
@@ -586,23 +610,17 @@ impl KeyPool {
         else {
             return;
         };
-        // Allocate while holding the same state lock used by selection. This
-        // keeps id order aligned with state-commit order, so a selection that
-        // truly predates this report can never look newer merely because the
-        // reporter waited for the lock after reserving its id.
-        let report_id = self
-            .inner
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if !entry
-            .cooling_until
-            .is_some_and(|existing| existing > deadline)
-        {
-            entry.cooling_until = Some(deadline);
-            entry.cooling_reason = Some(CoolingReason::ProactiveUsage);
-            entry.cooling_by = Some(report_id);
-            entry.last_failure_by = Some(report_id);
-            advance_cursor(&mut state, now);
+        let deadline = match update {
+            QuotaUpdate::Replace(cooldown) => cooldown.map(|d| deadline_after(now, d)),
+            QuotaUpdate::Extend(duration) => entry
+                .proactive_until
+                .max(Some(deadline_after(now, duration))),
+        };
+        if deadline != entry.proactive_until {
+            entry.proactive_until = deadline;
+            if deadline.is_some() {
+                advance_cursor(&mut state, now);
+            }
         }
     }
 
@@ -689,7 +707,7 @@ fn advance_cursor(state: &mut PoolState, now: tokio::time::Instant) {
     }
     for off in 1..=n {
         let idx = (state.cursor + off) % n;
-        if !state.entries[idx].cooling_until.is_some_and(|d| d > now) {
+        if !state.entries[idx].deadline().is_some_and(|d| d > now) {
             state.cursor = idx;
             return;
         }
@@ -800,7 +818,7 @@ impl RequestAttempts {
                 .find(|e| e.fingerprint == c.fingerprint)
             {
                 Some(e) => {
-                    !e.cooling_until.is_some_and(|d| d > now)
+                    !e.deadline().is_some_and(|d| d > now)
                         && !self.model.as_ref().is_some_and(|model| {
                             e.liveness_cooling
                                 .get(model)
@@ -857,7 +875,7 @@ impl RequestAttempts {
                     .model
                     .as_ref()
                     .and_then(|model| entry.liveness_cooling.get(model).copied());
-                match (entry.cooling_until, model_deadline) {
+                match (entry.deadline(), model_deadline) {
                     (Some(global), Some(model)) => Some(global.max(model)),
                     (Some(global), None) => Some(global),
                     (None, Some(model)) => Some(model),
