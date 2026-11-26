@@ -187,6 +187,34 @@ async fn proactive_cooldown_immediately_switches_to_the_next_key() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn late_429_after_quota_failover_keeps_the_current_healthy_key() {
+    let pool = pool(&["a", "b", "c"]);
+    let inflight = expect_selected(pool.request().next().await);
+    assert_eq!(inflight.fingerprint(), fingerprint("a"));
+    pool.report_proactive_cooldown(inflight.fingerprint(), Duration::from_secs(10));
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b")
+    );
+
+    pool.report_failure(
+        &inflight,
+        Failure::RateLimited {
+            retry_after: Some(Duration::from_secs(60)),
+        },
+    );
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b")
+    );
+    assert!(pool
+        .status_snapshot()
+        .iter()
+        .any(|key| key.cooling_reason == Some("rate_limited")
+            && key.cooling_remaining == Some(Duration::from_secs(60))));
+}
+
+#[tokio::test(start_paused = true)]
 async fn proactively_cooled_key_recovers_exactly_at_reset() {
     let pool = pool(&["a"]);
     pool.report_proactive_cooldown(&fingerprint("a"), Duration::from_secs(10));

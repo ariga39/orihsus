@@ -610,7 +610,6 @@ impl KeyPool {
         else {
             return;
         };
-        let current = index == state.cursor;
         let entry = &mut state.entries[index];
         let was_available = entry.deadline().is_none_or(|d| d <= now);
         entry.proactive_until = match update {
@@ -619,8 +618,8 @@ impl KeyPool {
                 .proactive_until
                 .max(Some(deadline_after(now, duration))),
         };
-        if current && was_available && entry.proactive_until.is_some_and(|d| d > now) {
-            advance_cursor(&mut state, now);
+        if was_available && entry.proactive_until.is_some_and(|d| d > now) {
+            advance_cursor_from(&mut state, index, now);
         }
     }
 
@@ -628,13 +627,14 @@ impl KeyPool {
     pub fn report_failure(&self, selection: &Selection, failure: Failure) {
         let mut state = write_state(&self.inner);
         let now = tokio::time::Instant::now();
-        let Some(entry) = state
+        let Some(index) = state
             .entries
-            .iter_mut()
-            .find(|e| e.fingerprint == selection.fingerprint)
+            .iter()
+            .position(|e| e.fingerprint == selection.fingerprint)
         else {
             return;
         };
+        let entry = &mut state.entries[index];
         match failure {
             Failure::UsageLimit { cooldown, .. } => {
                 let new_deadline = deadline_after(now, cooldown);
@@ -643,7 +643,7 @@ impl KeyPool {
                     entry.cooling_reason = Some(CoolingReason::UsageLimit);
                     entry.cooling_by = Some(selection.id);
                     entry.last_failure_by = Some(selection.id);
-                    advance_cursor(&mut state, now);
+                    advance_cursor_from(&mut state, index, now);
                 }
             }
             Failure::RateLimited { retry_after } | Failure::Unavailable { retry_after } => {
@@ -677,7 +677,7 @@ impl KeyPool {
                     entry.cooling_reason = Some(reason);
                     entry.cooling_by = Some(selection.id);
                     entry.last_failure_by = Some(selection.id);
-                    advance_cursor(&mut state, now);
+                    advance_cursor_from(&mut state, index, now);
                 }
             }
             Failure::Server => {}
@@ -692,7 +692,7 @@ impl KeyPool {
                         entry.cooling_by = Some(selection.id);
                         entry.consecutive_failures = 0;
                         entry.half_open = true;
-                        advance_cursor(&mut state, now);
+                        advance_cursor_from(&mut state, index, now);
                     }
                 }
             }
@@ -700,11 +700,11 @@ impl KeyPool {
     }
 }
 
-fn advance_cursor(state: &mut PoolState, now: tokio::time::Instant) {
-    let n = state.entries.len();
-    if n == 0 {
+fn advance_cursor_from(state: &mut PoolState, index: usize, now: tokio::time::Instant) {
+    if index != state.cursor {
         return;
     }
+    let n = state.entries.len();
     for off in 1..=n {
         let idx = (state.cursor + off) % n;
         if !state.entries[idx].deadline().is_some_and(|d| d > now) {
