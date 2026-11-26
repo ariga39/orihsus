@@ -652,3 +652,107 @@ async fn healthy_poll_preserves_overlapping_request_backoff_and_breaker() {
                 && key.cooling_remaining == Some(Duration::from_secs(60))));
     }
 }
+const HEALTHY_QUOTA: StaticFetcher = StaticFetcher(br#"{"rolling":{"percent":0,"resetsAt":"2026-08-14T12:01:00Z"},"weekly":{"percent":0,"resetsAt":"2026-08-15T00:00:00Z"},"monthly":{"percent":0,"resetsAt":"2026-09-01T00:00:00Z"}}"#);
+
+async fn poll_key(p: &Arc<KeyPool>, key: &str, sample: &StaticFetcher) {
+    UsageMonitor::poll_once(
+        sample,
+        &FixedClock("2026-08-14T12:00:00Z".parse().unwrap()),
+        95.0,
+        &[Secret::new(key)],
+        p,
+    )
+    .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn quota_recovery_keeps_routing_to_the_first_recovered_key() {
+    let p = pool();
+    for key in ["key-a", "key-b"] {
+        p.report_proactive_cooldown(&fingerprint(key), Duration::from_secs(120));
+    }
+    for recovered in ["key-a", "key-b"] {
+        poll_key(&p, recovered, &HEALTHY_QUOTA).await;
+        let AttemptResult::Selected(selected) = p.request().next().await else {
+            panic!("expected recovered key")
+        };
+        assert_eq!(selected.fingerprint(), fingerprint("key-a"));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn quota_recovery_is_sticky_when_the_second_key_recovers_first() {
+    let p = pool();
+    for key in ["key-a", "key-b"] {
+        p.report_proactive_cooldown(&fingerprint(key), Duration::from_secs(120));
+    }
+    poll_key(&p, "key-b", &HEALTHY_QUOTA).await;
+    assert_eq!(
+        expect_selected_fingerprint(&p).await,
+        fingerprint("key-b"),
+        "the first recovered key becomes the fallback"
+    );
+    poll_key(&p, "key-a", &HEALTHY_QUOTA).await;
+    assert_eq!(
+        expect_selected_fingerprint(&p).await,
+        fingerprint("key-b"),
+        "a later recovery must not displace the serving fallback"
+    );
+}
+
+async fn expect_selected_fingerprint(p: &Arc<KeyPool>) -> String {
+    let AttemptResult::Selected(selected) = p.request().next().await else {
+        panic!("expected a healthy key");
+    };
+    selected.fingerprint().to_string()
+}
+
+#[tokio::test(start_paused = true)]
+async fn quota_recovery_reschedules_all_waiting_requests() {
+    let shorter = StaticFetcher(br#"{"rolling":{"percent":95,"resetsAt":"2026-08-14T12:00:05Z"},"weekly":{"percent":0,"resetsAt":"2026-08-15T00:00:00Z"},"monthly":{"percent":0,"resetsAt":"2026-09-01T00:00:00Z"}}"#);
+    for (sample, delay) in [(&HEALTHY_QUOTA, 0), (&shorter, 5)] {
+        let p = pool_with_keys(&["key-a"]);
+        p.report_proactive_cooldown(&fingerprint("key-a"), Duration::from_secs(120));
+        let mut waiters = Vec::new();
+        for _ in 0..2 {
+            let mut req = p.request();
+            waiters.push(tokio::spawn(async move {
+                let selection = req.next().await;
+                (tokio::time::Instant::now(), selection)
+            }));
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let expected = tokio::time::Instant::now() + Duration::from_secs(delay);
+        poll_key(&p, "key-a", sample).await;
+        for waiter in waiters {
+            let (selected_at, selection) = waiter.await.unwrap();
+            assert!(matches!(selection, AttemptResult::Selected(_)));
+            assert_eq!(selected_at, expected);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn waking_for_a_used_key_preserves_the_request_wait_budget() {
+    let p = pool();
+    let start = tokio::time::Instant::now();
+    let mut request = p.request();
+    let AttemptResult::Selected(first) = request.next().await else {
+        panic!("expected first key")
+    };
+    assert_eq!(first.fingerprint(), fingerprint("key-a"));
+    for key in ["key-a", "key-b"] {
+        p.report_proactive_cooldown(&fingerprint(key), Duration::from_secs(60));
+    }
+    let waiting = tokio::spawn(async move { request.next().await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(20)).await;
+    poll_key(&p, "key-a", &HEALTHY_QUOTA).await;
+
+    let AttemptResult::Unavailable { retry_after } = waiting.await.unwrap() else {
+        panic!("second attempt must not reuse key-a");
+    };
+    assert_eq!(start.elapsed(), Duration::from_secs(30));
+    assert_eq!(retry_after, Duration::from_secs(30));
+}
