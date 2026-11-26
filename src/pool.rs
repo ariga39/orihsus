@@ -897,6 +897,16 @@ impl RequestAttempts {
                 .next_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
+        // Read-side fill-first policy: the healthy-preferred fast path is one
+        // availability check; only an unavailable preference scans for the
+        // first globally selectable fallback. Request-local filters above
+        // never influence this decision. Evaluate this BEFORE a half-open
+        // claim: the claim itself makes the probed key temporarily
+        // unavailable and must not move preference off a healthy preferred
+        // key, nor off a fallback that is the probe.
+        if !state.preferred_is_available(now) {
+            state.adopt_first_available(now);
+        }
         if let Some(entry) = state
             .entries
             .iter_mut()
@@ -911,13 +921,6 @@ impl RequestAttempts {
                 // lapsed unreported) can never clear a newer probe's claim.
                 entry.last_failure_by = Some(sel.id);
             }
-        }
-        // Read-side fill-first policy: the healthy-preferred fast path is one
-        // availability check; only an unavailable preference scans for the
-        // first globally selectable fallback. Request-local filters above
-        // never influence this decision.
-        if !state.preferred_is_available(now) {
-            state.adopt_first_available(now);
         }
         Some(sel)
     }

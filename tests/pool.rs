@@ -1762,6 +1762,66 @@ async fn successful_half_open_probe_wakes_waiters_immediately() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn successful_probe_of_the_preferred_key_keeps_it_preferred() {
+    let mut p = policy();
+    p.breaker_threshold = 1;
+    p.breaker_cooldown = Duration::from_secs(5);
+    let pool = pool_with(&["a", "b"], p);
+
+    let trip = expect_selected(pool.request().next().await);
+    assert_eq!(trip.fingerprint(), fingerprint("a"));
+    pool.report_failure(&trip, Failure::Network);
+
+    // No request runs while `a` is cooling, so it reaches probe eligibility
+    // while it is still the global preference.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+
+    let probe = expect_selected(pool.request().next().await);
+    assert_eq!(probe.fingerprint(), fingerprint("a"));
+    pool.report_success(&probe);
+
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("a"),
+        "a successful probe of the preferred key must keep it preferred"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn successful_probe_of_a_fallback_key_adopts_that_fallback() {
+    let mut p = policy();
+    p.breaker_threshold = 1;
+    p.breaker_cooldown = Duration::from_secs(5);
+    let pool = pool_with(&["a", "b", "c"], p);
+
+    // Trip `b` while `a` is still preferred and healthy.
+    let mut req = pool.request();
+    let sel_a = expect_selected(req.next().await);
+    assert_eq!(sel_a.fingerprint(), fingerprint("a"));
+    pool.report_failure(&sel_a, Failure::Server);
+    let sel_b = expect_selected(req.next().await);
+    assert_eq!(sel_b.fingerprint(), fingerprint("b"));
+    pool.report_failure(&sel_b, Failure::Network);
+
+    // Make the preferred key unavailable. `b` is still cooling now but will
+    // become the probe-eligible fallback.
+    pool.report_proactive_cooldown(sel_a.fingerprint(), Duration::from_secs(60));
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+
+    let probe = expect_selected(pool.request().next().await);
+    assert_eq!(probe.fingerprint(), fingerprint("b"));
+    pool.report_success(&probe);
+
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b"),
+        "a successful fallback probe must keep that fallback preferred"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn dropped_half_open_probe_does_not_wedge_the_key() {
     let mut p = policy();
     p.breaker_threshold = 1;
