@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 
 use crate::audit::fingerprint;
 use crate::config::{Secret, Usage};
-use crate::pool::KeyPool;
+use crate::pool::{KeyPool, QuotaUpdate};
 
 const USAGE_HISTORY_QUEUE_CAPACITY: usize = 4096;
 const HISTORY_WARNING: &str =
@@ -514,10 +514,10 @@ impl UsageMonitor {
                     snapshots.update(snapshot);
                 }
             }
-            let Some(cooldown) = evaluate(&body, now, soft_threshold_percent) else {
+            let Some(update) = evaluate(&body, now, soft_threshold_percent) else {
                 continue;
             };
-            pool.report_proactive_cooldown(&fingerprint(key.as_str()), cooldown);
+            pool.update_proactive(&fingerprint(key.as_str()), update);
         }
     }
 }
@@ -530,7 +530,7 @@ impl Drop for UsageMonitor {
     }
 }
 
-fn evaluate(body: &[u8], now: DateTime<Utc>, threshold: f64) -> Option<Duration> {
+fn evaluate(body: &[u8], now: DateTime<Utc>, threshold: f64) -> Option<QuotaUpdate> {
     let root: serde_json::Value = serde_json::from_slice(body).ok()?;
     let usage = root.get("usage").unwrap_or(&root);
     let top_limited = root.get("status").and_then(|v| v.as_str()) == Some("rate-limited");
@@ -541,9 +541,14 @@ fn evaluate(body: &[u8], now: DateTime<Utc>, threshold: f64) -> Option<Duration>
             .and_then(|v| v.as_str())
             == Some("rate-limited")
     });
+    let valid_status = |value: Option<&serde_json::Value>| {
+        value.is_none_or(|v| matches!(v.as_str(), Some("ok" | "rate-limited")))
+    };
+    let mut complete = valid_status(root.get("status"));
     let mut latest = None;
     for name in ["rolling", "weekly", "monthly"] {
         let Some(window) = usage.get(name) else {
+            complete = false;
             continue;
         };
         let percent = window
@@ -552,25 +557,22 @@ fn evaluate(body: &[u8], now: DateTime<Utc>, threshold: f64) -> Option<Duration>
             .and_then(serde_json::Value::as_f64);
         let limited = window.get("status").and_then(|v| v.as_str()) == Some("rate-limited");
         let top_applies = top_limited && (!has_limited_window || limited);
-        if !top_applies
-            && !limited
-            && !percent
-                .is_some_and(|p| p.is_finite() && (0.0..=100.0).contains(&p) && p >= threshold)
-        {
-            continue;
-        }
-        let Some(reset) = window
+        let reset = window
             .get("resetsAt")
-            .and_then(|value| value.as_str())
-            .and_then(|value| value.parse::<DateTime<Utc>>().ok())
-        else {
-            continue;
-        };
-        if reset <= now {
-            continue;
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<DateTime<Utc>>().ok())
+            .filter(|reset| *reset > now);
+        let valid_percent = percent.filter(|p| (0.0..=100.0).contains(p));
+        complete &=
+            valid_status(window.get("status")) && valid_percent.is_some() && reset.is_some();
+        if top_applies || limited || valid_percent.is_some_and(|p| p >= threshold) {
+            latest = latest.max(reset);
         }
-        latest = Some(latest.map_or(reset, |old: DateTime<Utc>| old.max(reset)));
     }
-    let reset = latest?;
-    (reset - now).to_std().ok()
+    let cooldown = latest.and_then(|reset| (reset - now).to_std().ok());
+    if complete {
+        Some(QuotaUpdate::Replace(cooldown))
+    } else {
+        cooldown.map(QuotaUpdate::Extend)
+    }
 }

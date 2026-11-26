@@ -6234,3 +6234,82 @@ async fn normal_stream_completion_releases_the_pump_arc_for_audit_flush() {
         "the completed stream's audit record must be flushed on a normal drained shutdown: {content}"
     );
 }
+#[tokio::test]
+async fn quota_reset_restores_status_and_routes_next_chat_to_recovered_key() {
+    use orihsus::usage::{Clock, UsageFetchError, UsageFetcher, UsageMonitor};
+
+    struct Sample(chrono::DateTime<chrono::Utc>, serde_json::Value);
+    impl Clock for Sample {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            self.0
+        }
+    }
+    #[async_trait]
+    impl UsageFetcher for Sample {
+        async fn fetch(&self, _: &Secret) -> Result<Vec<u8>, UsageFetchError> {
+            Ok(self.1.to_string().into_bytes())
+        }
+    }
+
+    let control = Arc::new(MockControl::default());
+    let addr = start_mock(control.clone()).await;
+    let p = pool(&["test-key-AAAAAA", "test-key-BBBBBB"]);
+    let keys = [Secret::new("test-key-AAAAAA")];
+    let snapshots = UsageSnapshotStore::default();
+    p.report_proactive_cooldown(&fingerprint("test-key-BBBBBB"), Duration::from_secs(3600));
+    let now: chrono::DateTime<chrono::Utc> = "2026-08-01T12:00:00Z".parse().unwrap();
+    for (minutes, percent, days) in [(0, 95, 14), (5, 0, 30)] {
+        let time = now + chrono::Duration::minutes(minutes);
+        let sample = Sample(
+            time,
+            serde_json::json!({"usage":{
+                "rolling":{"percent":0,"resetsAt":(time + chrono::Duration::hours(5)).to_rfc3339()},
+                "weekly":{"percent":0,"resetsAt":(time + chrono::Duration::days(7)).to_rfc3339()},
+                "monthly":{"percent":percent,"resetsAt":(time + chrono::Duration::days(days)).to_rfc3339()}
+            }}),
+        );
+        UsageMonitor::poll_once_with_observers(
+            &sample,
+            &sample,
+            95.0,
+            &keys,
+            &p,
+            None,
+            Some(&snapshots),
+        )
+        .await;
+        assert_eq!(p.has_available_key(), percent == 0);
+    }
+    let app = build_router(
+        state_with(
+            &p,
+            &queue(2, 2, Duration::from_secs(30)),
+            &format!("http://{addr}"),
+            TestSink::default(),
+        )
+        .with_usage_snapshots(snapshots),
+    );
+    let status = send(
+        &app,
+        Request::builder()
+            .uri("/v1/status")
+            .header("authorization", "Bearer gway-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status.status(), StatusCode::OK);
+    let status: serde_json::Value = serde_json::from_str(&body_string(status).await).unwrap();
+    let items = &status["keys"]["items"];
+    assert_eq!(items[0]["id"], "AAAAAA");
+    assert_eq!(items[0]["health"], "healthy");
+    assert_eq!(items[0]["usage"]["monthly"]["percent"], 0.0);
+    assert_eq!(items[1]["health"], "cooling");
+    assert_eq!(send(&app, chat_req()).await.status(), StatusCode::OK);
+    let requests = control.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].headers["authorization"],
+        "Bearer test-key-AAAAAA"
+    );
+}

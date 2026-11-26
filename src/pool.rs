@@ -177,6 +177,10 @@ pub struct KeyPool {
 
 struct PoolInner {
     state: RwLock<PoolState>,
+    /// Wakes requests waiting on an earlier recovery when a poll, a successful
+    /// probe, or a reload makes a key available (or available sooner) than the
+    /// deadline they are currently sleeping on.
+    earlier_recovery: tokio::sync::Notify,
     policy: PoolPolicy,
     jitter: Arc<dyn Jitter>,
     next_id: std::sync::atomic::AtomicU64,
@@ -184,13 +188,17 @@ struct PoolInner {
 
 struct PoolState {
     entries: Vec<KeyEntry>,
-    cursor: usize,
+    /// Index of the fill-first key. Kept as an O(1) cursor for the hot path;
+    /// `replace_keys` remaps it by fingerprint so hot reloads reorder and
+    /// remove preceding keys without changing the preferred identity.
+    preferred: usize,
 }
 
 struct KeyEntry {
     key: Secret,
     fingerprint: String,
     status_id: String,
+    proactive_until: Option<tokio::time::Instant>,
     cooling_until: Option<tokio::time::Instant>,
     cooling_reason: Option<CoolingReason>,
     /// Selection id that applied the current `cooling_until`, if any. A success
@@ -216,6 +224,52 @@ struct KeyEntry {
     /// can never wedge forever.
     half_open: bool,
     liveness_cooling: HashMap<String, tokio::time::Instant>,
+}
+
+pub(crate) enum QuotaUpdate {
+    Replace(Option<Duration>),
+    Extend(Duration),
+}
+
+impl KeyEntry {
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.proactive_until.max(self.cooling_until)
+    }
+
+    fn is_available(&self, now: tokio::time::Instant) -> bool {
+        !self.deadline().is_some_and(|deadline| deadline > now)
+    }
+
+    fn reason(&self) -> Option<CoolingReason> {
+        if self.proactive_until > self.cooling_until {
+            Some(CoolingReason::ProactiveUsage)
+        } else {
+            self.cooling_reason
+        }
+    }
+}
+
+impl PoolState {
+    fn preferred_is_available(&self, now: tokio::time::Instant) -> bool {
+        self.entries[self.preferred].is_available(now)
+    }
+
+    /// Single fill-first fallback policy, applied only when a selection finds
+    /// the preferred key unavailable. Adopt the first globally selectable key
+    /// after it in pool order. Request-local filters (a key already used, a
+    /// model-specific liveness cooldown, or a 5xx failover) never influence
+    /// this choice.
+    fn adopt_first_available(&mut self, now: tokio::time::Instant) {
+        let n = self.entries.len();
+        let start = self.preferred.min(n.saturating_sub(1));
+        for offset in 1..=n {
+            let index = (start + offset) % n;
+            if self.entries[index].is_available(now) {
+                self.preferred = index;
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -265,12 +319,13 @@ impl KeyPool {
         if keys.is_empty() {
             return Err(PoolError::EmptyKeys);
         }
-        let entries = keys
+        let entries: Vec<KeyEntry> = keys
             .into_iter()
             .map(|key| KeyEntry {
                 fingerprint: fingerprint(key.as_str()),
                 status_id: key_suffix(key.as_str()),
                 key,
+                proactive_until: None,
                 cooling_until: None,
                 cooling_reason: None,
                 cooling_by: None,
@@ -283,7 +338,11 @@ impl KeyPool {
             .collect();
         Ok(KeyPool {
             inner: Arc::new(PoolInner {
-                state: RwLock::new(PoolState { entries, cursor: 0 }),
+                state: RwLock::new(PoolState {
+                    entries,
+                    preferred: 0,
+                }),
+                earlier_recovery: tokio::sync::Notify::new(),
                 policy,
                 jitter,
                 next_id: std::sync::atomic::AtomicU64::new(0),
@@ -298,30 +357,47 @@ impl KeyPool {
         if keys.is_empty() {
             return Err(PoolError::EmptyKeys);
         }
-        let mut state = write_state(&self.inner);
-        let old = &state.entries;
-        let entries: Vec<KeyEntry> = keys
-            .into_iter()
-            .map(|key| {
-                let fingerprint = fingerprint(key.as_str());
-                let prev = old.iter().find(|e| e.fingerprint == fingerprint);
-                KeyEntry {
-                    fingerprint,
-                    status_id: key_suffix(key.as_str()),
-                    key,
-                    cooling_until: prev.and_then(|e| e.cooling_until),
-                    cooling_reason: prev.and_then(|e| e.cooling_reason),
-                    cooling_by: prev.and_then(|e| e.cooling_by),
-                    consecutive_failures: prev.map_or(0, |e| e.consecutive_failures),
-                    backoff_step: prev.map_or(0, |e| e.backoff_step),
-                    last_failure_by: prev.and_then(|e| e.last_failure_by),
-                    half_open: prev.is_some_and(|e| e.half_open),
-                    liveness_cooling: prev.map(|e| e.liveness_cooling.clone()).unwrap_or_default(),
-                }
-            })
-            .collect();
-        state.cursor = state.cursor.min(entries.len().saturating_sub(1));
-        state.entries = entries;
+        {
+            let mut state = write_state(&self.inner);
+            let preferred_fingerprint = state.entries[state.preferred].fingerprint.clone();
+            let entries: Vec<KeyEntry> = {
+                let old = &state.entries;
+                keys.into_iter()
+                    .map(|key| {
+                        let fingerprint = fingerprint(key.as_str());
+                        let prev = old.iter().find(|e| e.fingerprint == fingerprint);
+                        KeyEntry {
+                            fingerprint,
+                            status_id: key_suffix(key.as_str()),
+                            key,
+                            proactive_until: prev.and_then(|e| e.proactive_until),
+                            cooling_until: prev.and_then(|e| e.cooling_until),
+                            cooling_reason: prev.and_then(|e| e.cooling_reason),
+                            cooling_by: prev.and_then(|e| e.cooling_by),
+                            consecutive_failures: prev.map_or(0, |e| e.consecutive_failures),
+                            backoff_step: prev.map_or(0, |e| e.backoff_step),
+                            last_failure_by: prev.and_then(|e| e.last_failure_by),
+                            half_open: prev.is_some_and(|e| e.half_open),
+                            liveness_cooling: prev
+                                .map(|e| e.liveness_cooling.clone())
+                                .unwrap_or_default(),
+                        }
+                    })
+                    .collect()
+            };
+            // Remap the preference by fingerprint, so reordering or removing
+            // preceding keys never changes the preferred identity. If the
+            // preferred key itself was removed, start from the first key of
+            // the new generation.
+            state.preferred = entries
+                .iter()
+                .position(|entry| entry.fingerprint == preferred_fingerprint)
+                .unwrap_or(0);
+            state.entries = entries;
+        }
+        // Membership/deadlines may have changed; let waiting requests
+        // re-evaluate instead of sleeping until an old deadline.
+        self.inner.earlier_recovery.notify_waiters();
         Ok(())
     }
 }
@@ -344,7 +420,7 @@ impl fmt::Debug for KeyPool {
             .collect();
         f.debug_struct("KeyPool")
             .field("keys", &fingerprints)
-            .field("cursor", &state.cursor)
+            .field("preferred", &state.preferred)
             .finish()
     }
 }
@@ -450,9 +526,10 @@ pub struct RequestAttempts {
 
 impl KeyPool {
     /// Begin a request-scoped attempt series against this pool. The candidates
-    /// (keys + their cooldown deadlines, in cursor order) are captured NOW:
-    /// a request is pinned to the generation that existed when it started, so a
-    /// concurrent `replace_keys` can never leak a newly-added key into it.
+    /// (keys + their cooldown deadlines, in fill-first preference order) are
+    /// captured NOW: a request is pinned to the generation that existed when it
+    /// started, so a concurrent `replace_keys` can never leak a newly-added key
+    /// into it. The pinned order is not rewritten by a later preference change.
     pub fn request(&self) -> RequestAttempts {
         self.request_with_model(None)
     }
@@ -464,9 +541,10 @@ impl KeyPool {
     fn request_with_model(&self, model: Option<String>) -> RequestAttempts {
         let state = read_state(&self.inner);
         let n = state.entries.len();
+        let start = state.preferred;
         let mut candidates = Vec::with_capacity(n);
         for off in 0..n {
-            let idx = (state.cursor + off) % n;
+            let idx = (start + off) % n;
             let e = &state.entries[idx];
             candidates.push(RequestCandidate {
                 fingerprint: e.fingerprint.clone(),
@@ -505,10 +583,7 @@ impl KeyPool {
     pub fn has_available_key(&self) -> bool {
         let state = read_state(&self.inner);
         let now = tokio::time::Instant::now();
-        state
-            .entries
-            .iter()
-            .any(|e| !e.cooling_until.is_some_and(|d| d > now))
+        state.entries.iter().any(|e| e.is_available(now))
     }
 
     /// Secret-free, stable snapshot for the authenticated status endpoint.
@@ -520,7 +595,7 @@ impl KeyPool {
             .iter()
             .map(|entry| {
                 let remaining = entry
-                    .cooling_until
+                    .deadline()
                     .filter(|deadline| *deadline > now)
                     .map(|deadline| deadline.saturating_duration_since(now));
                 PoolKeyStatus {
@@ -531,7 +606,7 @@ impl KeyPool {
                     } else {
                         "healthy"
                     },
-                    cooling_reason: remaining.and(entry.cooling_reason.map(CoolingReason::as_str)),
+                    cooling_reason: remaining.and(entry.reason().map(CoolingReason::as_str)),
                     cooling_remaining: remaining,
                 }
             })
@@ -544,79 +619,91 @@ impl KeyPool {
     }
 
     /// Report a successful request for `selection`: reset failure/backoff state.
-    /// Fill-first keeps the current key; only failures advance the cursor. A
-    /// success from an older selection never touches state that a newer report
-    /// applied to the key — the cooldown, its `consecutive_failures`, its
-    /// `backoff_step`, and the half-open marker are all left intact, even when
-    /// no cooldown is currently active. Only a later or current success (whose
-    /// selection id is not older than `last_failure_by`) resets the key's state
-    /// normally and clears the marker. A success on a half-open probe confirms
-    /// the key healthy and clears the half-open marker.
+    /// Fill-first keeps the current key; a success never rotates away from a
+    /// healthy preferred key. A success from an older selection never touches
+    /// state that a newer report applied to the key — the cooldown, its
+    /// `consecutive_failures`, its `backoff_step`, and the half-open marker are
+    /// all left intact, even when no cooldown is currently active. Only a later
+    /// or current success (whose selection id is not older than
+    /// `last_failure_by`) resets the key's state normally and clears the
+    /// marker. A success on a half-open probe confirms the key healthy, clears
+    /// the half-open marker, and wakes waiters if it lifts the key's effective
+    /// deadline early.
     pub fn report_success(&self, selection: &Selection) {
-        let mut state = write_state(&self.inner);
-        let Some(entry) = state
-            .entries
-            .iter_mut()
-            .find(|e| e.fingerprint == selection.fingerprint)
-        else {
-            return;
-        };
-        if entry.last_failure_by.is_some_and(|id| id > selection.id) {
-            return;
-        }
-        entry.backoff_step = 0;
-        entry.consecutive_failures = 0;
-        entry.cooling_until = None;
-        entry.cooling_reason = None;
-        entry.cooling_by = None;
-        entry.half_open = false;
-        entry.last_failure_by = None;
+        self.update_key_deadline(&selection.fingerprint, |entry, _now| {
+            if entry.last_failure_by.is_some_and(|id| id > selection.id) {
+                return false;
+            }
+            entry.backoff_step = 0;
+            entry.consecutive_failures = 0;
+            entry.cooling_until = None;
+            entry.cooling_reason = None;
+            entry.cooling_by = None;
+            entry.half_open = false;
+            entry.last_failure_by = None;
+            true
+        });
     }
 
-    /// Cool a live key based on a proactive usage observation. The report
-    /// participates in the same monotonic report ordering as request results.
-    pub fn report_proactive_cooldown(&self, fingerprint: &str, cooldown: Duration) {
-        let now = tokio::time::Instant::now();
-        let deadline = deadline_after(now, cooldown);
-        let mut state = write_state(&self.inner);
-        let Some(entry) = state
-            .entries
-            .iter_mut()
-            .find(|entry| entry.fingerprint == fingerprint)
-        else {
-            return;
+    /// Apply a deadline-changing update to one key and wake waiters if the
+    /// key's effective deadline moved earlier (including becoming available).
+    /// `None` sorts before every future deadline, so `<` is exactly the
+    /// "became available now or sooner" test.
+    fn update_key_deadline<F>(&self, fingerprint: &str, update: F)
+    where
+        F: FnOnce(&mut KeyEntry, tokio::time::Instant) -> bool,
+    {
+        let (previous, updated) = {
+            let mut state = write_state(&self.inner);
+            let now = tokio::time::Instant::now();
+            let Some(entry) = state
+                .entries
+                .iter_mut()
+                .find(|entry| entry.fingerprint == fingerprint)
+            else {
+                return;
+            };
+            let previous = entry.deadline().filter(|deadline| *deadline > now);
+            if !update(entry, now) {
+                return;
+            }
+            let updated = entry.deadline().filter(|deadline| *deadline > now);
+            (previous, updated)
         };
-        // Allocate while holding the same state lock used by selection. This
-        // keeps id order aligned with state-commit order, so a selection that
-        // truly predates this report can never look newer merely because the
-        // reporter waited for the lock after reserving its id.
-        let report_id = self
-            .inner
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if !entry
-            .cooling_until
-            .is_some_and(|existing| existing > deadline)
-        {
-            entry.cooling_until = Some(deadline);
-            entry.cooling_reason = Some(CoolingReason::ProactiveUsage);
-            entry.cooling_by = Some(report_id);
-            entry.last_failure_by = Some(report_id);
-            advance_cursor(&mut state, now);
+        if updated < previous {
+            self.inner.earlier_recovery.notify_waiters();
         }
+    }
+
+    /// A limiting window in a partial sample can only extend the known restriction.
+    pub fn report_proactive_cooldown(&self, fingerprint: &str, cooldown: Duration) {
+        self.update_proactive(fingerprint, QuotaUpdate::Extend(cooldown));
+    }
+
+    pub(crate) fn update_proactive(&self, fingerprint: &str, update: QuotaUpdate) {
+        self.update_key_deadline(fingerprint, move |entry, now| {
+            entry.proactive_until = match update {
+                QuotaUpdate::Replace(cooldown) => cooldown.map(|d| deadline_after(now, d)),
+                QuotaUpdate::Extend(duration) => entry
+                    .proactive_until
+                    .max(Some(deadline_after(now, duration))),
+            };
+            true
+        });
     }
 
     /// Report a failed request for `selection`.
     pub fn report_failure(&self, selection: &Selection, failure: Failure) {
         let mut state = write_state(&self.inner);
         let now = tokio::time::Instant::now();
-        let Some(entry) = state
+        let Some(index) = state
             .entries
-            .iter_mut()
-            .find(|e| e.fingerprint == selection.fingerprint)
+            .iter()
+            .position(|e| e.fingerprint == selection.fingerprint)
         else {
             return;
         };
+        let entry = &mut state.entries[index];
         match failure {
             Failure::UsageLimit { cooldown, .. } => {
                 let new_deadline = deadline_after(now, cooldown);
@@ -625,7 +712,6 @@ impl KeyPool {
                     entry.cooling_reason = Some(CoolingReason::UsageLimit);
                     entry.cooling_by = Some(selection.id);
                     entry.last_failure_by = Some(selection.id);
-                    advance_cursor(&mut state, now);
                 }
             }
             Failure::RateLimited { retry_after } | Failure::Unavailable { retry_after } => {
@@ -659,7 +745,6 @@ impl KeyPool {
                     entry.cooling_reason = Some(reason);
                     entry.cooling_by = Some(selection.id);
                     entry.last_failure_by = Some(selection.id);
-                    advance_cursor(&mut state, now);
                 }
             }
             Failure::Server => {}
@@ -674,24 +759,9 @@ impl KeyPool {
                         entry.cooling_by = Some(selection.id);
                         entry.consecutive_failures = 0;
                         entry.half_open = true;
-                        advance_cursor(&mut state, now);
                     }
                 }
             }
-        }
-    }
-}
-
-fn advance_cursor(state: &mut PoolState, now: tokio::time::Instant) {
-    let n = state.entries.len();
-    if n == 0 {
-        return;
-    }
-    for off in 1..=n {
-        let idx = (state.cursor + off) % n;
-        if !state.entries[idx].cooling_until.is_some_and(|d| d > now) {
-            state.cursor = idx;
-            return;
         }
     }
 }
@@ -731,7 +801,7 @@ impl RequestAttempts {
         if self.used.len() >= self.max {
             return AttemptResult::Exhausted;
         }
-        match self.try_select_unused() {
+        match self.try_select_unused(&mut write_state(&self.pool), tokio::time::Instant::now()) {
             Some(sel) => {
                 self.used.push(sel.fingerprint.clone());
                 AttemptResult::Selected(sel)
@@ -749,29 +819,35 @@ impl RequestAttempts {
         }
         let deadline = self.deadline;
         loop {
-            if let Some(sel) = self.try_select_unused() {
-                self.used.push(sel.fingerprint.clone());
-                return AttemptResult::Selected(sel);
-            }
-            if !self.has_unused() {
-                return AttemptResult::Exhausted;
-            }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                let earliest = self.earliest_recovery().unwrap_or(now);
-                return AttemptResult::Unavailable {
-                    retry_after: earliest.saturating_duration_since(now),
+            // notify_waiters covers futures created before the update, even if
+            // they have not been polled yet. Subscribe before inspecting health.
+            let changed = self.pool.earlier_recovery.notified();
+            let wake_at = {
+                let mut state = write_state(&self.pool);
+                let now = tokio::time::Instant::now();
+                if let Some(sel) = self.try_select_unused(&mut state, now) {
+                    self.used.push(sel.fingerprint.clone());
+                    return AttemptResult::Selected(sel);
+                }
+                if !self.has_unused() {
+                    return AttemptResult::Exhausted;
+                }
+                let Some(earliest) = self.earliest_recovery(&state, now) else {
+                    return AttemptResult::Unavailable {
+                        retry_after: Duration::ZERO,
+                    };
                 };
-            }
-            let Some(earliest) = self.earliest_recovery() else {
-                return AttemptResult::Unavailable {
-                    retry_after: Duration::ZERO,
-                };
+                if now >= deadline {
+                    return AttemptResult::Unavailable {
+                        retry_after: earliest.saturating_duration_since(now),
+                    };
+                }
+                earliest.min(deadline)
             };
-            if earliest <= now {
-                continue;
+            tokio::select! {
+                _ = changed => {},
+                _ = tokio::time::sleep_until(wake_at) => {},
             }
-            tokio::time::sleep_until(earliest.min(deadline)).await;
         }
     }
 
@@ -787,9 +863,11 @@ impl RequestAttempts {
     /// `last_failure_by`, so a late success from an earlier, dropped probe can
     /// never clear a newer probe's claim and reopen the key to concurrent
     /// selectors.
-    fn try_select_unused(&self) -> Option<Selection> {
-        let mut state = write_state(&self.pool);
-        let now = tokio::time::Instant::now();
+    fn try_select_unused(
+        &self,
+        state: &mut PoolState,
+        now: tokio::time::Instant,
+    ) -> Option<Selection> {
         let cand_idx = self.candidates.iter().position(|c| {
             if self.used.contains(&c.fingerprint) {
                 return false;
@@ -800,7 +878,7 @@ impl RequestAttempts {
                 .find(|e| e.fingerprint == c.fingerprint)
             {
                 Some(e) => {
-                    !e.cooling_until.is_some_and(|d| d > now)
+                    e.is_available(now)
                         && !self.model.as_ref().is_some_and(|model| {
                             e.liveness_cooling
                                 .get(model)
@@ -819,6 +897,16 @@ impl RequestAttempts {
                 .next_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
+        // Read-side fill-first policy: the healthy-preferred fast path is one
+        // availability check; only an unavailable preference scans for the
+        // first globally selectable fallback. Request-local filters above
+        // never influence this decision. Evaluate this BEFORE a half-open
+        // claim: the claim itself makes the probed key temporarily
+        // unavailable and must not move preference off a healthy preferred
+        // key, nor off a fallback that is the probe.
+        if !state.preferred_is_available(now) {
+            state.adopt_first_available(now);
+        }
         if let Some(entry) = state
             .entries
             .iter_mut()
@@ -843,9 +931,11 @@ impl RequestAttempts {
             .any(|c| !self.used.contains(&c.fingerprint))
     }
 
-    fn earliest_recovery(&self) -> Option<tokio::time::Instant> {
-        let state = read_state(&self.pool);
-        let now = tokio::time::Instant::now();
+    fn earliest_recovery(
+        &self,
+        state: &PoolState,
+        now: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
         self.candidates
             .iter()
             .filter_map(|c| {
@@ -857,7 +947,7 @@ impl RequestAttempts {
                     .model
                     .as_ref()
                     .and_then(|model| entry.liveness_cooling.get(model).copied());
-                match (entry.cooling_until, model_deadline) {
+                match (entry.deadline(), model_deadline) {
                     (Some(global), Some(model)) => Some(global.max(model)),
                     (Some(global), None) => Some(global),
                     (None, Some(model)) => Some(model),

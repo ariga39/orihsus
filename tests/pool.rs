@@ -187,6 +187,34 @@ async fn proactive_cooldown_immediately_switches_to_the_next_key() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn late_429_after_quota_failover_keeps_the_current_healthy_key() {
+    let pool = pool(&["a", "b", "c"]);
+    let inflight = expect_selected(pool.request().next().await);
+    assert_eq!(inflight.fingerprint(), fingerprint("a"));
+    pool.report_proactive_cooldown(inflight.fingerprint(), Duration::from_secs(10));
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b")
+    );
+
+    pool.report_failure(
+        &inflight,
+        Failure::RateLimited {
+            retry_after: Some(Duration::from_secs(60)),
+        },
+    );
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b")
+    );
+    assert!(pool
+        .status_snapshot()
+        .iter()
+        .any(|key| key.cooling_reason == Some("rate_limited")
+            && key.cooling_remaining == Some(Duration::from_secs(60))));
+}
+
+#[tokio::test(start_paused = true)]
 async fn proactively_cooled_key_recovers_exactly_at_reset() {
     let pool = pool(&["a"]);
     pool.report_proactive_cooldown(&fingerprint("a"), Duration::from_secs(10));
@@ -202,6 +230,61 @@ async fn proactively_cooled_key_recovers_exactly_at_reset() {
     assert_eq!(
         expect_selected(handle.await.unwrap()).fingerprint(),
         fingerprint("a")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn natural_expiry_keeps_the_first_recovered_key() {
+    let pool = pool(&["a", "b"]);
+    // `b` recovers first while `a` remains cooling longer. The initial
+    // preference is `a`, so `b` is a fallback, not the old cursor target.
+    pool.report_proactive_cooldown(&fingerprint("b"), Duration::from_secs(10));
+    pool.report_proactive_cooldown(&fingerprint("a"), Duration::from_secs(20));
+
+    let mut req = pool.request();
+    let handle = tokio::spawn(async move { req.next().await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::task::yield_now().await;
+    let first = expect_selected(handle.await.unwrap());
+    assert_eq!(
+        first.fingerprint(),
+        fingerprint("b"),
+        "the first naturally recovered key must serve"
+    );
+    assert!(
+        pool.status_snapshot()
+            .iter()
+            .any(|key| key.id == "a" && key.health == "cooling"),
+        "the fallback must be selected while the previous preferred key is still recovering"
+    );
+
+    // `a`'s natural expiry must not switch requests back to the original key.
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b"),
+        "natural expiry must keep the adopted fallback key"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn natural_expiry_does_not_restore_a_demoted_preference() {
+    let pool = pool(&["a", "b"]);
+    let sel_a = expect_selected(pool.request().next().await);
+    assert_eq!(sel_a.fingerprint(), fingerprint("a"));
+    pool.report_proactive_cooldown(sel_a.fingerprint(), Duration::from_secs(10));
+
+    let sel_b = expect_selected(pool.request().next().await);
+    assert_eq!(sel_b.fingerprint(), fingerprint("b"));
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b"),
+        "the demoted key's natural expiry must not displace the healthy fallback"
     );
 }
 
@@ -406,6 +489,43 @@ async fn server_failure_does_not_disable_key_but_failover_uses_distinct_key() {
         sel.fingerprint(),
         fingerprint("a"),
         "5xx must not cool or switch the current key"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_local_detours_do_not_change_global_preference() {
+    let pool = pool(&["a", "b", "c"]);
+    let mut req = pool.request();
+    let sel_a = expect_selected(req.next().await);
+    assert_eq!(sel_a.fingerprint(), fingerprint("a"));
+
+    // A 5xx does not cool `a`; the request's second attempt must use a
+    // distinct key, but that per-request detour must not move the preference.
+    pool.report_failure(&sel_a, Failure::Server);
+    assert_eq!(
+        expect_selected(req.next().await).fingerprint(),
+        fingerprint("b"),
+        "a 5xx failover must use a distinct key"
+    );
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("a"),
+        "a request-local 5xx detour must not change the global preferred key"
+    );
+
+    // A model-specific liveness cooldown detours this model to `b` while `a`
+    // stays globally healthy, so unrelated models must keep preferring `a`.
+    pool.report_liveness_failure(&sel_a, "model-a");
+    let mut model_req = pool.request_for_model("model-a");
+    assert_eq!(
+        expect_selected(model_req.next().await).fingerprint(),
+        fingerprint("b"),
+        "the liveness-cooled key must be skipped for that model"
+    );
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("a"),
+        "a model-specific liveness detour must not change the global preferred key"
     );
 }
 
@@ -846,6 +966,80 @@ async fn replace_keys_removes_adds_and_never_invalidates_held_lease() {
         pool.replace_keys(Vec::new()),
         Err(PoolError::EmptyKeys)
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn replace_keys_preserves_preferred_identity_not_numeric_position() {
+    let pool = pool(&["a", "b", "c"]);
+    let sel_a = expect_selected(pool.request().next().await);
+    assert_eq!(sel_a.fingerprint(), fingerprint("a"));
+    pool.report_proactive_cooldown(sel_a.fingerprint(), Duration::from_secs(60));
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b"),
+        "a cooling preferred key falls back to `b`"
+    );
+
+    // Reorder so `b` moves from index 1 to index 0. A numeric cursor would
+    // now point at `a`, but the preferred identity must remain `b`.
+    pool.replace_keys(vec![Secret::new("b"), Secret::new("a"), Secret::new("c")])
+        .unwrap();
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b"),
+        "a hot reload must preserve the preferred key by identity"
+    );
+
+    // Removing a preceding key shifts `b` to index 0 as well.
+    pool.replace_keys(vec![Secret::new("b"), Secret::new("c")])
+        .unwrap();
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b"),
+        "removing a preceding key must not move the preference"
+    );
+
+    // If the preferred key itself disappears, adopt the first selectable key
+    // in the new generation.
+    pool.replace_keys(vec![Secret::new("c")]).unwrap();
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("c"),
+        "a removed preferred key is replaced deterministically"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_request_snapshot_cannot_displace_a_healthy_current_key() {
+    let pool = pool(&["a", "b", "c"]);
+    // Pin this request's candidate order while `a` is preferred.
+    let mut stale = pool.request();
+
+    let sel_a = expect_selected(pool.request().next().await);
+    assert_eq!(sel_a.fingerprint(), fingerprint("a"));
+    pool.report_proactive_cooldown(sel_a.fingerprint(), Duration::from_secs(10));
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b"),
+        "the fallback key becomes preferred"
+    );
+
+    tokio::time::advance(Duration::from_secs(10)).await;
+    tokio::task::yield_now().await;
+
+    // The old snapshot still offers `a` first and may use it, but that
+    // request-local selection must not displace the healthy preferred `b`.
+    let stale_sel = expect_selected(stale.next().await);
+    assert_eq!(
+        stale_sel.fingerprint(),
+        fingerprint("a"),
+        "a pinned snapshot keeps its captured order"
+    );
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b"),
+        "an old snapshot must not replace a healthy current preference"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1516,6 +1710,115 @@ async fn breaker_half_open_skips_to_healthy_key_under_concurrency() {
         let sel = expect_selected(h.await.unwrap());
         assert_eq!(sel.fingerprint(), fingerprint("a"));
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn successful_half_open_probe_wakes_waiters_immediately() {
+    let mut p = policy();
+    p.breaker_threshold = 1;
+    p.breaker_cooldown = Duration::from_secs(5);
+    let pool = pool_with(&["a"], p);
+
+    // Trip the breaker; `a` becomes half-open after five seconds.
+    let warmer = expect_selected(pool.request().next().await);
+    pool.report_failure(&warmer, Failure::Network);
+
+    // Two requests reach the recovery point together. Exactly one claims the
+    // probe; the other waits on the claim deadline.
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let mut req = pool.request();
+        handles.push(tokio::spawn(async move { req.next().await }));
+    }
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+
+    let mut probes = Vec::new();
+    let mut waiting = Vec::new();
+    for handle in handles {
+        if handle.is_finished() {
+            probes.push(handle.await.unwrap());
+        } else {
+            waiting.push(handle);
+        }
+    }
+    assert_eq!(probes.len(), 1, "exactly one half-open probe is claimed");
+    assert_eq!(waiting.len(), 1, "the other request waits for the probe");
+    let probe = expect_selected(probes.pop().unwrap());
+
+    // The probe succeeds before its claim deadline. The waiter must be woken
+    // now, not at the old claim deadline (which is five seconds away).
+    pool.report_success(&probe);
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        waiting[0].is_finished(),
+        "a successful probe must wake waiters immediately"
+    );
+    let selected = expect_selected(waiting.pop().unwrap().await.unwrap());
+    assert_eq!(selected.fingerprint(), fingerprint("a"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn successful_probe_of_the_preferred_key_keeps_it_preferred() {
+    let mut p = policy();
+    p.breaker_threshold = 1;
+    p.breaker_cooldown = Duration::from_secs(5);
+    let pool = pool_with(&["a", "b"], p);
+
+    let trip = expect_selected(pool.request().next().await);
+    assert_eq!(trip.fingerprint(), fingerprint("a"));
+    pool.report_failure(&trip, Failure::Network);
+
+    // No request runs while `a` is cooling, so it reaches probe eligibility
+    // while it is still the global preference.
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+
+    let probe = expect_selected(pool.request().next().await);
+    assert_eq!(probe.fingerprint(), fingerprint("a"));
+    pool.report_success(&probe);
+
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("a"),
+        "a successful probe of the preferred key must keep it preferred"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn successful_probe_of_a_fallback_key_adopts_that_fallback() {
+    let mut p = policy();
+    p.breaker_threshold = 1;
+    p.breaker_cooldown = Duration::from_secs(5);
+    let pool = pool_with(&["a", "b", "c"], p);
+
+    // Trip `b` while `a` is still preferred and healthy.
+    let mut req = pool.request();
+    let sel_a = expect_selected(req.next().await);
+    assert_eq!(sel_a.fingerprint(), fingerprint("a"));
+    pool.report_failure(&sel_a, Failure::Server);
+    let sel_b = expect_selected(req.next().await);
+    assert_eq!(sel_b.fingerprint(), fingerprint("b"));
+    pool.report_failure(&sel_b, Failure::Network);
+
+    // Make the preferred key unavailable. `b` is still cooling now but will
+    // become the probe-eligible fallback.
+    pool.report_proactive_cooldown(sel_a.fingerprint(), Duration::from_secs(60));
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::task::yield_now().await;
+
+    let probe = expect_selected(pool.request().next().await);
+    assert_eq!(probe.fingerprint(), fingerprint("b"));
+    pool.report_success(&probe);
+
+    assert_eq!(
+        expect_selected(pool.request().next().await).fingerprint(),
+        fingerprint("b"),
+        "a successful fallback probe must keep that fallback preferred"
+    );
 }
 
 #[tokio::test(start_paused = true)]
