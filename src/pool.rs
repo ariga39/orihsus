@@ -603,24 +603,24 @@ impl KeyPool {
     pub(crate) fn update_proactive(&self, fingerprint: &str, update: QuotaUpdate) {
         let mut state = write_state(&self.inner);
         let now = tokio::time::Instant::now();
-        let Some(entry) = state
+        let Some(index) = state
             .entries
-            .iter_mut()
-            .find(|entry| entry.fingerprint == fingerprint)
+            .iter()
+            .position(|entry| entry.fingerprint == fingerprint)
         else {
             return;
         };
-        let deadline = match update {
+        let current = index == state.cursor;
+        let entry = &mut state.entries[index];
+        let was_available = entry.deadline().is_none_or(|d| d <= now);
+        entry.proactive_until = match update {
             QuotaUpdate::Replace(cooldown) => cooldown.map(|d| deadline_after(now, d)),
             QuotaUpdate::Extend(duration) => entry
                 .proactive_until
                 .max(Some(deadline_after(now, duration))),
         };
-        if deadline != entry.proactive_until {
-            entry.proactive_until = deadline;
-            if deadline.is_some() {
-                advance_cursor(&mut state, now);
-            }
+        if current && was_available && entry.proactive_until.is_some_and(|d| d > now) {
+            advance_cursor(&mut state, now);
         }
     }
 

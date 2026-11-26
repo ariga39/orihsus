@@ -11,9 +11,13 @@ use orihsus::usage::{Clock, UsageFetchError, UsageFetcher, UsageHistoryWriter, U
 use tempfile::TempDir;
 
 fn pool() -> Arc<KeyPool> {
+    pool_with_keys(&["key-a", "key-b"])
+}
+
+fn pool_with_keys(keys: &[&str]) -> Arc<KeyPool> {
     Arc::new(
         KeyPool::with_jitter(
-            vec![Secret::new("key-a"), Secret::new("key-b")],
+            keys.iter().map(|key| Secret::new(*key)).collect(),
             PoolPolicy {
                 backoff_initial: Duration::from_secs(5),
                 backoff_max: Duration::from_secs(60),
@@ -579,7 +583,7 @@ async fn rounds_never_overlap_and_shutdown_joins_the_worker() {
 }
 #[tokio::test(start_paused = true)]
 async fn only_complete_quota_samples_can_shorten_an_existing_deadline() {
-    let p = pool();
+    let p = pool_with_keys(&["key-a", "key-b", "key-c"]);
     let keys = [Secret::new("key-a")];
     let clock = FixedClock("2026-08-14T12:00:00Z".parse().unwrap());
     let old = Duration::from_secs(86400);
@@ -605,6 +609,10 @@ async fn only_complete_quota_samples_can_shorten_an_existing_deadline() {
     let shorter = StaticFetcher(br#"{"rolling":{"percent":95,"resetsAt":"2026-08-14T12:01:00Z"},"weekly":{"percent":0,"resetsAt":"2026-08-15T00:00:00Z"},"monthly":{"percent":0,"resetsAt":"2026-09-01T00:00:00Z"}}"#);
     UsageMonitor::poll_once(&shorter, &clock, 95.0, &keys, &p).await;
     assert_eq!(remaining(), Some(Duration::from_secs(60)));
+    let AttemptResult::Selected(selected) = p.request().next().await else {
+        panic!("expected a healthy key");
+    };
+    assert_eq!(selected.fingerprint(), fingerprint("key-b"));
 }
 
 #[tokio::test(start_paused = true)]
