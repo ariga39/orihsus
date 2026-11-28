@@ -23,3 +23,13 @@ keys:
 # To pin a manual allowlist instead, add `models: ["deepseek-chat"]`.
 model_sync:
   interval_seconds: 3600
+
+# New client sessions avoid keys at or above this usage percentage in any
+# window. Existing durable session bindings ignore this soft quota.
+usage:
+  soft_threshold_percent: 95
+
+# Durable client-session -> key affinity. Create this directory for the
+# service user or let systemd StateDirectory=orihsus create it.
+session_routing:
+  state_path: "/var/lib/orihsus/session-bindings.sqlite3"

@@ -156,6 +156,10 @@ sudo systemctl kill -s HUP orihsus
 
 Successful five-minute usage polls are also recorded under `/var/log/orihsus/usage` by default. Each UTC day has one append-only `YYYY-MM-DD.jsonl` file; these files are deliberately outside the audit logrotate policy and are never merged or rotated by the process. Every line contains a timestamp, a 12-hex SHA-256 key fingerprint, and the rolling/weekly/monthly status, percent, and reset time. It never contains a raw key. Configure another directory with top-level `usage_history_dir`; ensure the `orihsus` user can create and append files there and extend the systemd `ReadWritePaths` sandbox if it is outside `/var/log/orihsus`.
 
+Durable client-session affinity uses an embedded SQLite database at `session_routing.state_path` (default `/var/lib/orihsus/session-bindings.sqlite3`). The unit creates `/var/lib/orihsus` through `StateDirectory=orihsus`, sets it mode `0700`, and keeps it writable under `ProtectSystem=strict`. The database stores only full SHA-256 session hashes and key fingerprints. Back it up with the service stopped, or use SQLite's online backup tooling; do not copy only the main file while WAL mode is active. Startup fails explicitly if the path cannot be opened or created.
+
+First deployment starts with an empty affinity database; there is no historical audit or usage backfill, and only requests carrying a real client `x-opencode-session` create bindings. Legacy requests without that header never do. Until the first successful usage poll, new-session FEFO has no monthly observations and falls back to fill-first order, while soft-threshold admission is not yet populated. If the deployment depends on only one eligible key, wait for the first poll and verify `GET /v1/status` shows the expected usage/health before admitting traffic.
+
 Usage-history writes use a bounded background queue. A full queue, unwritable directory, or file error drops history without delaying the usage request or its cooldown decision; monitor the static warning in the journal. Choose retention according to capacity-planning needs. To aggregate a UTC date range by fingerprint:
 
 ```bash
@@ -164,7 +168,7 @@ node tools/usage-summary.mjs --dir /var/log/orihsus/usage --days 30
 
 ## 7. Reload and restart boundaries
 
-The gateway key set, upstream key set, and model list are hot-reloadable. Listener/server settings, capacity, key-failure handling, audit, usage-poll scheduling, and `usage_history_dir` require an orihsus restart. The upstream origin and API-path allowlist are compiled in. nginx certificates and edge policy are reloaded independently with `nginx -t && systemctl reload nginx`.
+The gateway key set, upstream key set, and model list are hot-reloadable. Listener/server settings, capacity, key-failure handling, audit, usage-poll scheduling, `usage_history_dir`, and `session_routing` require an orihsus restart. The upstream origin and API-path allowlist are compiled in. nginx certificates and edge policy are reloaded independently with `nginx -t && systemctl reload nginx`.
 
 ## 8. Resource discipline
 

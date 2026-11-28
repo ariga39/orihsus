@@ -19,7 +19,7 @@ OpenCode Go subscription keys have independent usage limits and recovery times. 
 
 ### System boundary
 
-Implement one Rust process that authenticates gateway clients, exposes a small OpenAI-compatible route set on loopback HTTP, forwards to an HTTPS OpenCode upstream, rotates keys, and writes JSONL audit records. nginx is the only public listener and terminates TLS/HTTP2. Do not add a database, management UI, or arbitrary proxying.
+Implement one Rust process that authenticates gateway clients, exposes a small OpenAI-compatible route set on loopback HTTP, forwards to an HTTPS OpenCode upstream, rotates keys, and writes JSONL audit records. nginx is the only public listener and terminates TLS/HTTP2. Do not add an external database, management UI, or arbitrary proxying; one embedded SQLite file holds durable client-session affinity.
 
 ### Components
 

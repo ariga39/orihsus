@@ -50,6 +50,7 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 libc = "0.2"
 tower = { version = "0.5", features = ["util"] }
 async-trait = "0.1"
+rusqlite = { version = "0.43", features = ["bundled"] }
 tikv-jemallocator = "0.6"
 
 [dev-dependencies]

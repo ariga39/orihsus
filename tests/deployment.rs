@@ -54,7 +54,9 @@ fn systemd_unit_contains_the_required_safety_directives() {
         "MemoryDenyWriteExecute=true",
         "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
         "ReadOnlyPaths=",
-        "ReadWritePaths=",
+        "ReadWritePaths=/var/log/orihsus /var/lib/orihsus",
+        "StateDirectory=orihsus",
+        "StateDirectoryMode=0700",
         "CapabilityBoundingSet=",
         "AmbientCapabilities=",
     ] {
@@ -135,6 +137,11 @@ fn example_config_loads_when_copied_and_chmod_600() {
     assert_eq!(cfg.server.max_header_bytes, 32 * 1024);
     assert_eq!(cfg.server.max_connections, 1024);
     assert_eq!(cfg.audit.queue_capacity, 4096);
+    assert_eq!(cfg.usage.soft_threshold_percent, 95.0);
+    assert_eq!(
+        cfg.session_routing.state_path,
+        Path::new("/var/lib/orihsus/session-bindings.sqlite3")
+    );
     assert_eq!(cfg.keys.len(), 2);
 }
 

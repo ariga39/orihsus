@@ -31,7 +31,9 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadOnlyPaths=/etc/orihsus
-ReadWritePaths=/var/log/orihsus
+ReadWritePaths=/var/log/orihsus /var/lib/orihsus
+StateDirectory=orihsus
+StateDirectoryMode=0700
 CapabilityBoundingSet=
 AmbientCapabilities=
 

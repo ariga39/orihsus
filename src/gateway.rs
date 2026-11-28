@@ -28,8 +28,9 @@ use crate::audit::{
 use crate::config::{
     upstream_api_url, EventTimeouts, GatewayKey, Secret, UpstreamApi, MAX_MODEL_BYTES,
 };
-use crate::pool::{AttemptResult, Failure, KeyPool, UsageDimension};
+use crate::pool::{AttemptResult, Failure, KeyPool, RequestAttempts, Selection, UsageDimension};
 use crate::queue::{AdmissionError, AdmissionQueue, Permit};
+use crate::routing::{Binding, RouteDecision, RoutingError, SessionRouting};
 use crate::usage::UsageSnapshotStore;
 
 const HOP_BY_HOP: [&str; 8] = [
@@ -383,6 +384,228 @@ pub struct BodyPermit {
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
+/// Request-local durable-session state. It owns the binding version watcher,
+/// performs the bind/rebind/wait sequence, and hides that machinery from the
+/// shared proxy loop.
+struct SessionRequest {
+    id: Vec<u8>,
+    binding: Option<Binding>,
+    pending_new: bool,
+    changes: tokio::sync::watch::Receiver<u64>,
+}
+
+enum BeforeSend {
+    Proceed,
+    Retry,
+}
+
+impl SessionRequest {
+    /// Subscribe before the first DB read: a bind/rebind that lands during the
+    /// read remains visible as a pending version change.
+    async fn start(
+        state: &GatewayState,
+        id: Vec<u8>,
+        candidates: &[String],
+        model: &str,
+        attempts: &mut RequestAttempts,
+    ) -> Result<Self, RoutingError> {
+        let routing = state
+            .session_routing
+            .as_ref()
+            .expect("session routing is configured for this request");
+        let changes = routing.subscribe(&id)?;
+        let mut request = SessionRequest {
+            id,
+            binding: None,
+            pending_new: false,
+            changes,
+        };
+        request
+            .refresh(routing, candidates, model, &state.pool, attempts)
+            .await?;
+        Ok(request)
+    }
+
+    /// Consume any pending version before each DB read. If a newer version
+    /// arrives during the read, loop and read again instead of hiding it.
+    async fn refresh(
+        &mut self,
+        routing: &SessionRouting,
+        candidates: &[String],
+        model: &str,
+        pool: &KeyPool,
+        attempts: &mut RequestAttempts,
+    ) -> Result<(), RoutingError> {
+        loop {
+            self.changes.borrow_and_update();
+            let decision = routing.decide(&self.id, candidates, model, pool).await?;
+            if self.changes.has_changed().unwrap_or(false) {
+                continue;
+            }
+            match decision {
+                RouteDecision::Bound(binding) => {
+                    attempts.set_bound_key(binding.fingerprint.clone());
+                    self.binding = Some(binding);
+                    self.pending_new = false;
+                }
+                RouteDecision::New { order } => {
+                    attempts.set_new_session_order(order);
+                    self.binding = None;
+                    self.pending_new = true;
+                }
+            }
+            return Ok(());
+        }
+    }
+
+    /// Wait for a key selection while also waking on this session's binding
+    /// changes, so a request parked on an old hard backoff follows a rebind.
+    async fn next(
+        &mut self,
+        attempts: &mut RequestAttempts,
+        state: &GatewayState,
+        model: &str,
+    ) -> AttemptResult {
+        let routing = state
+            .session_routing
+            .as_ref()
+            .expect("session state implies a router");
+        loop {
+            let mut changes = self.changes.clone();
+            tokio::select! {
+                result = attempts.next() => {
+                    self.changes = changes;
+                    return result;
+                }
+                _ = changes.changed() => {
+                    self.changes = changes;
+                    let candidates = attempts.candidate_fingerprints();
+                    if self.refresh(routing, &candidates, model, &state.pool, attempts).await.is_err() {
+                        return AttemptResult::Unavailable { retry_after: Duration::ZERO };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Commit the first binding or verify the current one before any send.
+    /// No extra DB read happens on the stable fast path.
+    async fn before_send(
+        &mut self,
+        sel: &Selection,
+        attempts: &mut RequestAttempts,
+        state: &GatewayState,
+        model: &str,
+    ) -> Result<BeforeSend, RoutingError> {
+        let routing = state
+            .session_routing
+            .as_ref()
+            .expect("session state implies a router");
+        let selected = sel.fingerprint();
+        if self.pending_new {
+            // Consume before the mutation; then re-read authoritatively via
+            // refresh so a concurrent bind that raced ours is not hidden by
+            // our own commit notification.
+            self.changes.borrow_and_update();
+            routing.bind_if_absent(&self.id, selected).await?;
+            let candidates = attempts.candidate_fingerprints();
+            self.refresh(routing, &candidates, model, &state.pool, attempts)
+                .await?;
+            let still_bound = self
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.fingerprint == selected)
+                && !self.pending_new;
+            if !still_bound || self.changes.has_changed().unwrap_or(false) {
+                attempts.discard_selection(selected);
+                if self.changes.has_changed().unwrap_or(false) {
+                    self.refresh(routing, &candidates, model, &state.pool, attempts)
+                        .await?;
+                }
+                return Ok(BeforeSend::Retry);
+            }
+            attempts.set_bound_key(selected.to_string());
+            return Ok(BeforeSend::Proceed);
+        }
+
+        if !self.changes.has_changed().unwrap_or(false) {
+            return Ok(BeforeSend::Proceed);
+        }
+        // Consume before reading the DB. A commit during the read advances the
+        // version again, so this request re-routes rather than sending stale A.
+        self.changes.borrow_and_update();
+        let current = routing.current_binding(&self.id).await?;
+        if self.changes.has_changed().unwrap_or(false) {
+            let selected = selected.to_string();
+            attempts.discard_selection(&selected);
+            let candidates = attempts.candidate_fingerprints();
+            self.refresh(routing, &candidates, model, &state.pool, attempts)
+                .await?;
+            return Ok(BeforeSend::Retry);
+        }
+        match current {
+            Some(current) if current.fingerprint != selected => {
+                attempts.bind_to(current.fingerprint.clone(), Some(selected));
+                self.binding = Some(current);
+                Ok(BeforeSend::Retry)
+            }
+            Some(current) => {
+                self.binding = Some(current);
+                Ok(BeforeSend::Proceed)
+            }
+            None => {
+                let selected = selected.to_string();
+                attempts.discard_selection(&selected);
+                let candidates = attempts.candidate_fingerprints();
+                let order = routing.new_session_order(&candidates, model, &state.pool)?;
+                attempts.set_new_session_order(order);
+                self.binding = None;
+                self.pending_new = true;
+                Ok(BeforeSend::Retry)
+            }
+        }
+    }
+
+    /// A confirmed exact GoUsageLimitError is the only event that may durably
+    /// change this session's key.
+    async fn exhausted(
+        &mut self,
+        sel: &Selection,
+        attempts: &mut RequestAttempts,
+        state: &GatewayState,
+        model: &str,
+    ) -> Result<(), RoutingError> {
+        let routing = state
+            .session_routing
+            .as_ref()
+            .expect("session state implies a router");
+        let generation = self
+            .binding
+            .as_ref()
+            .filter(|binding| binding.fingerprint == sel.fingerprint())
+            .map_or(0, |binding| binding.generation);
+        let candidates = attempts.candidate_fingerprints();
+        let used = attempts.used_fingerprints();
+        self.changes.borrow_and_update();
+        routing
+            .rebind_after_usage_limit(
+                &self.id,
+                sel.fingerprint(),
+                generation,
+                &candidates,
+                model,
+                &state.pool,
+                &used,
+            )
+            .await?;
+        // The rebind transaction is committed; resolve the authoritative route
+        // through the same version-aware path (and consume our own commit).
+        self.refresh(routing, &candidates, model, &state.pool, attempts)
+            .await?;
+        Ok(())
+    }
+}
+
 /// Runtime dependencies for the gateway routes.
 pub struct GatewayState {
     pub(crate) http: reqwest::Client,
@@ -395,6 +618,7 @@ pub struct GatewayState {
     pub(crate) timeouts: IoTimeouts,
     pub(crate) model_event_timeouts: BTreeMap<String, EventTimeouts>,
     pub(crate) usage_snapshots: UsageSnapshotStore,
+    pub(crate) session_routing: Option<Arc<SessionRouting>>,
     pub(crate) started_at: tokio::time::Instant,
 }
 
@@ -456,6 +680,7 @@ impl GatewayState {
             timeouts,
             model_event_timeouts: BTreeMap::new(),
             usage_snapshots: UsageSnapshotStore::default(),
+            session_routing: None,
             started_at: tokio::time::Instant::now(),
         }
     }
@@ -470,6 +695,11 @@ impl GatewayState {
 
     pub fn with_usage_snapshots(mut self, snapshots: UsageSnapshotStore) -> Self {
         self.usage_snapshots = snapshots;
+        self
+    }
+
+    pub fn with_session_routing(mut self, routing: Arc<SessionRouting>) -> Self {
+        self.session_routing = Some(routing);
         self
     }
 
@@ -511,7 +741,11 @@ async fn healthz() -> StatusCode {
 async fn readyz(State(state): State<Arc<GatewayState>>) -> Response {
     if state.queue.is_closed() {
         service_unavailable(Some(1))
-    } else if !state.pool.has_available_key() {
+    } else if !state.pool.has_hard_available_key() {
+        // Proactive/soft quota does not make the gateway unready: sessions
+        // already bound to a soft-limited key can still use it. Only hard
+        // unavailability (failure cooldown, breaker, authentication) removes
+        // this instance from the load-balancer pool.
         rate_limited(1)
     } else {
         StatusCode::OK.into_response()
@@ -769,6 +1003,25 @@ async fn read_limited(body: Body, limit: usize) -> Result<Bytes, BodyReadError> 
             }
         }
     }
+}
+
+/// Real client-supplied session identity used for durable affinity. The full
+/// bytes are hashed for the binding; long IDs are valid and never truncated.
+/// Duplicate values, an empty value, or a value nominated by `Connection` are
+/// ambiguous/invalid and rejected before any upstream attempt. Only complete
+/// absence selects legacy routing.
+fn routing_session_id(headers: &HeaderMap) -> Result<Option<Vec<u8>>, ()> {
+    let mut values = headers.get_all(OPENCODE_SESSION_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some()
+        || value.as_bytes().is_empty()
+        || connection_named_headers(headers).contains(OPENCODE_SESSION_HEADER)
+    {
+        return Err(());
+    }
+    Ok(Some(value.as_bytes().to_vec()))
 }
 
 fn request_id_for(headers: &HeaderMap) -> String {
@@ -1174,6 +1427,24 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
     // atomically; in-flight SSE streams keep the pair they started with.
     let (rt, mut attempts) = state.runtime.snapshot_and_request(&state.pool);
     let (parts, body) = req.into_parts();
+    let client_session = match routing_session_id(&parts.headers) {
+        Ok(session) => session,
+        Err(()) => {
+            record_audit_rejected_with_context(
+                &state,
+                &request_id,
+                StatusCode::BAD_REQUEST.as_u16(),
+                start,
+                request_audit,
+            );
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "Invalid OpenCode session identity",
+                "invalid_request_error",
+                Some("invalid_session_id"),
+            );
+        }
+    };
     // Reserve this request's body bytes and stream the body under ONE body_read
     // deadline: waiting for the global budget and reading the body share a
     // single absolute deadline, so a budget wait can never double the wait. The
@@ -1269,6 +1540,33 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
         request_audit.opencode_session_id = Some(fallback_session_id.clone());
     }
 
+    let mut session_request = None;
+    if let (Some(_), Some(session_id)) = (state.session_routing.as_ref(), client_session.as_deref())
+    {
+        let candidates = attempts.candidate_fingerprints();
+        match SessionRequest::start(
+            &state,
+            session_id.to_vec(),
+            &candidates,
+            &model,
+            &mut attempts,
+        )
+        .await
+        {
+            Ok(session) => session_request = Some(session),
+            Err(_) => {
+                record_audit_rejected_with_context(
+                    &state,
+                    &request_id,
+                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                    start,
+                    request_audit,
+                );
+                return service_unavailable(Some(1));
+            }
+        }
+    }
+
     let mut last_response: Option<(ConsumedResponse, String)> = None;
     let final_outcome = loop {
         // Before any upstream response exists, waiting for a cooling candidate
@@ -1277,6 +1575,8 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
         // replace the response already received.
         let next_attempt = if last_response.is_some() {
             attempts.next_immediate()
+        } else if let Some(session) = session_request.as_mut() {
+            session.next(&mut attempts, &state, &model).await
         } else {
             attempts.next().await
         };
@@ -1287,6 +1587,16 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
             }
             AttemptResult::Exhausted => break FinalOutcome::LastResponse(last_response),
         };
+        if let Some(session) = session_request.as_mut() {
+            match session
+                .before_send(&sel, &mut attempts, &state, &model)
+                .await
+            {
+                Ok(BeforeSend::Proceed) => {}
+                Ok(BeforeSend::Retry) => continue,
+                Err(_) => break FinalOutcome::LastResponse(None),
+            }
+        }
         let fingerprint = sel.fingerprint().to_string();
         if let Some(previous) = request_audit.attempts.last_mut() {
             if previous.precommit && previous.failover_target.is_none() {
@@ -1379,8 +1689,20 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
                         },
                         RateLimitKind::Generic => Failure::RateLimited { retry_after },
                     };
+                    let exact_usage_limit = matches!(failure, Failure::UsageLimit { .. });
                     state.pool.report_failure(&sel, failure);
-                    last_response = Some((consumed, fingerprint));
+                    last_response = Some((consumed, fingerprint.clone()));
+                    if exact_usage_limit {
+                        if let Some(session) = session_request.as_mut() {
+                            if session
+                                .exhausted(&sel, &mut attempts, &state, &model)
+                                .await
+                                .is_err()
+                            {
+                                break FinalOutcome::LastResponse(last_response);
+                            }
+                        }
+                    }
                     continue;
                 }
                 if is_auth_unavailable(status) {

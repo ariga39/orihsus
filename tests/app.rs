@@ -22,6 +22,8 @@ const MINIMAL: &str = r#"
 gateway_token: "gway-secret"
 keys:
   - "key-1"
+session_routing:
+  state_path: "/tmp/orihsus-app-test-sessions.sqlite3"
 audit:
   path: "/tmp/orihsus-app-test-audit.jsonl"
 "#;
@@ -32,6 +34,8 @@ keys:
   - "key-1"
 limits:
   queue_wait_timeout_seconds: 300
+session_routing:
+  state_path: "/tmp/orihsus-app-test-sessions.sqlite3"
 audit:
   path: "__AUDIT_PATH__"
 "#;

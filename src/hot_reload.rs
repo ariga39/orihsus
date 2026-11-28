@@ -376,6 +376,7 @@ fn non_hot_changed(cfg: &Config, baseline: &Config) -> bool {
         || cfg.key_failure_handling != baseline.key_failure_handling
         || cfg.usage != baseline.usage
         || cfg.usage_history_dir != baseline.usage_history_dir
+        || cfg.session_routing != baseline.session_routing
         || cfg.audit != baseline.audit
         || cfg.server != baseline.server
 }

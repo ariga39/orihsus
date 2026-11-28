@@ -9,5 +9,6 @@ pub mod hot_reload;
 pub mod models;
 pub mod pool;
 pub mod queue;
+pub mod routing;
 pub mod server;
 pub mod usage;
