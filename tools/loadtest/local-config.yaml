@@ -22,6 +22,8 @@ key_failure_handling:
   breaker_threshold: 5
   breaker_cooldown_seconds: 5
   max_attempts: 2
+session_routing:
+  state_path: "/tmp/orihsus-loadtest/session-bindings.sqlite3"
 audit:
   path: "/tmp/orihsus-loadtest/audit.jsonl"
   queue_capacity: 4096
