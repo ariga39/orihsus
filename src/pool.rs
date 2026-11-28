@@ -240,6 +240,12 @@ impl KeyEntry {
         !self.deadline().is_some_and(|deadline| deadline > now)
     }
 
+    /// Hard availability ignores the proactive/soft quota cooldown. It still
+    /// includes request failures, breaker claims, and model liveness.
+    fn is_hard_available(&self, now: tokio::time::Instant) -> bool {
+        !self.cooling_until.is_some_and(|deadline| deadline > now)
+    }
+
     fn reason(&self) -> Option<CoolingReason> {
         if self.proactive_until > self.cooling_until {
             Some(CoolingReason::ProactiveUsage)
@@ -300,6 +306,17 @@ pub struct PoolKeyStatus {
     pub health: &'static str,
     pub cooling_reason: Option<&'static str>,
     pub cooling_remaining: Option<Duration>,
+}
+
+/// Secret-free health view used by durable session routing. `hard` excludes
+/// the proactive/soft quota cooldown; `soft` is the legacy full availability
+/// (hard plus proactive). Both include the request's model-liveness cooldown.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyHealth {
+    pub hard_available: bool,
+    pub soft_available: bool,
+    pub hard_recovery: Option<tokio::time::Instant>,
+    pub soft_recovery: Option<tokio::time::Instant>,
 }
 
 impl KeyPool {
@@ -522,6 +539,17 @@ pub struct RequestAttempts {
     max: usize,
     deadline: tokio::time::Instant,
     model: Option<String>,
+    session: Option<SessionRoute>,
+}
+
+/// Session routing is pinned to the request's captured candidates. A `Bound`
+/// key ignores the proactive/soft quota but still respects hard failures,
+/// breaker claims, and model liveness. `New` is the first-binding order chosen
+/// by the durable router and applies the full soft policy.
+#[derive(Clone)]
+enum SessionRoute {
+    Bound { fingerprint: String },
+    New { order: Vec<String> },
 }
 
 impl KeyPool {
@@ -558,6 +586,7 @@ impl KeyPool {
             max: self.inner.policy.max_attempts,
             deadline: deadline_after(tokio::time::Instant::now(), self.inner.policy.wait_timeout),
             model,
+            session: None,
         }
     }
 
@@ -579,11 +608,50 @@ impl KeyPool {
         );
     }
 
-    /// True if at least one key is currently selectable (not cooling).
+    /// True if at least one key is currently selectable under the legacy
+    /// (hard + soft) policy.
     pub fn has_available_key(&self) -> bool {
         let state = read_state(&self.inner);
         let now = tokio::time::Instant::now();
         state.entries.iter().any(|e| e.is_available(now))
+    }
+
+    /// True if at least one key is selectable ignoring proactive/soft quota.
+    /// Durable session bindings can still serve from these keys, so readiness
+    /// must not fail merely because every key is soft-limited.
+    pub fn has_hard_available_key(&self) -> bool {
+        let state = read_state(&self.inner);
+        let now = tokio::time::Instant::now();
+        state.entries.iter().any(|e| e.is_hard_available(now))
+    }
+
+    /// Health for one key, including an optional model-liveness cooldown.
+    pub(crate) fn key_health(&self, fingerprint: &str, model: Option<&str>) -> Option<KeyHealth> {
+        let state = read_state(&self.inner);
+        let now = tokio::time::Instant::now();
+        let entry = state
+            .entries
+            .iter()
+            .find(|entry| entry.fingerprint == fingerprint)?;
+        let model_deadline = model
+            .and_then(|model| entry.liveness_cooling.get(model).copied())
+            .filter(|deadline| *deadline > now);
+        let hard = entry.cooling_until.filter(|deadline| *deadline > now);
+        let soft = entry.deadline().filter(|deadline| *deadline > now);
+        let combine = |global: Option<tokio::time::Instant>| match (global, model_deadline) {
+            (Some(global), Some(model)) => Some(global.max(model)),
+            (Some(global), None) => Some(global),
+            (None, Some(model)) => Some(model),
+            (None, None) => None,
+        };
+        let hard_recovery = combine(hard);
+        let soft_recovery = combine(soft);
+        Some(KeyHealth {
+            hard_available: hard_recovery.is_none(),
+            soft_available: soft_recovery.is_none(),
+            hard_recovery,
+            soft_recovery,
+        })
     }
 
     /// Secret-free, stable snapshot for the authenticated status endpoint.
@@ -663,14 +731,23 @@ impl KeyPool {
             else {
                 return;
             };
-            let previous = entry.deadline().filter(|deadline| *deadline > now);
+            let previous = (
+                entry.deadline().filter(|deadline| *deadline > now),
+                entry.cooling_until.filter(|deadline| *deadline > now),
+            );
             if !update(entry, now) {
                 return;
             }
-            let updated = entry.deadline().filter(|deadline| *deadline > now);
+            let updated = (
+                entry.deadline().filter(|deadline| *deadline > now),
+                entry.cooling_until.filter(|deadline| *deadline > now),
+            );
             (previous, updated)
         };
-        if updated < previous {
+        // Bound session waiters ignore the soft/proactive deadline, so a hard
+        // claim that clears while a longer soft cooldown still dominates the
+        // combined deadline must wake them too.
+        if updated.0 < previous.0 || updated.1 < previous.1 {
             self.inner.earlier_recovery.notify_waiters();
         }
     }
@@ -766,6 +843,40 @@ impl KeyPool {
     }
 }
 
+impl KeyPool {
+    /// Relinquish a half-open probe claim for a selection that was never sent
+    /// upstream (for example a session-routing retry or DB error).
+    ///
+    /// Only the exact claim owner may release it. The half-open marker stays
+    /// set so another selector can probe immediately. `last_failure_by` is
+    /// deliberately retained as a monotonic fence even if a newer failure
+    /// report advanced it while the claim was active; counters and backoff are
+    /// also untouched.
+    pub(crate) fn release_unsent_claim(&self, selection: &Selection) {
+        self.update_key_deadline(&selection.fingerprint, |entry, _now| {
+            if !entry.half_open
+                || entry.cooling_by != Some(selection.id)
+                || !matches!(entry.cooling_reason, Some(CoolingReason::CircuitBreaker))
+            {
+                return false;
+            }
+            entry.cooling_until = None;
+            entry.cooling_reason = None;
+            entry.cooling_by = None;
+            // A late sub-threshold report may have lowered the fence to an
+            // older id. Raise it back to at least this claim id so a stale
+            // success cannot clear half-open state before the next probe.
+            entry.last_failure_by = Some(
+                entry
+                    .last_failure_by
+                    .unwrap_or(selection.id)
+                    .max(selection.id),
+            );
+            true
+        });
+    }
+}
+
 /// Convert a cooldown duration into a deadline, clamped to [`MAX_COOLDOWN`]
 /// first so the addition can never overflow `Instant`. A bare `now + duration`
 /// panics on an enormous (but constructible) external Retry-After or
@@ -789,9 +900,148 @@ fn backoff_at(policy: &PoolPolicy, step: u32) -> Duration {
     d.min(policy.backoff_max)
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    fn policy() -> PoolPolicy {
+        PoolPolicy {
+            backoff_initial: Duration::from_secs(5),
+            backoff_max: Duration::from_secs(60),
+            breaker_threshold: 3,
+            breaker_cooldown: Duration::from_secs(5),
+            wait_timeout: Duration::from_secs(30),
+            max_attempts: 2,
+        }
+    }
+
+    fn selected(result: AttemptResult) -> Selection {
+        match result {
+            AttemptResult::Selected(selection) => selection,
+            other => panic!("expected Selected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn releasing_an_unsent_claim_preserves_fence_and_allows_early_probe() {
+        let pool =
+            KeyPool::with_jitter(vec![Secret::new("a")], policy(), Arc::new(NoJitter)).unwrap();
+
+        let old = selected(pool.request().next().await);
+        for _ in 0..3 {
+            pool.report_failure(&old, Failure::Network);
+        }
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        let claim = selected(pool.request().next().await);
+        assert_eq!(claim.fingerprint(), fingerprint("a"));
+        assert!(
+            !pool.has_available_key(),
+            "the probe claim must reserve the key"
+        );
+
+        // A late sub-threshold network report advances the failure fence
+        // without replacing the owned claim deadline.
+        pool.report_failure(&old, Failure::Network);
+        pool.release_unsent_claim(&claim);
+        assert!(
+            pool.has_available_key(),
+            "the owned claim deadline must be released"
+        );
+
+        // The late report lowered the fence to `old.id`. Exercise a stale
+        // success BEFORE any new probe is selected: release must have raised
+        // the fence back to the claim id, so this success cannot clear
+        // half-open state.
+        pool.report_success(&old);
+        let before = tokio::time::Instant::now();
+        let next = selected(pool.request().next().await);
+        assert_eq!(next.fingerprint(), fingerprint("a"));
+        assert_eq!(
+            before.elapsed(),
+            Duration::ZERO,
+            "another probe must become eligible immediately"
+        );
+        assert!(
+            !pool.has_available_key(),
+            "the next probe must still claim half-open after the stale success"
+        );
+
+        // A stale release of the old claim must not clear the later claim.
+        pool.release_unsent_claim(&claim);
+        assert!(
+            !pool.has_available_key(),
+            "stale owner actions must not clear the later claim"
+        );
+
+        pool.report_success(&next);
+        assert!(pool.has_available_key());
+    }
+}
+
 impl RequestAttempts {
     pub(crate) fn set_model(&mut self, model: impl Into<String>) {
         self.model = Some(model.into());
+    }
+
+    pub(crate) fn candidate_fingerprints(&self) -> Vec<String> {
+        self.candidates
+            .iter()
+            .map(|candidate| candidate.fingerprint.clone())
+            .collect()
+    }
+
+    pub(crate) fn used_fingerprints(&self) -> Vec<String> {
+        self.used.clone()
+    }
+
+    pub(crate) fn set_bound_key(&mut self, fingerprint: impl Into<String>) {
+        self.session = Some(SessionRoute::Bound {
+            fingerprint: fingerprint.into(),
+        });
+    }
+
+    pub(crate) fn set_new_session_order(&mut self, order: Vec<String>) {
+        self.session = Some(SessionRoute::New { order });
+    }
+
+    /// Switch to a durable binding that won a concurrent CAS race. Any key
+    /// selected but not yet sent upstream is released from the used set.
+    pub(crate) fn bind_to(&mut self, fingerprint: String, discard_used: Option<&str>) {
+        if let Some(discard) = discard_used {
+            self.discard_selection(discard);
+        }
+        self.set_bound_key(fingerprint);
+    }
+
+    /// Release a selection that was never sent upstream.
+    pub(crate) fn discard_selection(&mut self, fingerprint: &str) {
+        self.used.retain(|used| used != fingerprint);
+    }
+
+    fn route_fingerprints(&self) -> Vec<&str> {
+        match &self.session {
+            Some(SessionRoute::Bound { fingerprint }) => vec![fingerprint.as_str()],
+            Some(SessionRoute::New { order }) if !order.is_empty() => {
+                order.iter().map(String::as_str).collect()
+            }
+            Some(SessionRoute::New { .. }) => self
+                .candidates
+                .iter()
+                .map(|candidate| candidate.fingerprint.as_str())
+                .collect(),
+            None => self
+                .candidates
+                .iter()
+                .map(|candidate| candidate.fingerprint.as_str())
+                .collect(),
+        }
+    }
+
+    fn ignores_soft_quota(&self) -> bool {
+        matches!(self.session, Some(SessionRoute::Bound { .. }))
     }
 
     /// Select another distinct key only if one is available now. Once the
@@ -868,27 +1118,42 @@ impl RequestAttempts {
         state: &mut PoolState,
         now: tokio::time::Instant,
     ) -> Option<Selection> {
-        let cand_idx = self.candidates.iter().position(|c| {
-            if self.used.contains(&c.fingerprint) {
-                return false;
+        let mut selected = None;
+        for fingerprint in self.route_fingerprints() {
+            if self.used.iter().any(|used| used == fingerprint) {
+                continue;
             }
-            match state
+            let Some(candidate) = self
+                .candidates
+                .iter()
+                .find(|candidate| candidate.fingerprint == fingerprint)
+            else {
+                continue;
+            };
+            let Some(entry) = state
                 .entries
                 .iter()
-                .find(|e| e.fingerprint == c.fingerprint)
-            {
-                Some(e) => {
-                    e.is_available(now)
-                        && !self.model.as_ref().is_some_and(|model| {
-                            e.liveness_cooling
-                                .get(model)
-                                .is_some_and(|deadline| *deadline > now)
-                        })
-                }
-                None => false,
+                .find(|entry| entry.fingerprint == fingerprint)
+            else {
+                continue;
+            };
+            let available = if self.ignores_soft_quota() {
+                entry.is_hard_available(now)
+            } else {
+                entry.is_available(now)
+            };
+            let model_available = !self.model.as_ref().is_some_and(|model| {
+                entry
+                    .liveness_cooling
+                    .get(model)
+                    .is_some_and(|deadline| *deadline > now)
+            });
+            if available && model_available {
+                selected = Some(candidate);
+                break;
             }
-        })?;
-        let cand = &self.candidates[cand_idx];
+        }
+        let cand = selected?;
         let sel = Selection {
             fingerprint: cand.fingerprint.clone(),
             key: cand.key.clone(),
@@ -926,9 +1191,9 @@ impl RequestAttempts {
     }
 
     fn has_unused(&self) -> bool {
-        self.candidates
+        self.route_fingerprints()
             .iter()
-            .any(|c| !self.used.contains(&c.fingerprint))
+            .any(|fingerprint| !self.used.iter().any(|used| used == fingerprint))
     }
 
     fn earliest_recovery(
@@ -936,25 +1201,31 @@ impl RequestAttempts {
         state: &PoolState,
         now: tokio::time::Instant,
     ) -> Option<tokio::time::Instant> {
-        self.candidates
-            .iter()
-            .filter_map(|c| {
+        let ignore_soft = self.ignores_soft_quota();
+        self.route_fingerprints()
+            .into_iter()
+            .filter_map(|fingerprint| {
                 let entry = state
                     .entries
                     .iter()
-                    .find(|e| e.fingerprint == c.fingerprint)?;
+                    .find(|e| e.fingerprint == fingerprint)?;
+                let global = if ignore_soft {
+                    entry.cooling_until
+                } else {
+                    entry.deadline()
+                };
                 let model_deadline = self
                     .model
                     .as_ref()
                     .and_then(|model| entry.liveness_cooling.get(model).copied());
-                match (entry.deadline(), model_deadline) {
+                match (global, model_deadline) {
                     (Some(global), Some(model)) => Some(global.max(model)),
                     (Some(global), None) => Some(global),
                     (None, Some(model)) => Some(model),
                     (None, None) => None,
                 }
             })
-            .filter(|d| *d > now)
+            .filter(|deadline| *deadline > now)
             .min()
     }
 }

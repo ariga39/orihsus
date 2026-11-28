@@ -11,6 +11,7 @@ use crate::gateway::{build_router, BodyBudget, GatewayState, RuntimeState, Runti
 use crate::models::ModelMonitor;
 use crate::pool::{KeyPool, PoolPolicy};
 use crate::queue::AdmissionQueue;
+use crate::routing::{RoutingError, SessionRouting};
 use crate::usage::{UsageMonitor, UsageSnapshotStore};
 
 /// Startup errors. Never echoes keys or tokens.
@@ -18,6 +19,7 @@ use crate::usage::{UsageMonitor, UsageSnapshotStore};
 pub enum BootstrapError {
     Audit(crate::audit::AuditError),
     Pool(crate::pool::PoolError),
+    Routing(RoutingError),
     Client(reqwest::Error),
 }
 
@@ -26,6 +28,7 @@ impl std::fmt::Display for BootstrapError {
         match self {
             BootstrapError::Audit(e) => write!(f, "cannot start audit logging: {e}"),
             BootstrapError::Pool(e) => write!(f, "cannot build the key pool: {e}"),
+            BootstrapError::Routing(e) => write!(f, "cannot start durable session routing: {e}"),
             BootstrapError::Client(e) => write!(f, "cannot build the upstream client: {e}"),
         }
     }
@@ -91,6 +94,13 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
             .expect("config validation caps max_body_bytes at u32::MAX"),
     );
     let usage_snapshots = UsageSnapshotStore::default();
+    let session_routing = Arc::new(
+        SessionRouting::open(
+            cfg.session_routing.state_path.clone(),
+            usage_snapshots.clone(),
+        )
+        .map_err(BootstrapError::Routing)?,
+    );
     let state = GatewayState::with_runtime(
         http,
         runtime.clone(),
@@ -101,7 +111,8 @@ pub fn assemble(cfg: &Config) -> Result<(AppRuntime, Router), BootstrapError> {
         timeouts,
     )
     .with_model_event_timeouts(cfg.server.model_event_timeouts.clone())
-    .with_usage_snapshots(usage_snapshots.clone());
+    .with_usage_snapshots(usage_snapshots.clone())
+    .with_session_routing(session_routing);
     let router = build_router(state);
     let usage_monitor = UsageMonitor::start(
         cfg.usage.clone(),

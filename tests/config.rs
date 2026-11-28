@@ -57,11 +57,15 @@ fn minimal_valid_config_yields_defaults() {
     );
     assert_eq!(cfg.key_failure_handling.max_attempts, 2);
 
-    assert_eq!(cfg.usage.soft_threshold_percent, 80.0);
+    assert_eq!(cfg.usage.soft_threshold_percent, 95.0);
     assert_eq!(cfg.usage.poll_interval, Duration::from_secs(5 * 60));
     assert_eq!(
         cfg.usage_history_dir,
         PathBuf::from("/var/log/orihsus/usage")
+    );
+    assert_eq!(
+        cfg.session_routing.state_path,
+        PathBuf::from("/var/lib/orihsus/session-bindings.sqlite3")
     );
 
     assert_eq!(
@@ -199,7 +203,7 @@ fn explicit_usage_values_are_parsed() {
         "usage.yaml",
         &MINIMAL.replace(
             "keys:\n  - \"key-1\"",
-            "keys:\n  - \"key-1\"\nusage_history_dir: /srv/orihsus/usage-history\nusage:\n  soft_threshold_percent: 73.5\n  poll_interval_seconds: 45",
+            "keys:\n  - \"key-1\"\nusage_history_dir: /srv/orihsus/usage-history\nusage:\n  soft_threshold_percent: 73.5\n  poll_interval_seconds: 45\nsession_routing:\n  state_path: /srv/orihsus/sessions.sqlite3",
         ),
     );
 
@@ -209,6 +213,10 @@ fn explicit_usage_values_are_parsed() {
     assert_eq!(
         cfg.usage_history_dir,
         PathBuf::from("/srv/orihsus/usage-history")
+    );
+    assert_eq!(
+        cfg.session_routing.state_path,
+        PathBuf::from("/srv/orihsus/sessions.sqlite3")
     );
 }
 

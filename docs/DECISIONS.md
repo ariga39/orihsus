@@ -5,19 +5,22 @@ This document records the decisions that define the gateway contract.
 ## Language and scope
 
 - Implement the service in stable Rust with Tokio, Axum, Reqwest, Rustls, Serde, and Tracing.
-- Ship one native binary with no database, container requirement, administrative UI, or metrics endpoint.
+- Ship one native binary with no external database, container requirement, administrative UI, or metrics endpoint. Durable session affinity uses one embedded SQLite state file.
 - Expose `POST /v1/chat/completions`, `POST /v1/messages`, `POST /v1/responses`, authenticated `GET /v1/models` and `GET /v1/status`, `/healthz`, and `/readyz`. Return explicit 404 or 405 responses for everything else. Proxy each request in its native protocol without OpenAI/Anthropic/Responses conversion.
 - Stream SSE and ordinary successful bodies without buffering them completely. Sanitize final upstream 401/403/429/5xx bodies into bounded OpenAI-compatible errors; preserve only a validated `Retry-After` on 429.
 
 ## Key rotation
 
 - Use a fill-first pool rather than round-robin selection. Keep using a healthy key until it becomes unavailable.
+- Bind a client-supplied `x-opencode-session` to one upstream key in an embedded SQLite journal keyed by the full SHA-256 of the session bytes. Bindings survive restart and are compare-and-swap versioned. Missing headers keep legacy routing; duplicate, empty, or `Connection`-nominated session headers are rejected before upstream.
+- New session bindings skip hard-cooling keys and keys at or above the configured soft threshold in any usage window. A known valid future monthly reset outranks an unknown, invalid, or past reset, and the earliest known date wins; equal known dates and the all-unknown case keep pinned fill-first order. A past reset, not snapshot age, makes a reset unknown. Existing bindings ignore soft quota but respect hard failure, breaker, and model liveness. Only a classified `GoUsageLimitError` on the session's own attempt may durably rebind; another session's usage-limit cooldown makes an existing binding wait or return 429, never migrate from pooled health or a poll.
 - Take one request-level candidate snapshot so a hot reload cannot mix generations during a retry sequence.
 - Attempt at most two distinct keys per request.
 - Treat exact OpenCode `GoUsageLimitError` payloads as quota cooldowns. Recognized dimensions are `weekly`, `monthly`, and `5h`; parsed reset durations override dimension defaults.
 - Treat ordinary 429 responses with `Retry-After` when valid, otherwise exponential backoff. Handle 401/403 as key failures and retry eligible 5xx/network failures without exposing credentials.
 - Once an upstream error response has been committed, retry only another key that is available immediately. A different key's existing cooldown must never delay or replace a saved 5xx response with the gateway-level all-keys-cooling 429.
 - When every key is cooling down, wait within a fixed pool budget, then return 429 with a conservative `Retry-After` derived from the earliest recovery. Reserve 503 for gateway capacity, timeout, shutdown, or upstream-transport failures.
+- `/readyz` reflects hard key availability only. Soft/proactive quota can exclude new session bindings but must not remove an instance that can still serve existing bindings.
 - Poll the OpenCode usage API proactively. A key at or above the configured utilization threshold is cooled until the reported reset time; polling failures do not remove otherwise healthy keys.
 - Accept each configured key as either a legacy string or an object with `key` and an optional UTF-8 `name`. Keep aliases out of audit and usage history. The authenticated status response identifies keys by their literal last six characters plus the optional alias, sorts by that displayed identifier, and joins current pool cooling state with the latest cached usage response.
 

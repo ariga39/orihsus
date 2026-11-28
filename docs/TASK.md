@@ -19,7 +19,7 @@ Build a production-oriented Rust gateway that exposes native OpenAI Chat, Anthro
 ## Technical constraints
 
 - Stable Rust; Tokio/Axum/Reqwest/Rustls.
-- One process and no persistent database.
+- One process and no external database; durable client-session affinity uses one embedded SQLite state file.
 - Fixed HTTPS OpenCode Go upstream and no redirect following.
 - Secrets must be absent from logs, formatting, errors, and audit output.
 - Production behavior must remain testable through narrow public seams and deterministic state-machine tests.
