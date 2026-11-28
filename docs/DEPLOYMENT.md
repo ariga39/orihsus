@@ -35,7 +35,7 @@ sudo systemctl enable --now orihsus
 sudo systemctl status orihsus
 ```
 
-The unit runs without root or capabilities and grants write access only to `/var/log/orihsus`, which contains audit and usage-history logs. `TimeoutStopSec=45` covers the ≤30s connection drain, 5s audit flush, and scheduling margin.
+The unit runs without root or capabilities. It grants write access to `/var/log/orihsus` for audit and usage-history logs and to `/var/lib/orihsus` for the SQLite session bindings. `TimeoutStopSec=45` covers the ≤30s connection drain, 5s audit flush, and scheduling margin.
 
 Verify the private HTTP listener locally:
 
