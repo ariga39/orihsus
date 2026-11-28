@@ -7001,6 +7001,98 @@ async fn long_session_ids_bind_on_full_bytes_and_invalid_ones_are_rejected() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn another_sessions_usage_limit_does_not_migrate_an_idle_binding() {
+    let dir = TempDir::new().unwrap();
+    let control = Arc::new(MockControl::default());
+    let addr = start_mock(control.clone()).await;
+    let snapshots = UsageSnapshotStore::default();
+    let now = chrono::Utc::now();
+    record_monthly_usage(&snapshots, "key-1", 0.0, now + chrono::Duration::days(1));
+    record_monthly_usage(&snapshots, "key-2", 0.0, now + chrono::Duration::days(10));
+    let p = pool_with_timeout(&["key-1", "key-2"], Duration::from_secs(1));
+    let routing = session_routing_at(&dir.path().join("sessions.sqlite3"), &snapshots);
+    let app = build_router(state_with_session_routing(
+        &p,
+        &queue(4, 4, Duration::from_secs(30)),
+        &format!("http://{addr}"),
+        TestSink::default(),
+        Arc::clone(&routing),
+        snapshots,
+    ));
+
+    for session in ["session-a", "session-b"] {
+        assert_eq!(
+            send(&app, session_chat_req(session)).await.status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        routing
+            .current_binding(b"session-b")
+            .await
+            .unwrap()
+            .unwrap()
+            .fingerprint,
+        fingerprint("key-1")
+    );
+
+    control
+        .keyed_responses
+        .lock()
+        .unwrap()
+        .entry("Bearer key-1".to_string())
+        .or_default()
+        .push_back(MockResponse {
+            status: 429,
+            content_type: "application/json",
+            body: br#"{"error":{"type":"GoUsageLimitError","message":"Monthly usage limit reached. Resets in 30 seconds."},"metadata":{"limitName":"monthly"}}"#.to_vec(),
+            extra_headers: Vec::new(),
+        });
+    assert_eq!(
+        send(&app, session_chat_req("session-a")).await.status(),
+        StatusCode::OK
+    );
+    {
+        let requests = control.requests.lock().unwrap();
+        assert_eq!(
+            requests.last().unwrap().headers["authorization"],
+            "Bearer key-2",
+            "session A rebinds only on its own exact usage-limit reply"
+        );
+    }
+
+    // Session B remains bound to key-1. While key-1 is hard-cooled by A's
+    // usage limit, B must not migrate to key-2; it times out with 429.
+    let before = control.requests.lock().unwrap().len();
+    assert_eq!(
+        send(&app, session_chat_req("session-b")).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(control.requests.lock().unwrap().len(), before);
+    assert_eq!(
+        routing
+            .current_binding(b"session-b")
+            .await
+            .unwrap()
+            .unwrap()
+            .fingerprint,
+        fingerprint("key-1")
+    );
+
+    // Once key-1's hard usage cooldown ends, idle B resumes its original key.
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        send(&app, session_chat_req("session-b")).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        control.requests.lock().unwrap().last().unwrap().headers["authorization"],
+        "Bearer key-1"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn old_bound_waiter_follows_a_concurrent_rebind_instead_of_sending_stale_a() {
     let dir = TempDir::new().unwrap();
     let control = Arc::new(MockControl::default());
@@ -7209,6 +7301,86 @@ async fn first_binding_on_a_half_open_probe_is_not_discarded_by_its_own_commit()
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].headers["authorization"], "Bearer key-1");
     assert_eq!(requests[1].headers["authorization"], "Bearer key-1");
+}
+
+#[tokio::test(start_paused = true)]
+async fn session_binding_race_releases_an_unsent_half_open_probe() {
+    let dir = TempDir::new().unwrap();
+    let control = Arc::new(MockControl::default());
+    let addr = start_mock(control.clone()).await;
+    let snapshots = UsageSnapshotStore::default();
+    let p = Arc::new(
+        KeyPool::with_jitter(
+            vec![Secret::new("key-1"), Secret::new("key-2")],
+            PoolPolicy {
+                backoff_initial: Duration::from_secs(5),
+                backoff_max: Duration::from_secs(60),
+                breaker_threshold: 1,
+                breaker_cooldown: Duration::from_secs(5),
+                wait_timeout: Duration::from_secs(30),
+                max_attempts: 2,
+            },
+            Arc::new(NoJitter),
+        )
+        .unwrap(),
+    );
+    let routing = session_routing_at(&dir.path().join("sessions.sqlite3"), &snapshots);
+    let app = build_router(state_with_session_routing(
+        &p,
+        &queue(4, 4, Duration::from_secs(30)),
+        &format!("http://{addr}"),
+        TestSink::default(),
+        Arc::clone(&routing),
+        snapshots,
+    ));
+
+    let trip = match p.request().next().await {
+        AttemptResult::Selected(sel) => sel,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(trip.fingerprint(), fingerprint("key-1"));
+    p.report_failure(&trip, Failure::Network);
+    p.report_proactive_cooldown(&fingerprint("key-2"), Duration::from_secs(3600));
+
+    // No key is eligible at start: key-1 is half-open and key-2 is soft
+    // limited. The request waits in the New route.
+    let request = tokio::spawn({
+        let app = app.clone();
+        async move { app.oneshot(session_chat_req("session-discard")).await }
+    });
+    tokio::task::yield_now().await;
+
+    // A concurrent first bind picks key-2 while the request waits. When the
+    // request later claims the key-1 probe, before_send must discard that
+    // unsent reservation and follow key-2.
+    let committed = routing
+        .bind_if_absent(b"session-discard", &fingerprint("key-2"))
+        .await
+        .unwrap();
+    assert_eq!(committed.fingerprint, fingerprint("key-2"));
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    // Switch to real time so the 5s probe-claim deadline cannot auto-expire
+    // while the request is briefly waiting on the SQLite blocking pool.
+    tokio::time::resume();
+    for _ in 0..256 {
+        if request.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(request.await.unwrap().unwrap().status(), StatusCode::OK);
+    {
+        let requests = control.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].headers["authorization"], "Bearer key-2");
+    }
+    assert!(
+        p.status_snapshot()
+            .iter()
+            .any(|key| key.id == "key-1" && key.health == "healthy"),
+        "the discarded half-open claim must be released immediately"
+    );
 }
 
 #[tokio::test]

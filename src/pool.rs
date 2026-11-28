@@ -843,6 +843,40 @@ impl KeyPool {
     }
 }
 
+impl KeyPool {
+    /// Relinquish a half-open probe claim for a selection that was never sent
+    /// upstream (for example a session-routing retry or DB error).
+    ///
+    /// Only the exact claim owner may release it. The half-open marker stays
+    /// set so another selector can probe immediately. `last_failure_by` is
+    /// deliberately retained as a monotonic fence even if a newer failure
+    /// report advanced it while the claim was active; counters and backoff are
+    /// also untouched.
+    pub(crate) fn release_unsent_claim(&self, selection: &Selection) {
+        self.update_key_deadline(&selection.fingerprint, |entry, _now| {
+            if !entry.half_open
+                || entry.cooling_by != Some(selection.id)
+                || !matches!(entry.cooling_reason, Some(CoolingReason::CircuitBreaker))
+            {
+                return false;
+            }
+            entry.cooling_until = None;
+            entry.cooling_reason = None;
+            entry.cooling_by = None;
+            // A late sub-threshold report may have lowered the fence to an
+            // older id. Raise it back to at least this claim id so a stale
+            // success cannot clear half-open state before the next probe.
+            entry.last_failure_by = Some(
+                entry
+                    .last_failure_by
+                    .unwrap_or(selection.id)
+                    .max(selection.id),
+            );
+            true
+        });
+    }
+}
+
 /// Convert a cooldown duration into a deadline, clamped to [`MAX_COOLDOWN`]
 /// first so the addition can never overflow `Instant`. A bare `now + duration`
 /// panics on an enormous (but constructible) external Retry-After or
@@ -864,6 +898,87 @@ fn backoff_at(policy: &PoolPolicy, step: u32) -> Duration {
         d = d.saturating_mul(2).min(policy.backoff_max);
     }
     d.min(policy.backoff_max)
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    fn policy() -> PoolPolicy {
+        PoolPolicy {
+            backoff_initial: Duration::from_secs(5),
+            backoff_max: Duration::from_secs(60),
+            breaker_threshold: 3,
+            breaker_cooldown: Duration::from_secs(5),
+            wait_timeout: Duration::from_secs(30),
+            max_attempts: 2,
+        }
+    }
+
+    fn selected(result: AttemptResult) -> Selection {
+        match result {
+            AttemptResult::Selected(selection) => selection,
+            other => panic!("expected Selected, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn releasing_an_unsent_claim_preserves_fence_and_allows_early_probe() {
+        let pool =
+            KeyPool::with_jitter(vec![Secret::new("a")], policy(), Arc::new(NoJitter)).unwrap();
+
+        let old = selected(pool.request().next().await);
+        for _ in 0..3 {
+            pool.report_failure(&old, Failure::Network);
+        }
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        let claim = selected(pool.request().next().await);
+        assert_eq!(claim.fingerprint(), fingerprint("a"));
+        assert!(
+            !pool.has_available_key(),
+            "the probe claim must reserve the key"
+        );
+
+        // A late sub-threshold network report advances the failure fence
+        // without replacing the owned claim deadline.
+        pool.report_failure(&old, Failure::Network);
+        pool.release_unsent_claim(&claim);
+        assert!(
+            pool.has_available_key(),
+            "the owned claim deadline must be released"
+        );
+
+        // The late report lowered the fence to `old.id`. Exercise a stale
+        // success BEFORE any new probe is selected: release must have raised
+        // the fence back to the claim id, so this success cannot clear
+        // half-open state.
+        pool.report_success(&old);
+        let before = tokio::time::Instant::now();
+        let next = selected(pool.request().next().await);
+        assert_eq!(next.fingerprint(), fingerprint("a"));
+        assert_eq!(
+            before.elapsed(),
+            Duration::ZERO,
+            "another probe must become eligible immediately"
+        );
+        assert!(
+            !pool.has_available_key(),
+            "the next probe must still claim half-open after the stale success"
+        );
+
+        // A stale release of the old claim must not clear the later claim.
+        pool.release_unsent_claim(&claim);
+        assert!(
+            !pool.has_available_key(),
+            "stale owner actions must not clear the later claim"
+        );
+
+        pool.report_success(&next);
+        assert!(pool.has_available_key());
+    }
 }
 
 impl RequestAttempts {

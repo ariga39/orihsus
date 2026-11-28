@@ -330,9 +330,10 @@ impl SessionRouting {
         .await
     }
 
-    /// New first bindings prefer the eligible key with the earliest valid
-    /// future monthly reset. Ties and missing/stale observations fall back to
-    /// the pool's pinned fill-first order.
+    /// New first bindings rank a known valid future monthly reset ahead of an
+    /// unknown, invalid, or past reset, then choose the earliest known date.
+    /// Equal known dates and the all-unknown case keep the pool's pinned
+    /// fill-first order. A past reset, not snapshot age, makes a reset unknown.
     pub fn new_session_order(
         &self,
         candidates: &[String],
@@ -415,14 +416,8 @@ impl SessionRouting {
         &self,
         hash: [u8; 32],
     ) -> Result<Option<StoredBinding>, RoutingError> {
-        self.blocking_db(move |connection| {
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
-            let binding = read_stored_binding(&transaction, hash)?;
-            transaction.commit()?;
-            Ok(binding)
-        })
-        .await
+        self.blocking_db(move |connection| read_stored_binding(connection, hash))
+            .await
     }
 
     /// Run one synchronous SQLite operation on the blocking pool. The blocking
@@ -445,10 +440,10 @@ impl SessionRouting {
 }
 
 fn read_stored_binding(
-    transaction: &rusqlite::Transaction<'_>,
+    connection: &Connection,
     hash: [u8; 32],
 ) -> rusqlite::Result<Option<StoredBinding>> {
-    transaction
+    connection
         .query_row(
             "SELECT key_fingerprint, generation
              FROM session_bindings WHERE session_hash = ?1",

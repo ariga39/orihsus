@@ -1593,8 +1593,16 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Body>, api: Upstre
                 .await
             {
                 Ok(BeforeSend::Proceed) => {}
-                Ok(BeforeSend::Retry) => continue,
-                Err(_) => break FinalOutcome::LastResponse(None),
+                Ok(BeforeSend::Retry) => {
+                    // The selection was not sent upstream. If it had reserved a
+                    // half-open probe, relinquish exactly that reservation now.
+                    state.pool.release_unsent_claim(&sel);
+                    continue;
+                }
+                Err(_) => {
+                    state.pool.release_unsent_claim(&sel);
+                    break FinalOutcome::LastResponse(last_response);
+                }
             }
         }
         let fingerprint = sel.fingerprint().to_string();

@@ -9,8 +9,12 @@ use orihsus::usage::UsageSnapshotStore;
 use tempfile::TempDir;
 
 fn pool() -> KeyPool {
+    pool_with_keys(&["key-1"])
+}
+
+fn pool_with_keys(keys: &[&str]) -> KeyPool {
     KeyPool::with_jitter(
-        vec![Secret::new("key-1")],
+        keys.iter().map(|key| Secret::new(*key)).collect(),
         PoolPolicy {
             backoff_initial: Duration::from_secs(5),
             backoff_max: Duration::from_secs(60),
@@ -22,6 +26,93 @@ fn pool() -> KeyPool {
         Arc::new(NoJitter),
     )
     .unwrap()
+}
+
+fn record_monthly(snapshots: &UsageSnapshotStore, key: &str, reset: &str) {
+    let now = chrono::Utc::now();
+    let body = serde_json::json!({
+        "usage": {
+            "rolling": {"percent": 0, "resetsAt": (now + chrono::Duration::hours(5)).to_rfc3339()},
+            "weekly": {"percent": 0, "resetsAt": (now + chrono::Duration::days(7)).to_rfc3339()},
+            "monthly": {"percent": 0, "resetsAt": reset},
+        }
+    });
+    assert!(snapshots.record_response(body.to_string().as_bytes(), now, &Secret::new(key)));
+}
+
+#[test]
+fn monthly_reset_order_known_before_unknown_then_pinned_order() {
+    let dir = TempDir::new().unwrap();
+    let usage = UsageSnapshotStore::default();
+    let routing = SessionRouting::open(dir.path().join("sessions.sqlite3"), usage.clone()).unwrap();
+    let pool = pool_with_keys(&["key-1", "key-2"]);
+    let candidates = vec![fingerprint("key-1"), fingerprint("key-2")];
+    let model = "deepseek-chat";
+    let now = chrono::Utc::now();
+    let at = |days: i64| (now + chrono::Duration::days(days)).to_rfc3339();
+
+    assert_eq!(
+        routing
+            .new_session_order(&candidates, model, &pool)
+            .unwrap(),
+        candidates,
+        "all unknown keeps pinned pool order"
+    );
+
+    record_monthly(&usage, "key-2", &at(10));
+    assert_eq!(
+        routing
+            .new_session_order(&candidates, model, &pool)
+            .unwrap(),
+        vec![fingerprint("key-2"), fingerprint("key-1")],
+        "a known future reset outranks an unknown later candidate"
+    );
+
+    record_monthly(&usage, "key-1", &at(20));
+    assert_eq!(
+        routing
+            .new_session_order(&candidates, model, &pool)
+            .unwrap(),
+        vec![fingerprint("key-2"), fingerprint("key-1")]
+    );
+
+    record_monthly(&usage, "key-1", &at(5));
+    assert_eq!(
+        routing
+            .new_session_order(&candidates, model, &pool)
+            .unwrap(),
+        vec![fingerprint("key-1"), fingerprint("key-2")],
+        "earliest known future reset wins"
+    );
+
+    record_monthly(&usage, "key-1", &at(-1));
+    assert_eq!(
+        routing
+            .new_session_order(&candidates, model, &pool)
+            .unwrap(),
+        vec![fingerprint("key-2"), fingerprint("key-1")],
+        "a past reset is unknown, not stale-snapshot age"
+    );
+
+    record_monthly(&usage, "key-1", &at(7));
+    record_monthly(&usage, "key-2", &at(7));
+    assert_eq!(
+        routing
+            .new_session_order(&candidates, model, &pool)
+            .unwrap(),
+        candidates,
+        "equal known dates keep pinned order"
+    );
+
+    record_monthly(&usage, "key-1", "invalid");
+    record_monthly(&usage, "key-2", &at(-2));
+    assert_eq!(
+        routing
+            .new_session_order(&candidates, model, &pool)
+            .unwrap(),
+        candidates,
+        "all invalid/past resets keep pinned order"
+    );
 }
 
 #[tokio::test]
